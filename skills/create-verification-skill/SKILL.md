@@ -44,6 +44,35 @@ commands, seed data, or readiness messages.
 
 Create `.agents/skills/verify-<app>/SKILL.md` with frontmatter containing the
 matching `name` and a description that names the app, surface, and trigger.
+The name is at most 64 characters. The description is valid YAML, has no angle
+brackets, and is at most 1,024 characters.
+
+Use structured command values throughout the JSON specification:
+
+```json
+{"executable": "python3", "argv": ["app.py", "doctor", "--state", "scratch/state.txt"]}
+```
+
+Do not accept a shell command string. The helper renders argv with shell
+quoting for a reader, but does not execute it. Executables cannot contain shell
+syntax. Command arguments cannot use absolute paths or `..` to escape the
+project. Keep disposable paths below `disposable_root`, evidence paths below
+`evidence_root`, and keep those roots separate.
+
+The app specification also records `setup`, `environment`, `seed_auth`,
+`isolation`, `ownership`, `evidence_scope`, and `failure_signals`. Every
+feature records the same fields. Each action records its own failure signals
+and an evidence object with a bounded artifact path:
+
+```json
+{
+  "evidence": {
+    "path": "artifacts/feature/pass.json",
+    "proves": "the visible result and read-only side effect"
+  }
+}
+```
+
 The body must contain these sections, grounded in the interview:
 
 - **Launch:** the exact startup command, readiness check, required environment,
@@ -61,6 +90,8 @@ The body must contain these sections, grounded in the interview:
 - **Cleanup:** stop only instances created by the run, remove scratch state,
   restore seeded data, and leave evidence in place.
 - **Helpers:** list every shipped helper and show its literal invocation.
+- **Maintenance:** state that feature-map maintenance is the #4 follow-up and
+  is unsupported until #4 is available.
 
 Use the bundled [scaffold helper](scripts/scaffold.py) when all commands and
 expected results are already known. It writes a new skill atomically from an
@@ -80,9 +111,12 @@ python3 scripts/scaffold.py validate \
   --skill-root /absolute/path/project/.agents/skills/verify-app
 ```
 
-The helper refuses an existing target, including a broken symlink. Use the
-repository's normal skill-authoring workflow for a deliberate update instead of
-turning a collision into an overwrite.
+The helper refuses an existing target, including a broken symlink. It rejects
+symlinks in the complete generated tree and in every parent component. It
+reserves the final directory with an exclusive create before publication, so a
+target that appears during generation is preserved. Use the repository's
+normal skill-authoring workflow for a deliberate update instead of turning a
+collision into an overwrite.
 
 ## 3. Seed the feature map
 
@@ -100,9 +134,9 @@ feature file. Each feature file has exactly these four H2 sections, in order:
 4. `Gotchas`
 
 Within the driving section, every recorded action names the actor, fixture,
-user action or exact command, expected result, and evidence. Keep the map in
-the user's vocabulary. Implementation details belong in the repository, not in
-the feature map.
+user action or exact argv command, expected result, failure signals, and
+evidence. Keep the map in the user's vocabulary. Implementation details belong
+in the repository, not in the feature map.
 
 ## 4. Execute before handing it over
 
@@ -111,8 +145,10 @@ Run the generated skill end to end once:
 1. Launch the instance or prepare the isolated short-lived process.
 2. Run Doctor and confirm that this run owns the instance and scratch state.
 3. Drive one mapped feature through its real user path.
-4. Capture the action, visible result, and relevant side effect.
-5. Run Cleanup, then confirm that evidence still exists.
+4. Capture the literal generated command, stdout, stderr, exit code, visible
+   result, and relevant side effect.
+5. Run the literal generated Cleanup command, then confirm that evidence still
+   exists at its bounded path.
 
 After every failed iteration, run Cleanup before trying again. A passing
 document check is not a passing product check. Report `PASS`, `FAIL`,
@@ -127,6 +163,10 @@ the boundary and preserve the closest local proof. Never replace a missing
 capability with a pretend adapter. Dry-run or test-mode names are not proof of
 isolation: observe files, network, process ownership, and refs when safety
 depends on what the mode skips.
+
+Feature-map maintenance is a #4 follow-up and is unsupported until #4 is
+available. Do not claim that this creation flow detects stale commands,
+selectors, fixtures, or expected results.
 
 ## References
 

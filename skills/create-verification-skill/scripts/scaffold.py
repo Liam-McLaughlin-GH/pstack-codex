@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Scaffold and validate a project-local Codex verification skill.
 
-The helper consumes an explicit JSON specification. It never runs commands
-from that specification and never overwrites an existing target.
+The helper consumes an explicit JSON specification. Commands are structured
+as an executable plus argv, so generated instructions never need a shell
+parser. The helper never runs commands from a specification and never
+overwrites an existing target.
 """
 
 from __future__ import annotations
@@ -11,16 +13,51 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
+import stat
 import sys
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 
+MAX_SKILL_NAME_LENGTH = 64
+MAX_DESCRIPTION_LENGTH = 1024
 NAME_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-MARKDOWN_LINK = re.compile(r"\[[^\]]+\]\(([^)]+)\)")
-FRONTMATTER_FIELD = re.compile(r"^(name|description):\s*(.+)$")
+SKILL_NAME_PATTERN = re.compile(r"^verify-[a-z0-9]+(?:-[a-z0-9]+)*$")
+TOP_LEVEL_FIELD = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]*(?P<value>.*))?$")
+MARKDOWN_LINK = re.compile(
+    r"(?<!!)\[(?:\\.|[^\]])*\]\((?:<(?P<bracket>[^>]+)>|(?P<plain>[^)\s]+))\)"
+)
+REFERENCE_DEFINITION_PREFIX = re.compile(r"^[ \t]{0,3}\[(?P<label>[^\]]+)\]:")
+REFERENCE_DEFINITION = re.compile(
+    r"^[ \t]{0,3}\[(?P<label>[^\]]+)\]:[ \t]*(?:<(?P<bracket>[^>]+)>|(?P<plain>\S+))(?:[ \t]+.*)?$"
+)
+REFERENCE_USE = re.compile(r"(?<!!)\[(?P<text>[^\]]+)\]\[(?P<label>[^\]]*)\]")
+COMMAND_SHELL_MARKERS = frozenset(";&|<>$`{}*?!()")
+SHELL_EXECUTABLES = frozenset(
+    {"sh", "bash", "zsh", "dash", "fish", "ksh", "csh", "tcsh", "pwsh", "powershell", "cmd", "cmd.exe"}
+)
+CONTEXT_FIELDS = (
+    "setup",
+    "environment",
+    "seed_auth",
+    "isolation",
+    "ownership",
+    "evidence_scope",
+    "failure_signals",
+)
+CONTEXT_LABELS = {
+    "setup": "Setup",
+    "environment": "Environment",
+    "seed_auth": "Seed/auth",
+    "isolation": "Isolation",
+    "ownership": "Ownership",
+    "evidence_scope": "Evidence scope",
+    "failure_signals": "Failure signals",
+}
 REQUIRED_APP_FIELDS = (
     "name",
     "label",
@@ -31,8 +68,11 @@ REQUIRED_APP_FIELDS = (
     "ready",
     "doctor",
     "drive",
-    "evidence",
     "cleanup",
+    *CONTEXT_FIELDS,
+    "disposable_root",
+    "evidence_root",
+    "disposable_paths",
 )
 REQUIRED_FEATURE_FIELDS = (
     "id",
@@ -40,18 +80,39 @@ REQUIRED_FEATURE_FIELDS = (
     "summary",
     "sub_features",
     "entry_points",
+    *CONTEXT_FIELDS,
     "actors",
     "fixtures",
     "actions",
     "gotchas",
 )
-REQUIRED_ACTION_FIELDS = ("action", "command", "expected_result", "evidence")
+REQUIRED_ACTION_FIELDS = (
+    "action",
+    "command",
+    "expected_result",
+    "failure_signals",
+    "evidence",
+)
 HEADING_ORDER = (
     "Sub-features",
     "How to get to it (user POV)",
     "Driving it with",
     "Gotchas",
 )
+SKILL_HEADING_ORDER = (
+    "Launch",
+    "Doctor",
+    "Drive",
+    "Evidence",
+    "Cleanup",
+    "Helpers",
+    "Maintenance",
+)
+TRUSTED_SYSTEM_SYMLINKS = {
+    "/var": "/private/var",
+    "/tmp": "/private/tmp",
+    "/etc": "/private/etc",
+}
 
 
 class ScaffoldError(ValueError):
@@ -73,8 +134,10 @@ def _require_text(value: Any, label: str, *, allow_empty: bool = False) -> str:
         raise ScaffoldError(f"{label} must be a string")
     if not allow_empty and not value.strip():
         raise ScaffoldError(f"{label} must not be empty")
-    if "\n" in value or "\r" in value:
-        raise ScaffoldError(f"{label} must be one line")
+    if "\n" in value or "\r" in value or "\x00" in value:
+        raise ScaffoldError(f"{label} must be one line without NUL")
+    if any(ord(character) < 32 and character != "\t" for character in value):
+        raise ScaffoldError(f"{label} contains a control character")
     return value
 
 
@@ -86,6 +149,12 @@ def _require_text_list(value: Any, label: str, *, allow_empty: bool = False) -> 
     return [_require_text(item, f"{label}[{index}]") for index, item in enumerate(value)]
 
 
+def _require_mapping_list(value: Any, label: str) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ScaffoldError(f"{label} must be an array")
+    return [_require_mapping(item, f"{label}[{index}]") for index, item in enumerate(value)]
+
+
 def _slug(value: Any, label: str) -> str:
     value = _require_text(value, label)
     if not NAME_PATTERN.fullmatch(value):
@@ -93,10 +162,130 @@ def _slug(value: Any, label: str) -> str:
     return value
 
 
-def _validate_action(action: Any, label: str) -> None:
+def _safe_relative_path(value: Any, label: str) -> str:
+    """Validate a path that remains below the project root when rendered."""
+
+    value = _require_text(value, label)
+    if "\\" in value or value.startswith(("/", "~", "//")):
+        raise ScaffoldError(f"{label} must be a relative POSIX path")
+    if re.match(r"^[A-Za-z]:", value) or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", value):
+        raise ScaffoldError(f"{label} must not be an absolute path or URI")
+    parts = value.split("/")
+    if any(part in {"", ".", ".."} for part in parts):
+        raise ScaffoldError(f"{label} must not contain empty, '.', or '..' path parts")
+    return "/".join(parts)
+
+
+def _path_is_within(path: str, root: str) -> bool:
+    path_parts = PurePosixPath(path).parts
+    root_parts = PurePosixPath(root).parts
+    return path_parts[: len(root_parts)] == root_parts
+
+
+def _validate_roots(app: dict[str, Any]) -> tuple[str, str]:
+    disposable_root = _safe_relative_path(app["disposable_root"], "app.disposable_root")
+    evidence_root = _safe_relative_path(app["evidence_root"], "app.evidence_root")
+    if _path_is_within(disposable_root, evidence_root) or _path_is_within(evidence_root, disposable_root):
+        raise ScaffoldError("app.disposable_root and app.evidence_root must not overlap")
+
+    disposable_paths = _require_text_list(app["disposable_paths"], "app.disposable_paths")
+    for index, path in enumerate(disposable_paths):
+        normalized = _safe_relative_path(path, f"app.disposable_paths[{index}]")
+        if not _path_is_within(normalized, disposable_root):
+            raise ScaffoldError(
+                f"app.disposable_paths[{index}] must be below app.disposable_root"
+            )
+    return disposable_root, evidence_root
+
+
+def _validate_context(value: dict[str, Any], label: str) -> None:
+    for field in CONTEXT_FIELDS:
+        _require_text_list(value.get(field), f"{label}.{field}")
+
+
+def _command_argument_candidates(argument: str) -> tuple[str, ...]:
+    candidates = [argument]
+    if "=" in argument:
+        candidates.append(argument.split("=", 1)[1])
+    return tuple(candidates)
+
+
+def _validate_command(value: Any, label: str, *, forbidden_roots: tuple[str, ...] = ()) -> dict[str, Any]:
+    command = _require_mapping(value, label)
+    allowed_fields = {"executable", "argv", "cwd"}
+    unknown = set(command) - allowed_fields
+    if unknown:
+        raise ScaffoldError(f"{label} has unsupported fields: {', '.join(sorted(unknown))}")
+    executable = _require_text(command.get("executable"), f"{label}.executable")
+    if any(character in COMMAND_SHELL_MARKERS for character in executable):
+        raise ScaffoldError(
+            f"{label}.executable must be an executable path or name, not shell syntax"
+        )
+    argv = command.get("argv")
+    if not isinstance(argv, list):
+        raise ScaffoldError(f"{label}.argv must be an array")
+    if Path(executable).name.casefold() in SHELL_EXECUTABLES:
+        if any(
+            argument.casefold() in {"-c", "/c", "-command", "-encodedcommand"}
+            for argument in argv
+            if isinstance(argument, str)
+        ):
+            raise ScaffoldError(f"{label} must not introduce a free-form shell command")
+    for index, argument in enumerate(argv):
+        argument = _require_text(argument, f"{label}.argv[{index}]")
+        for candidate in _command_argument_candidates(argument):
+            if candidate.startswith(("/", "~", "//")) or re.match(r"^[A-Za-z]:[\\/]", candidate):
+                raise ScaffoldError(
+                    f"{label}.argv[{index}] must not contain an absolute path"
+                )
+            if candidate.casefold().startswith("file:"):
+                raise ScaffoldError(
+                    f"{label}.argv[{index}] must not contain a file URI"
+                )
+            if "\\" not in candidate and ".." in PurePosixPath(candidate).parts:
+                raise ScaffoldError(
+                    f"{label}.argv[{index}] must not escape the project with '..'"
+                )
+            for root in forbidden_roots:
+                if candidate == root or candidate.startswith(f"{root}/"):
+                    raise ScaffoldError(
+                        f"{label}.argv[{index}] must not address protected path {root!r}"
+                    )
+    if "cwd" in command:
+        command["cwd"] = _safe_relative_path(command["cwd"], f"{label}.cwd")
+    command["executable"] = executable
+    command["argv"] = argv
+    return command
+
+
+def _validate_evidence(value: Any, label: str, evidence_root: str) -> dict[str, str]:
+    evidence = _require_mapping(value, label)
+    if set(evidence) != {"path", "proves"}:
+        raise ScaffoldError(f"{label} must contain only path and proves")
+    path = _safe_relative_path(evidence["path"], f"{label}.path")
+    if not _path_is_within(path, evidence_root):
+        raise ScaffoldError(f"{label}.path must be below app.evidence_root")
+    proves = _require_text(evidence["proves"], f"{label}.proves")
+    evidence["path"] = path
+    evidence["proves"] = proves
+    return evidence
+
+
+def _validate_action(
+    action: Any,
+    label: str,
+    *,
+    evidence_root: str,
+) -> None:
     action = _require_mapping(action, label)
     for field in REQUIRED_ACTION_FIELDS:
-        _require_text(action.get(field), f"{label}.{field}")
+        if field not in action:
+            raise ScaffoldError(f"{label}.{field} is required")
+    _require_text(action["action"], f"{label}.action")
+    _validate_command(action["command"], f"{label}.command")
+    _require_text(action["expected_result"], f"{label}.expected_result")
+    _require_text_list(action["failure_signals"], f"{label}.failure_signals")
+    _validate_evidence(action["evidence"], f"{label}.evidence", evidence_root)
     for field in ("actors", "fixtures"):
         if field in action:
             _require_text_list(action[field], f"{label}.{field}")
@@ -108,8 +297,28 @@ def validate_spec(spec: Any) -> dict[str, Any]:
     spec = _require_mapping(spec, "spec")
     app = _require_mapping(spec.get("app"), "app")
     for field in REQUIRED_APP_FIELDS:
-        _require_text(app.get(field), f"app.{field}")
+        if field not in app:
+            raise ScaffoldError(f"app.{field} is required")
     app["name"] = _slug(app["name"], "app.name")
+    generated_name = f"verify-{app['name']}"
+    if len(generated_name) > MAX_SKILL_NAME_LENGTH:
+        raise ScaffoldError(
+            f"generated skill name is too long ({len(generated_name)} characters; maximum is {MAX_SKILL_NAME_LENGTH})"
+        )
+    for field in ("label", "description", "surface", "harness", "ready"):
+        _require_text(app[field], f"app.{field}")
+    _frontmatter_description(app)
+    _validate_context(app, "app")
+    disposable_root, evidence_root = _validate_roots(app)
+    _validate_command(app["launch"], "app.launch")
+    _validate_command(app["doctor"], "app.doctor")
+    _validate_command(app["drive"], "app.drive")
+    _validate_command(app["cleanup"], "app.cleanup", forbidden_roots=(evidence_root,))
+    if "evidence" in app:
+        _require_text(app["evidence"], "app.evidence")
+    for field in ("baseline", "helpers"):
+        if field in spec:
+            _require_text_list(spec[field], field, allow_empty=True)
 
     features = spec.get("features")
     if not isinstance(features, list) or not features:
@@ -130,29 +339,31 @@ def validate_spec(spec: Any) -> dict[str, Any]:
         sub_features = _require_mapping_list(feature["sub_features"], f"{label}.sub_features")
         if not sub_features:
             raise ScaffoldError(f"{label}.sub_features must contain at least one item")
+        sub_ids: set[str] = set()
         for sub_index, sub_feature in enumerate(sub_features):
-            _slug(sub_feature.get("id"), f"{label}.sub_features[{sub_index}].id")
-            _require_text(sub_feature.get("description"), f"{label}.sub_features[{sub_index}].description")
+            sub_id = _slug(sub_feature.get("id"), f"{label}.sub_features[{sub_index}].id")
+            if sub_id in sub_ids:
+                raise ScaffoldError(f"duplicate sub-feature id: {sub_id}")
+            sub_ids.add(sub_id)
+            _require_text(
+                sub_feature.get("description"),
+                f"{label}.sub_features[{sub_index}].description",
+            )
         _require_text_list(feature["entry_points"], f"{label}.entry_points")
+        _validate_context(feature, label)
         _require_text_list(feature["actors"], f"{label}.actors")
         _require_text_list(feature["fixtures"], f"{label}.fixtures")
         actions = _require_mapping_list(feature["actions"], f"{label}.actions")
         if not actions:
             raise ScaffoldError(f"{label}.actions must contain at least one action")
         for action_index, action in enumerate(actions):
-            _validate_action(action, f"{label}.actions[{action_index}]")
+            _validate_action(
+                action,
+                f"{label}.actions[{action_index}]",
+                evidence_root=evidence_root,
+            )
         _require_text_list(feature["gotchas"], f"{label}.gotchas", allow_empty=True)
-
-    for field in ("baseline", "helpers"):
-        if field in spec:
-            _require_text_list(spec[field], field, allow_empty=True)
     return spec
-
-
-def _require_mapping_list(value: Any, label: str) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
-        raise ScaffoldError(f"{label} must be an array")
-    return [_require_mapping(item, f"{label}[{index}]") for index, item in enumerate(value)]
 
 
 def load_spec(path: Path) -> dict[str, Any]:
@@ -163,80 +374,133 @@ def load_spec(path: Path) -> dict[str, Any]:
     return validate_spec(raw)
 
 
+def _markdown_text(value: str) -> str:
+    """Escape text inserted into prose, headings, and list items."""
+
+    escaped = value.replace("\\", "\\\\")
+    for character in "`*_[]()<>#!|":
+        escaped = escaped.replace(character, f"\\{character}")
+    return escaped
+
+
+def _code_span(value: str) -> str:
+    runs = [len(run) for run in re.findall(r"`+", value)]
+    delimiter = "`" * (max(runs, default=0) + 1)
+    if value.startswith("`") or value.endswith("`"):
+        return f"{delimiter} {value} {delimiter}"
+    return f"{delimiter}{value}{delimiter}"
+
+
+def _render_command(command: dict[str, Any]) -> str:
+    return shlex.join([command["executable"], *command["argv"]])
+
+
+def _command_line(label: str, command: dict[str, Any]) -> str:
+    return f"- {label}: {_code_span(_render_command(command))}"
+
+
 def _bullet(items: list[str]) -> str:
-    return "\n".join(f"- {item}" for item in items) or "- None recorded."
+    return "\n".join(f"- {_markdown_text(item)}" for item in items) or "- None recorded."
+
+
+def _context_lines(value: dict[str, Any]) -> list[str]:
+    lines: list[str] = []
+    for field in CONTEXT_FIELDS:
+        lines.append(f"- {CONTEXT_LABELS[field]}:")
+        lines.extend(f"  - {_markdown_text(item)}" for item in value[field])
+    return lines
 
 
 def _action_text(action: dict[str, Any], feature: dict[str, Any]) -> str:
     actors = action.get("actors", feature["actors"])
     fixtures = action.get("fixtures", feature["fixtures"])
+    evidence = action["evidence"]
     return "\n".join(
         (
-            f"- **{action['action']}.**",
-            f"  - Actors: {', '.join(actors)}",
-            f"  - Fixtures: {', '.join(fixtures)}",
-            f"  - Action: `{action['command']}`",
-            f"  - Expected result: {action['expected_result']}",
-            f"  - Evidence: {action['evidence']}",
+            f"- **{_markdown_text(action['action'])}.**",
+            f"  - Actors: {_markdown_text(', '.join(actors))}",
+            f"  - Fixtures: {_markdown_text(', '.join(fixtures))}",
+            f"  - Action: {_code_span(_render_command(action['command']))}",
+            f"  - Expected result: {_markdown_text(action['expected_result'])}",
+            f"  - Failure signals: {_markdown_text('; '.join(action['failure_signals']))}",
+            f"  - Evidence: {_code_span(evidence['path'])}, {_markdown_text(evidence['proves'])}",
         )
     )
+
+
+def _frontmatter_description(app: dict[str, Any]) -> str:
+    description = (
+        f"Drive and verify {app['label']} through its {app['surface']} surface "
+        f"using the repository's {app['harness']} harness."
+    )
+    if len(description) > MAX_DESCRIPTION_LENGTH or "<" in description or ">" in description:
+        raise ScaffoldError("generated frontmatter description exceeds Codex limits")
+    return description
 
 
 def _skill_markdown(spec: dict[str, Any]) -> str:
     app = spec["app"]
     name = f"verify-{app['name']}"
-    description = f"Drive and verify {app['label']} through its {app['surface']} surface using the repository's {app['harness']} harness."
-    return "\n".join(
-        (
-            "---",
-            f"name: {json.dumps(name)}",
-            f"description: {json.dumps(description)}",
-            "---",
-            "",
-            f"# Verify {app['label']}",
-            "",
-            app["description"],
-            "",
-            "Use this project-local skill to drive the real user-facing surface and retain proof. Generated instructions are not product proof until they run.",
-            "",
-            "## Launch",
-            "",
-            f"- Command: `{app['launch']}`",
-            f"- Ready when: {app['ready']}",
-            f"- Surface: {app['surface']}",
-            "",
-            "## Doctor",
-            "",
-            f"- Run: `{app['doctor']}`",
-            f"- A healthy result means: {app['ready']}",
-            "- Do not drive an instance that this run did not start or cannot identify.",
-            "",
-            "## Drive",
-            "",
-            f"- Harness: {app['harness']}",
-            f"- Main path: `{app['drive']}`",
-            "- Use the feature map in `features/README.md` and the linked feature recipe.",
-            "",
-            "## Evidence",
-            "",
-            f"- {app['evidence']}",
-            "- Capture the action and resulting state, not only the final screen or output.",
-            "- Verify relevant side effects with a read-only second view.",
-            "- Report PASS, FAIL, NOT RUN, or UNSUPPORTED with the command and artifact path.",
-            "",
-            "## Cleanup",
-            "",
-            f"- {app['cleanup']}",
-            "- Keep evidence artifacts after cleanup.",
-            "",
-            "## Helpers",
-            "",
-            _bullet(spec.get("helpers", [])),
-            "",
-            "The feature map is maintained under `features/`; it describes coverage and does not replace execution.",
-            "",
-        )
-    )
+    description = _frontmatter_description(app)
+    evidence_context = {field: app[field] for field in CONTEXT_FIELDS}
+    lines = [
+        "---",
+        f"name: {json.dumps(name)}",
+        f"description: {json.dumps(description)}",
+        "---",
+        "",
+        f"# Verify {_markdown_text(app['label'])}",
+        "",
+        _markdown_text(app["description"]),
+        "",
+        "Use this project-local skill to drive the real user-facing surface and retain proof. Generated instructions are not product proof until they run.",
+        "",
+        "## Launch",
+        "",
+        *_context_lines(app),
+        _command_line("Command", app["launch"]),
+        f"- Ready when: {_markdown_text(app['ready'])}",
+        f"- Surface: {_markdown_text(app['surface'])}",
+        "",
+        "## Doctor",
+        "",
+        _command_line("Command", app["doctor"]),
+        "- This is a read-only check of the process, build or version, endpoint or prompt, auth, and disposable state.",
+        *_context_lines(app),
+        f"- Healthy result: {_markdown_text(app['ready'])}",
+        "",
+        "## Drive",
+        "",
+        f"- Harness: {_markdown_text(app['harness'])}",
+        _command_line("Command", app["drive"]),
+        "- Start from the feature map's Preconditions and use the linked recipe's literal action command.",
+        f"- Isolation: {_markdown_text('; '.join(app['isolation']))}",
+        "",
+        "## Evidence",
+        "",
+        f"- Evidence root: {_code_span(app['evidence_root'])}",
+        *_context_lines(evidence_context),
+        "- Capture the command, stdout, stderr, exit code, visible result, and a read-only side-effect check.",
+        "- Keep evidence paths below the evidence root and never remove them during cleanup.",
+        "",
+        "## Cleanup",
+        "",
+        _command_line("Command", app["cleanup"]),
+        *_context_lines(app),
+        f"- Disposable root: {_code_span(app['disposable_root'])}",
+        f"- Disposable paths: {', '.join(_code_span(path) for path in app['disposable_paths'])}",
+        f"- Evidence survives cleanup under {_code_span(app['evidence_root'])}.",
+        "",
+        "## Helpers",
+        "",
+        _bullet(spec.get("helpers", [])),
+        "",
+        "## Maintenance",
+        "",
+        "Feature-map maintenance is a #4 follow-up and is unsupported until #4 is available. Do not claim stale-map detection from this creation flow.",
+        "",
+    ]
+    return "\n".join(lines)
 
 
 def _index_markdown(spec: dict[str, Any]) -> str:
@@ -244,66 +508,77 @@ def _index_markdown(spec: dict[str, Any]) -> str:
     features = spec["features"]
     baseline = spec.get("baseline", [])
     lines = [
-        f"# {app['label']} verification map",
+        f"# {_markdown_text(app['label'])} verification map",
         "",
-        "This directory is the maintained source for user-facing verification paths. Read the index before driving the app, then use the matching feature file.",
+        _markdown_text(app["description"]),
         "",
         "## Baseline preconditions",
         "",
-        _bullet(baseline),
-        "",
-        "## Driving conventions",
-        "",
-        f"- Use the `{app['harness']}` harness and the exact commands recorded in each recipe.",
-        "- Start every recipe from its stated preconditions.",
-        "- Prefer stable accessible names, prompt strings, routes, and flags over coordinates or tab order.",
-        "",
-        "## Proof and skip reporting",
-        "",
-        "- Capture the action and resulting state, not only the final view.",
-        "- Verify mutations with a read-only second view when the surface permits it.",
-        "- Keep proof artifacts after cleanup.",
-        "- Report an unreachable path with the attempted command and unmet precondition.",
-        "- Do not report one entry point as verified through a different path.",
-        "",
-        "## Features",
-        "",
+        *_context_lines(app),
+        f"- Disposable root: {_code_span(app['disposable_root'])}",
+        f"- Evidence root: {_code_span(app['evidence_root'])}",
     ]
+    if baseline:
+        lines.extend(("", "- Additional baseline notes:", *[f"  - {_markdown_text(item)}" for item in baseline]))
+    lines.extend(
+        (
+            "",
+            "## Driving conventions",
+            "",
+            f"- Use the {_code_span(app['harness'])} harness and the exact argv commands recorded in each recipe.",
+            "- Start every recipe from its stated Preconditions.",
+            "- Prefer stable accessible names, prompt strings, routes, and flags over coordinates or tab order.",
+            "",
+            "## Proof and skip reporting",
+            "",
+            "- Capture the action and resulting state, not only the final view.",
+            "- Record stdout, stderr, exit code, visible result, and a read-only side-effect check when relevant.",
+            "- Keep proof artifacts after cleanup.",
+            "- Report an unreachable path with the attempted command and unmet precondition.",
+            "- Do not report one entry point as verified through a different path.",
+            "",
+            "## Features",
+            "",
+        )
+    )
     for feature in features:
-        lines.append(f"- [{feature['title']}](./{feature['id']}.md): {feature['summary']}")
-    lines.extend(("",))
+        lines.append(
+            f"- [{_markdown_text(feature['title'])}](./{feature['id']}.md): "
+            f"{_markdown_text(feature['summary'])}"
+        )
+    lines.append("")
     return "\n".join(lines)
 
 
 def _feature_markdown(feature: dict[str, Any], harness: str) -> str:
     lines = [
-        f"# {feature['title']}",
+        f"# {_markdown_text(feature['title'])}",
         "",
-        feature["summary"],
+        _markdown_text(feature["summary"]),
         "",
         "## Sub-features",
         "",
     ]
     lines.extend(
-        f"- `{item['id']}`: {item['description']}" for item in feature["sub_features"]
+        f"- `{_markdown_text(item['id'])}`: {_markdown_text(item['description'])}"
+        for item in feature["sub_features"]
     )
     lines.extend(("", "## How to get to it (user POV)", ""))
-    lines.extend(f"- {entry}" for entry in feature["entry_points"])
-    lines.extend(("", f"## Driving it with {harness}", "", "Preconditions:", ""))
-    lines.append(f"- Actors: {', '.join(feature['actors'])}")
-    lines.append(f"- Fixtures: {', '.join(feature['fixtures'])}")
+    lines.extend(f"- {_markdown_text(entry)}" for entry in feature["entry_points"])
+    lines.extend(("", f"## Driving it with {_markdown_text(harness)}", "", "Preconditions:", ""))
+    lines.extend(_context_lines(feature))
+    lines.append(f"- Actors: {_markdown_text(', '.join(feature['actors']))}")
+    lines.append(f"- Fixtures: {_markdown_text(', '.join(feature['fixtures']))}")
     lines.append("")
     for action in feature["actions"]:
         lines.extend((_action_text(action, feature), ""))
-    lines.extend(("## Gotchas", ""))
-    lines.append(_bullet(feature["gotchas"]))
-    lines.append("")
+    lines.extend(("## Gotchas", "", _bullet(feature["gotchas"]), ""))
     return "\n".join(lines)
 
 
 def _write_tree(spec: dict[str, Any], root: Path) -> None:
     app = spec["app"]
-    (root / "features").mkdir(parents=True)
+    (root / "features").mkdir()
     (root / "SKILL.md").write_text(_skill_markdown(spec), encoding="utf-8")
     (root / "features" / "README.md").write_text(_index_markdown(spec), encoding="utf-8")
     for feature in spec["features"]:
@@ -311,128 +586,634 @@ def _write_tree(spec: dict[str, Any], root: Path) -> None:
         path.write_text(_feature_markdown(feature, app["harness"]), encoding="utf-8")
 
 
-def _parse_frontmatter(path: Path) -> dict[str, str]:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
-        raise ScaffoldError(f"cannot read {path}: {exc}") from exc
-    if not lines or lines[0] != "---":
-        raise ScaffoldError(f"{path} is missing YAML frontmatter")
-    try:
-        closing = lines.index("---", 1)
-    except ValueError as exc:
-        raise ScaffoldError(f"{path} has unterminated YAML frontmatter") from exc
+def _strict_frontmatter_subset(text: str) -> dict[str, str]:
     fields: dict[str, str] = {}
-    for line in lines[1:closing]:
-        match = FRONTMATTER_FIELD.fullmatch(line)
-        if match:
-            value = match.group(2).strip()
-            if value.startswith('"') and value.endswith('"'):
-                try:
-                    value = json.loads(value)
-                except json.JSONDecodeError as exc:
-                    raise ScaffoldError(f"{path} has invalid quoted frontmatter") from exc
-            elif value.startswith("'") and value.endswith("'"):
-                value = value[1:-1].replace("''", "'")
-            fields[match.group(1)] = value
-    for field in ("name", "description"):
-        if field not in fields or not fields[field].strip():
-            raise ScaffoldError(f"{path} frontmatter is missing {field}")
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        match = TOP_LEVEL_FIELD.fullmatch(line)
+        if not match:
+            raise ScaffoldError(f"invalid YAML frontmatter line: {line!r}")
+        key = match.group("key")
+        if key in fields:
+            raise ScaffoldError(f"duplicate frontmatter field: {key}")
+        value = (match.group("value") or "").strip()
+        if not value:
+            raise ScaffoldError(f"frontmatter field {key!r} is empty")
+        if value.startswith('"'):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise ScaffoldError(f"frontmatter field {key!r} has invalid YAML quoting") from exc
+            if not isinstance(parsed, str):
+                raise ScaffoldError(f"frontmatter field {key!r} must be a string")
+            fields[key] = parsed
+            continue
+        if value.startswith("'"):
+            if len(value) < 2 or not value.endswith("'"):
+                raise ScaffoldError(f"frontmatter field {key!r} has an unterminated quote")
+            fields[key] = value[1:-1].replace("''", "'")
+            continue
+        if value.startswith(("[", "{", "&", "*", "!", "|", ">", "%", "@", "`")):
+            raise ScaffoldError(f"frontmatter field {key!r} is not a supported scalar")
+        fields[key] = value
     return fields
 
 
-def _check_links(root: Path) -> None:
-    for path in root.rglob("*.md"):
+def _parse_frontmatter(path: Path) -> dict[str, str]:
+    try:
         text = path.read_text(encoding="utf-8")
-        for target in MARKDOWN_LINK.findall(text):
-            if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", target) or target.startswith("#"):
+    except OSError as exc:
+        raise ScaffoldError(f"cannot read {path}: {exc}") from exc
+    lines = text.splitlines()
+    if not lines or lines[0] != "---":
+        raise ScaffoldError(f"{path} is missing YAML frontmatter")
+    try:
+        closing = next(index for index in range(1, len(lines)) if lines[index] == "---")
+    except StopIteration as exc:
+        raise ScaffoldError(f"{path} has unterminated YAML frontmatter") from exc
+    source = "\n".join(lines[1:closing])
+    try:
+        import yaml  # type: ignore[import-not-found]
+
+        class UniqueLoader(yaml.SafeLoader):  # type: ignore[name-defined]
+            pass
+
+        def construct_mapping(loader: Any, node: Any, deep: bool = False) -> dict[Any, Any]:
+            mapping: dict[Any, Any] = {}
+            for key_node, value_node in node.value:
+                key = loader.construct_object(key_node, deep=deep)
+                if key in mapping:
+                    raise ScaffoldError(f"duplicate frontmatter field: {key}")
+                mapping[key] = loader.construct_object(value_node, deep=deep)
+            return mapping
+
+        UniqueLoader.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+            construct_mapping,
+        )
+        parsed = yaml.load(source, Loader=UniqueLoader)
+        if not isinstance(parsed, dict):
+            raise ScaffoldError("frontmatter must be a YAML mapping")
+        fields = parsed
+    except ModuleNotFoundError:
+        fields = _strict_frontmatter_subset(source)
+    except ScaffoldError:
+        raise
+    except Exception as exc:
+        raise ScaffoldError(f"invalid YAML frontmatter: {exc}") from exc
+
+    if set(fields) - {"name", "description"}:
+        unknown = ", ".join(sorted(set(fields) - {"name", "description"}))
+        raise ScaffoldError(f"unsupported frontmatter field(s): {unknown}")
+    for field in ("name", "description"):
+        if field not in fields:
+            raise ScaffoldError(f"{path} frontmatter is missing {field}")
+        if not isinstance(fields[field], str) or not fields[field].strip():
+            raise ScaffoldError(f"frontmatter field {field!r} must be a non-empty string")
+    return {"name": fields["name"], "description": fields["description"]}
+
+
+def _validate_frontmatter_fields(
+    frontmatter: dict[str, str], *, expected_name: str, path: Path
+) -> None:
+    name = frontmatter["name"].strip()
+    if not SKILL_NAME_PATTERN.fullmatch(name):
+        raise ScaffoldError(f"{path} has an invalid Codex skill name: {name!r}")
+    if name != expected_name:
+        raise ScaffoldError("frontmatter name does not match the generated directory")
+    if len(name) > MAX_SKILL_NAME_LENGTH:
+        raise ScaffoldError(f"frontmatter name exceeds {MAX_SKILL_NAME_LENGTH} characters")
+    description = frontmatter["description"].strip()
+    if description.startswith("[TODO:"):
+        raise ScaffoldError("frontmatter description contains an unfinished TODO")
+    if "<" in description or ">" in description:
+        raise ScaffoldError("frontmatter description must not contain angle brackets")
+    if len(description) > MAX_DESCRIPTION_LENGTH:
+        raise ScaffoldError(f"frontmatter description exceeds {MAX_DESCRIPTION_LENGTH} characters")
+
+
+def _lexical_absolute(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path)))
+
+
+def _symlink_component_errors(path: Path, *, include_final: bool = True) -> list[str]:
+    absolute = _lexical_absolute(path)
+    components = absolute.parts
+    current = Path(absolute.anchor)
+    errors: list[str] = []
+    limit = len(components) if include_final else max(1, len(components) - 1)
+    for component in components[1:limit]:
+        current /= component
+        try:
+            mode = os.lstat(current).st_mode
+        except FileNotFoundError:
+            break
+        if stat.S_ISLNK(mode):
+            trusted_target = TRUSTED_SYSTEM_SYMLINKS.get(os.fspath(current))
+            if trusted_target and os.path.realpath(current) == trusted_target:
                 continue
-            candidate = (path.parent / target.split("#", 1)[0]).resolve()
-            if not candidate.is_relative_to(root.resolve()):
-                raise ScaffoldError(f"{path.relative_to(root)} link escapes generated skill: {target}")
-            if not candidate.exists():
-                raise ScaffoldError(f"{path.relative_to(root)} link target does not exist: {target}")
+            errors.append(f"symlinked path component is not allowed: {current}")
+    return errors
+
+
+def _tree_errors(root: Path) -> list[str]:
+    errors = _symlink_component_errors(root)
+    absolute_root = _lexical_absolute(root)
+    try:
+        root_mode = os.lstat(absolute_root).st_mode
+    except OSError as exc:
+        return [*errors, f"cannot inspect generated root: {exc}"]
+    if stat.S_ISLNK(root_mode):
+        errors.append("skill root must not be a symlink")
+    elif not stat.S_ISDIR(root_mode):
+        errors.append("skill root must be a directory")
+    if errors or not stat.S_ISDIR(root_mode):
+        return errors
+
+    pending = [absolute_root]
+    while pending:
+        directory = pending.pop()
+        try:
+            entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+        except OSError as exc:
+            errors.append(f"cannot inspect {directory}: {exc}")
+            continue
+        for entry in entries:
+            path = Path(entry.path)
+            try:
+                mode = entry.stat(follow_symlinks=False).st_mode
+            except OSError as exc:
+                errors.append(f"cannot inspect {path}: {exc}")
+                continue
+            if stat.S_ISLNK(mode):
+                errors.append(f"generated tree contains symlink: {path}")
+            elif stat.S_ISDIR(mode):
+                pending.append(path)
+            elif not stat.S_ISREG(mode):
+                errors.append(f"generated tree contains non-regular file: {path}")
+    return errors
+
+
+def _skill_location_error(skill_root: Path) -> str | None:
+    if not SKILL_NAME_PATTERN.fullmatch(skill_root.name):
+        return "skill root must be named verify-<app>"
+    if len(skill_root.name) > MAX_SKILL_NAME_LENGTH:
+        return f"skill root name exceeds {MAX_SKILL_NAME_LENGTH} characters"
+    if len(skill_root.parts) < 3 or skill_root.parts[-3:-1] != (".agents", "skills"):
+        return "skill root must be under .agents/skills/verify-<app>"
+    return None
+
+
+def _strip_markdown_code(text: str) -> str:
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    text = re.sub(r"~~~.*?~~~", "", text, flags=re.DOTALL)
+    return re.sub(r"(?P<ticks>`+).*?(?P=ticks)", "", text, flags=re.DOTALL)
+
+
+def _reference_label(label: str) -> str:
+    return " ".join(label.split()).casefold()
+
+
+def _validate_link_target(root: Path, path: Path, target: str) -> None:
+    parsed = urlsplit(target)
+    if target.startswith("#"):
+        return
+    if parsed.scheme or parsed.netloc or target.startswith("//"):
+        raise ScaffoldError(f"{path.relative_to(root)} contains a non-local link: {target}")
+    link_path = unquote(parsed.path)
+    if not link_path:
+        raise ScaffoldError(f"{path.relative_to(root)} contains an empty link")
+    candidate = _lexical_absolute(path.parent / link_path)
+    if not candidate.is_relative_to(root):
+        raise ScaffoldError(f"{path.relative_to(root)} link escapes generated skill: {target}")
+    if not candidate.is_file():
+        raise ScaffoldError(f"{path.relative_to(root)} link target does not exist: {target}")
+
+
+def _check_links(root: Path) -> None:
+    root = _lexical_absolute(root)
+    for path in sorted(root.rglob("*.md")):
+        text = _strip_markdown_code(path.read_text(encoding="utf-8"))
+        definitions: dict[str, str] = {}
+        for line in text.splitlines():
+            prefix = REFERENCE_DEFINITION_PREFIX.match(line)
+            if not prefix:
+                continue
+            definition = REFERENCE_DEFINITION.match(line)
+            if definition is None:
+                raise ScaffoldError(
+                    f"{path.relative_to(root)} contains a malformed Markdown reference definition"
+                )
+            label = _reference_label(prefix.group("label"))
+            if label in definitions:
+                raise ScaffoldError(
+                    f"{path.relative_to(root)} repeats Markdown reference definition {label!r}"
+                )
+            target = definition.group("bracket") or definition.group("plain") or ""
+            definitions[label] = target
+            _validate_link_target(root, path, target)
+        for match in MARKDOWN_LINK.finditer(text):
+            target = match.group("bracket") or match.group("plain") or ""
+            _validate_link_target(root, path, target)
+        for match in REFERENCE_USE.finditer(text):
+            label = _reference_label(match.group("label") or match.group("text"))
+            if label not in definitions:
+                raise ScaffoldError(f"{path.relative_to(root)} has an unresolved Markdown reference: {label!r}")
+
+
+def _nonempty_lines_between(lines: list[str], start: int, end: int) -> list[str]:
+    return [line.strip() for line in lines[start:end] if line.strip()]
+
+
+def _section_lines(lines: list[str], heading: str) -> tuple[int, int, list[str]] | None:
+    try:
+        start = lines.index(heading)
+    except ValueError:
+        return None
+    end = len(lines)
+    for index in range(start + 1, len(lines)):
+        if lines[index].startswith("## "):
+            end = index
+            break
+    return start, end, lines[start + 1 : end]
+
+
+def _require_label(lines: list[str], label: str, location: str, errors: list[str]) -> None:
+    prefix = f"- {label}:"
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith(prefix):
+            continue
+        if stripped[len(prefix) :].strip():
+            return
+        if index + 1 < len(lines) and lines[index + 1].strip().startswith("-"):
+            return
+    errors.append(f"{location} is missing {label}:")
+
+
+def _code_label_values(lines: list[str], label: str) -> list[str]:
+    pattern = re.compile(rf"^- {re.escape(label)}: `([^`]+)`\s*$")
+    for line in lines:
+        match = pattern.fullmatch(line.strip())
+        if match:
+            return [match.group(1)]
+    return []
+
+
+def _code_label_value(lines: list[str], label: str) -> str | None:
+    values = _code_label_values(lines, label)
+    return values[0] if values else None
+
+
+def _inline_code_values(lines: list[str], label: str) -> list[str]:
+    prefix = f"- {label}:"
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(prefix):
+            return re.findall(r"`([^`]+)`", stripped[len(prefix) :])
+    return []
+
+
+def _validate_index(
+    index: Path,
+    feature_files: list[Path],
+    root: Path,
+    errors: list[str],
+    *,
+    disposable_root: str | None = None,
+    evidence_root: str | None = None,
+) -> None:
+    lines = index.read_text(encoding="utf-8").splitlines()
+    nonempty = [line for line in lines if line.strip()]
+    if not nonempty or not nonempty[0].startswith("# ") or nonempty[0].startswith("## "):
+        errors.append("features/README.md must start with an H1")
+    if len([line for line in lines if line.startswith("# ")]) != 1:
+        errors.append("features/README.md must contain exactly one H1")
+    first_h2 = next((index for index, line in enumerate(lines) if line.startswith("## ")), len(lines))
+    if not _nonempty_lines_between(lines, 1, first_h2):
+        errors.append("features/README.md must contain a summary paragraph")
+    headings = [line.removeprefix("## ") for line in lines if line.startswith("## ")]
+    expected_headings = [
+        "Baseline preconditions",
+        "Driving conventions",
+        "Proof and skip reporting",
+        "Features",
+    ]
+    if headings != expected_headings:
+        errors.append("features/README.md headings are incomplete or out of order")
+    for label in (*CONTEXT_LABELS.values(), "Disposable root", "Evidence root"):
+        _require_label(lines, label, "features/README.md", errors)
+
+    expected_ids = [path.stem for path in feature_files]
+    links = re.findall(r"\]\(\./([a-z0-9-]+)\.md\)", index.read_text(encoding="utf-8"))
+    if len(links) != len(set(links)):
+        errors.append("features/README.md repeats a feature link")
+    if set(links) != set(expected_ids) or len(links) != len(expected_ids):
+        errors.append("features/README.md must link every feature exactly once")
+    for feature_id in links:
+        if not any(path.stem == feature_id for path in feature_files):
+            errors.append(f"features/README.md links an unknown feature: {feature_id}")
+    index_disposable_root = _code_label_value(lines, "Disposable root")
+    if index_disposable_root is None:
+        errors.append("features/README.md must name a relative Disposable root")
+    else:
+        try:
+            normalized = _safe_relative_path(index_disposable_root, "features/README.md Disposable root")
+            if disposable_root is not None and normalized != disposable_root:
+                errors.append("features/README.md Disposable root does not match SKILL.md")
+        except ScaffoldError as exc:
+            errors.append(str(exc))
+    index_evidence_root = _code_label_value(lines, "Evidence root")
+    if index_evidence_root is None:
+        errors.append("features/README.md must name a relative Evidence root")
+    else:
+        try:
+            normalized = _safe_relative_path(index_evidence_root, "features/README.md Evidence root")
+            if evidence_root is not None and normalized != evidence_root:
+                errors.append("features/README.md Evidence root does not match SKILL.md")
+        except ScaffoldError as exc:
+            errors.append(str(exc))
+
+
+def _validate_feature(
+    path: Path,
+    root: Path,
+    errors: list[str],
+    *,
+    evidence_root: str | None = None,
+) -> None:
+    relative = path.relative_to(root)
+    lines = path.read_text(encoding="utf-8").splitlines()
+    nonempty = [line for line in lines if line.strip()]
+    if not nonempty or not nonempty[0].startswith("# ") or nonempty[0].startswith("## "):
+        errors.append(f"{relative} must start with an H1")
+    if len([line for line in lines if line.startswith("# ")]) != 1:
+        errors.append(f"{relative} must contain exactly one H1")
+    first_h2_index = next((index for index, line in enumerate(lines) if line.startswith("## ")), len(lines))
+    if not _nonempty_lines_between(lines, 1, first_h2_index):
+        errors.append(f"{relative} must contain a summary paragraph")
+    headings = [line.removeprefix("## ") for line in lines if line.startswith("## ")]
+    if (
+        len(headings) != 4
+        or headings[:2] != list(HEADING_ORDER[:2])
+        or not headings[2].startswith(HEADING_ORDER[2])
+        or headings[3] != HEADING_ORDER[3]
+    ):
+        errors.append(f"{relative} has the wrong feature section contract")
+
+    driving = next((index for index, line in enumerate(lines) if line.startswith("## Driving it with ")), None)
+    if driving is None:
+        return
+    first_after_heading = next(
+        (line.strip() for line in lines[driving + 1 :] if line.strip()),
+        "",
+    )
+    if first_after_heading != "Preconditions:":
+        errors.append(f"{relative} driving section must start with Preconditions:")
+    for label in (*CONTEXT_LABELS.values(), "Actors", "Fixtures"):
+        _require_label(lines[driving + 1 :], label, str(relative), errors)
+
+    action_starts = [
+        index
+        for index, line in enumerate(lines)
+        if re.fullmatch(r"- \*\*.+\.\*\*", line)
+    ]
+    if not action_starts:
+        errors.append(f"{relative} must contain at least one action record")
+    for action_index, start in enumerate(action_starts):
+        end = action_starts[action_index + 1] if action_index + 1 < len(action_starts) else len(lines)
+        block = lines[start:end]
+        for label in ("Actors", "Fixtures", "Action", "Expected result", "Failure signals", "Evidence"):
+            _require_label(block, label, str(relative), errors)
+        evidence_line = next((line.strip() for line in block if line.strip().startswith("- Evidence:")), None)
+        evidence_match = re.match(r"^- Evidence: `([^`]+)`(?:,|$)", evidence_line or "")
+        if evidence_match is None:
+            errors.append(f"{relative} action evidence must name an artifact path")
+        elif evidence_root is not None:
+            try:
+                evidence_path = _safe_relative_path(evidence_match.group(1), f"{relative} evidence path")
+                if not _path_is_within(evidence_path, evidence_root):
+                    errors.append(f"{relative} evidence path escapes the evidence root")
+            except ScaffoldError as exc:
+                errors.append(str(exc))
 
 
 def validate_generated_skill(
-    skill_root: Path, *, expected_name: str | None = None
+    skill_root: Path,
+    *,
+    expected_name: str | None = None,
+    enforce_location: bool = True,
 ) -> tuple[str, ...]:
     """Return structural errors for a generated skill tree."""
 
-    errors: list[str] = []
-    if skill_root.is_symlink():
-        return ("skill root must not be a symlink",)
-    skill_root = skill_root.resolve()
+    skill_root = _lexical_absolute(skill_root)
+    errors = _tree_errors(skill_root)
+    if errors:
+        return tuple(errors)
+    if enforce_location:
+        location_error = _skill_location_error(skill_root)
+        if location_error:
+            errors.append(location_error)
+    expected_name = expected_name or skill_root.name
     skill_file = skill_root / "SKILL.md"
-    index = skill_root / "features" / "README.md"
+    features_dir = skill_root / "features"
+    index = features_dir / "README.md"
     if not skill_file.is_file():
         errors.append("missing SKILL.md")
+    if not features_dir.is_dir():
+        errors.append("missing features directory")
     if not index.is_file():
         errors.append("missing features/README.md")
     if errors:
         return tuple(errors)
+
+    disposable_root: str | None = None
+    evidence_root: str | None = None
     try:
         frontmatter = _parse_frontmatter(skill_file)
-        expected_name = expected_name or skill_root.name
-        if frontmatter["name"] != expected_name:
-            errors.append("frontmatter name does not match the generated directory")
-        headings = [
-            line.removeprefix("## ")
-            for line in skill_file.read_text(encoding="utf-8").splitlines()
-            if line.startswith("## ")
-        ]
-        required_skill_headings = ["Launch", "Doctor", "Drive", "Evidence", "Cleanup", "Helpers"]
-        if headings != required_skill_headings:
+        _validate_frontmatter_fields(frontmatter, expected_name=expected_name, path=skill_file)
+        skill_lines = skill_file.read_text(encoding="utf-8").splitlines()
+        disposable_root = _code_label_value(skill_lines, "Disposable root")
+        if disposable_root is None:
+            errors.append("SKILL.md must name a relative Disposable root")
+        else:
+            try:
+                disposable_root = _safe_relative_path(disposable_root, "SKILL.md Disposable root")
+            except ScaffoldError as exc:
+                errors.append(str(exc))
+                disposable_root = None
+        disposable_paths = _inline_code_values(skill_lines, "Disposable paths")
+        if not disposable_paths:
+            errors.append("SKILL.md must name disposable paths")
+        elif disposable_root is not None:
+            for path in disposable_paths:
+                try:
+                    normalized = _safe_relative_path(path, "SKILL.md disposable path")
+                    if not _path_is_within(normalized, disposable_root):
+                        errors.append("SKILL.md disposable path escapes the disposable root")
+                except ScaffoldError as exc:
+                    errors.append(str(exc))
+        evidence_root = _code_label_value(skill_lines, "Evidence root")
+        if evidence_root is None:
+            errors.append("SKILL.md must name a relative Evidence root")
+        else:
+            try:
+                evidence_root = _safe_relative_path(evidence_root, "SKILL.md Evidence root")
+            except ScaffoldError as exc:
+                errors.append(str(exc))
+                evidence_root = None
+        headings = [line.removeprefix("## ") for line in skill_lines if line.startswith("## ")]
+        if headings != list(SKILL_HEADING_ORDER):
             errors.append("generated SKILL.md sections are incomplete or out of order")
+        for section_name in ("Launch", "Doctor", "Evidence", "Cleanup"):
+            section = _section_lines(skill_lines, f"## {section_name}")
+            if section is None:
+                continue
+            for label in CONTEXT_LABELS.values():
+                _require_label(section[2], label, f"SKILL.md {section_name}", errors)
+        for section_name in SKILL_HEADING_ORDER[:-1]:
+            section = _section_lines(skill_lines, f"## {section_name}")
+            if section is None:
+                continue
+            if section_name in {"Launch", "Doctor", "Drive", "Cleanup"}:
+                _require_label(section[2], "Command", f"SKILL.md {section_name}", errors)
+        maintenance = _section_lines(skill_lines, "## Maintenance")
+        maintenance_ok = maintenance is not None and any(
+            "#4 follow-up" in line and "unsupported until #4" in line
+            for line in maintenance[2]
+        )
+        if not maintenance_ok:
+            errors.append("SKILL.md must state the unsupported #4 maintenance handoff")
         _check_links(skill_root)
-    except ScaffoldError as exc:
+    except (OSError, ScaffoldError) as exc:
         errors.append(str(exc))
 
-    feature_files = sorted(path for path in (skill_root / "features").glob("*.md") if path.name != "README.md")
+    feature_files = sorted(path for path in features_dir.glob("*.md") if path.name != "README.md")
     if not feature_files:
         errors.append("feature map has no feature files")
+    _validate_index(
+        index,
+        feature_files,
+        skill_root,
+        errors,
+        disposable_root=disposable_root,
+        evidence_root=evidence_root,
+    )
     for path in feature_files:
-        lines = path.read_text(encoding="utf-8").splitlines()
-        h2 = [line.removeprefix("## ") for line in lines if line.startswith("## ")]
-        if len(h2) != 4 or h2[:2] != list(HEADING_ORDER[:2]) or not h2[2].startswith(HEADING_ORDER[2]) or h2[3] != HEADING_ORDER[3]:
-            errors.append(f"{path.relative_to(skill_root)} has the wrong feature section contract")
-        for label in ("Actors:", "Fixtures:", "Action:", "Expected result:", "Evidence:"):
-            if not any(line.strip().startswith(f"- {label}") or line.strip().startswith(f"  - {label}") for line in lines):
-                errors.append(f"{path.relative_to(skill_root)} is missing {label}")
+        try:
+            _validate_feature(path, skill_root, errors, evidence_root=evidence_root)
+        except OSError as exc:
+            errors.append(f"{path.relative_to(skill_root)} cannot be read: {exc}")
     return tuple(errors)
+
+
+def _remove_path(path: Path) -> None:
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+        path.unlink()
+    else:
+        shutil.rmtree(path)
+
+
+def _remove_empty_parents(created_parents: list[Path]) -> None:
+    for directory in reversed(created_parents):
+        try:
+            mode = os.lstat(directory).st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+            continue
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
+def _existing_directory(path: Path, label: str) -> bool:
+    try:
+        mode = os.lstat(path).st_mode
+    except FileNotFoundError:
+        return False
+    if stat.S_ISLNK(mode):
+        raise ScaffoldError(f"{label} must not be a symlink: {path}")
+    if not stat.S_ISDIR(mode):
+        raise ScaffoldError(f"{label} must be a directory: {path}")
+    return True
 
 
 def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
     """Create a new generated skill and return its path."""
 
     spec = validate_spec(spec)
-    project_root = project_root.expanduser()
-    if project_root.is_symlink() or not project_root.is_dir():
+    project_root = _lexical_absolute(project_root.expanduser())
+    if _symlink_component_errors(project_root):
+        raise ScaffoldError("project root or one of its parents is a symlink")
+    try:
+        project_mode = os.lstat(project_root).st_mode
+    except OSError as exc:
+        raise ScaffoldError(f"project root cannot be inspected: {exc}") from exc
+    if stat.S_ISLNK(project_mode) or not stat.S_ISDIR(project_mode):
         raise ScaffoldError("project root must be an existing non-symlink directory")
-    project_root = project_root.resolve()
+
     target = project_root / ".agents" / "skills" / f"verify-{spec['app']['name']}"
     if os.path.lexists(target):
         raise CollisionError(f"output already exists: {target}")
     parent = project_root / ".agents"
-    for directory in (parent, parent / "skills"):
-        if os.path.lexists(directory) and directory.is_symlink():
-            raise ScaffoldError(f"output parent must not be a symlink: {directory}")
-        directory.mkdir(exist_ok=True)
-        if not directory.is_dir():
-            raise ScaffoldError(f"output parent is not a directory: {directory}")
-    staging = Path(tempfile.mkdtemp(prefix=f".{target.name}.staging-", dir=target.parent))
+    skills_parent = parent / "skills"
+    created_parents: list[Path] = []
+    staging: Path | None = None
+    target_reserved = False
+    moved_names: list[str] = []
     try:
+        for directory, label in ((parent, ".agents"), (skills_parent, ".agents/skills")):
+            if not _existing_directory(directory, f"output parent {label}"):
+                try:
+                    directory.mkdir()
+                except FileExistsError:
+                    _existing_directory(directory, f"output parent {label}")
+                else:
+                    created_parents.append(directory)
+        staging = Path(tempfile.mkdtemp(prefix=f".verify-{spec['app']['name']}.staging-", dir=skills_parent))
         _write_tree(spec, staging)
-        errors = validate_generated_skill(staging, expected_name=target.name)
+        errors = validate_generated_skill(
+            staging,
+            expected_name=target.name,
+            enforce_location=False,
+        )
         if errors:
             raise ScaffoldError("generated skill failed validation: " + "; ".join(errors))
-        if os.path.lexists(target):
-            raise CollisionError(f"output appeared during generation: {target}")
-        staging.rename(target)
+
+        # Reserve the final directory with an exclusive mkdir. Unlike rename,
+        # this cannot replace a target that appeared after the initial check.
+        try:
+            os.mkdir(target)
+        except FileExistsError as exc:
+            raise CollisionError(f"output appeared during generation: {target}") from exc
+        target_reserved = True
+        for child in sorted(staging.iterdir(), key=lambda path: path.name):
+            destination = target / child.name
+            if os.path.lexists(destination):
+                raise CollisionError(f"target changed during publication: {destination}")
+            child.rename(destination)
+            moved_names.append(child.name)
+        staging.rmdir()
+        staging = None
         return target
     except Exception:
-        if staging.exists():
-            shutil.rmtree(staging)
+        if staging is not None:
+            _remove_path(staging)
+        if target_reserved:
+            for name in reversed(moved_names):
+                _remove_path(target / name)
+            try:
+                target.rmdir()
+            except OSError:
+                pass
+        _remove_empty_parents(created_parents)
         raise
 
 

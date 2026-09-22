@@ -18,10 +18,18 @@ def main() -> int:
     check.add_argument("--state", type=Path, required=True)
     check.add_argument("--expected", required=True)
 
+    cleanup = subparsers.add_parser("cleanup")
+    cleanup.add_argument("--state", type=Path, required=True)
+
     args = parser.parse_args()
     if not args.state.is_file():
         print(f"state file missing: {args.state}")
         return 2
+    if args.command == "cleanup":
+        args.state.unlink()
+        print(f"cleanup removed: {args.state}")
+        return 0
+
     state = args.state.read_text(encoding="utf-8").strip()
     if args.command == "doctor":
         if state != "ready":
