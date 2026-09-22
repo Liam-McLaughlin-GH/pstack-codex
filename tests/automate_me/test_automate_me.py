@@ -442,6 +442,21 @@ class AutomateMeBehaviorTests(unittest.TestCase):
                 confirmed_signals(positive_records, ["keep replies short"]),
                 ("keep replies short",),
             )
+            fenced_paths = []
+            for index, fence in enumerate(("```", "~~~")):
+                path = records_dir / f"fenced-{index}.md"
+                path.write_text(
+                    f"{fence}markdown\n"
+                    "Preference candidate: keep replies short.\n"
+                    f"{fence}\n",
+                    encoding="utf-8",
+                )
+                fenced_paths.append(path.relative_to(workspace))
+            fenced_records = read_allowlisted_artifacts(workspace, fenced_paths)
+            self.assertEqual(
+                confirmed_signals(fenced_records, ["keep replies short"]),
+                (),
+            )
 
     def test_history_has_per_record_and_aggregate_bounds(self) -> None:
         with tempfile.TemporaryDirectory(prefix="automate-me-bounds-") as temp_dir:
@@ -570,7 +585,11 @@ Read [provenance](references/provenance.md).
             )
             self.assertIn("Approved local exception", (target / "SKILL.md").read_text())
             self.assertIn("Keep the release checklist visible", (target / "SKILL.md").read_text())
-            self.assertEqual((target / "references" / "working-style.md").read_text(), working_style)
+            updated_working_style = (target / "references" / "working-style.md").read_text()
+            self.assertIn("Keep the checklist visible", updated_working_style)
+            self.assertIn("- Keep replies short.", updated_working_style)
+            self.assertIn("records/slice-a.md", updated_working_style)
+            self.assertNotEqual(updated_working_style, working_style)
             self.assertEqual((target / "agents" / "openai.yaml").read_text(), openai_yaml)
             self.assertEqual(validate_skill_tree(target), ())
 
@@ -645,7 +664,13 @@ Read [provenance](references/provenance.md).
                 )
 
     def test_relative_links_reject_absolute_and_protocol_relative_targets(self) -> None:
-        for link in ("/tmp/outside.md", "//example.com/outside.md", "https://example.com/doc.md"):
+        for link in (
+            "/tmp/outside.md",
+            "//example.com/outside.md",
+            "https://example.com/doc.md",
+            "http://[::1",
+            "",
+        ):
             with tempfile.TemporaryDirectory(prefix="automate-me-links-") as temp_dir:
                 skill = Path(temp_dir) / "safe-skill"
                 skill.mkdir()
@@ -655,6 +680,65 @@ Read [provenance](references/provenance.md).
                 )
                 errors = validate_skill_tree(skill, require_provenance=False)
                 self.assertTrue(any("link" in error for error in errors), link)
+
+    def test_frontmatter_fallback_rejects_non_strings_and_unterminated_quotes(self) -> None:
+        cases = (
+            "description: true",
+            "description: [not, a, scalar]",
+            'description: "unterminated',
+            "description: 'unterminated",
+        )
+        for field in cases:
+            with tempfile.TemporaryDirectory(prefix="automate-me-frontmatter-") as temp_dir:
+                skill = Path(temp_dir) / "safe-skill"
+                skill.mkdir()
+                (skill / "SKILL.md").write_text(
+                    f"---\nname: safe-skill\n{field}\n---\n",
+                    encoding="utf-8",
+                )
+                errors = validate_skill_tree(skill, require_provenance=False)
+                self.assertTrue(
+                    any("frontmatter" in error for error in errors),
+                    field,
+                )
+
+    def test_readme_activation_guard_skips_dangling_collision_safely(self) -> None:
+        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(
+            '[ -e "$CODEX_SKILLS/$skill_name" ] || [ -L "$CODEX_SKILLS/$skill_name" ]',
+            readme,
+        )
+        with tempfile.TemporaryDirectory(prefix="automate-me-readme-activation-") as temp_dir:
+            root = Path(temp_dir)
+            repo_skills = root / "repo" / "skills"
+            discovery = root / "codex-skills"
+            (repo_skills / "literal%name").mkdir(parents=True)
+            discovery.mkdir()
+            (discovery / "literal%name").symlink_to(root / "missing-target")
+            script = """
+for skill_dir in "$REPO"/skills/*; do
+  skill_name=$(basename "$skill_dir")
+  if [ -e "$CODEX_SKILLS/$skill_name" ] || [ -L "$CODEX_SKILLS/$skill_name" ]; then
+    printf 'Skipping existing skill %s\\n' "$skill_name"
+    continue
+  fi
+  ln -s "$skill_dir" "$CODEX_SKILLS/$skill_name"
+done
+"""
+            completed = subprocess.run(
+                ["zsh", "-c", script],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={
+                    **os.environ,
+                    "REPO": str(root / "repo"),
+                    "CODEX_SKILLS": str(discovery),
+                },
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("Skipping existing skill literal%name", completed.stdout)
+            self.assertTrue((discovery / "literal%name").is_symlink())
 
     def test_every_bundled_markdown_file_is_link_checked_relative_to_itself(self) -> None:
         with tempfile.TemporaryDirectory(prefix="automate-me-bundled-links-") as temp_dir:
@@ -898,6 +982,173 @@ Read [style](references/style.md) and [provenance](references/provenance.md).
                     approval=self._approval("create"),
                 )
             self.assertTrue((workspace / "skills" / "alex-mode" / "SKILL.md").is_file())
+
+    def test_create_collision_cleanup_does_not_remove_target_appearing_after_preflight(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-create-race-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            evidence = self._write_evidence(workspace)
+            target = workspace / "skills" / "alex-mode"
+            draft = SkillDraft(
+                name="alex-mode",
+                description="Apply approved Alex conventions.",
+                rules=("Keep replies short.",),
+                evidence=evidence,
+            )
+
+            def create_competitor(point: str) -> None:
+                if point == "before_install":
+                    target.mkdir()
+                    (target / "concurrent.txt").write_text("keep me", encoding="utf-8")
+
+            with self.assertRaises(CollisionError):
+                write_generated_skill(
+                    target,
+                    draft,
+                    workspace_root=workspace,
+                    operation="create",
+                    approval=self._approval("create"),
+                    failure_injector=create_competitor,
+                )
+            self.assertEqual(
+                (target / "concurrent.txt").read_text(encoding="utf-8"),
+                "keep me",
+            )
+
+    def test_update_rejects_external_swap_before_publication(self) -> None:
+        for replacement_kind in ("directory", "symlink"):
+            with self.subTest(replacement_kind=replacement_kind):
+                with tempfile.TemporaryDirectory(prefix="automate-me-update-swap-") as temp_dir:
+                    workspace = Path(temp_dir) / "project"
+                    evidence = self._write_evidence(workspace)
+                    target = workspace / "skills" / "alex-mode"
+                    draft = SkillDraft(
+                        name="alex-mode",
+                        description="Apply approved Alex conventions.",
+                        rules=("Keep replies short.",),
+                        evidence=evidence,
+                    )
+                    write_generated_skill(
+                        target,
+                        draft,
+                        workspace_root=workspace,
+                        operation="create",
+                        approval=self._approval("create"),
+                    )
+                    displaced = workspace / "displaced-original"
+                    replacement = workspace / "external-replacement"
+
+                    def swap_target(point: str) -> None:
+                        if point != "before_install":
+                            return
+                        target.rename(displaced)
+                        replacement.mkdir()
+                        (replacement / "sentinel.txt").write_text(
+                            "external", encoding="utf-8"
+                        )
+                        if replacement_kind == "symlink":
+                            target.symlink_to(replacement, target_is_directory=True)
+                        else:
+                            target.mkdir()
+                            (target / "sentinel.txt").write_text(
+                                "external", encoding="utf-8"
+                            )
+
+                    with self.assertRaises(ScopeError):
+                        write_generated_skill(
+                            target,
+                            draft,
+                            workspace_root=workspace,
+                            operation="update",
+                            approval=self._approval("update"),
+                            failure_injector=swap_target,
+                        )
+                    self.assertTrue(displaced.exists())
+                    if replacement_kind == "symlink":
+                        self.assertTrue(target.is_symlink())
+                    else:
+                        self.assertEqual(
+                            (target / "sentinel.txt").read_text(encoding="utf-8"),
+                            "external",
+                        )
+
+    def test_update_collision_cleanup_preserves_target_appearing_after_backup(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-update-race-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            evidence = self._write_evidence(workspace)
+            target = workspace / "skills" / "alex-mode"
+            draft = SkillDraft(
+                name="alex-mode",
+                description="Apply approved Alex conventions.",
+                rules=("Keep replies short.",),
+                evidence=evidence,
+            )
+            write_generated_skill(
+                target,
+                draft,
+                workspace_root=workspace,
+                operation="create",
+                approval=self._approval("create"),
+            )
+
+            def create_competitor(point: str) -> None:
+                if point == "after_backup":
+                    target.mkdir()
+                    (target / "concurrent.txt").write_text("keep me", encoding="utf-8")
+                    raise OSError("stop after external target appears")
+
+            with self.assertRaises(OSError):
+                write_generated_skill(
+                    target,
+                    draft,
+                    workspace_root=workspace,
+                    operation="update",
+                    approval=self._approval("update"),
+                    failure_injector=create_competitor,
+                )
+            self.assertEqual(
+                (target / "concurrent.txt").read_text(encoding="utf-8"),
+                "keep me",
+            )
+
+    def test_update_bounds_preserved_regular_file_copies(self) -> None:
+        for mode in ("per-file", "aggregate"):
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory(prefix="automate-me-preserved-bounds-") as temp_dir:
+                    workspace = Path(temp_dir) / "project"
+                    evidence = self._write_evidence(workspace)
+                    target = workspace / "skills" / "alex-mode"
+                    draft = SkillDraft(
+                        name="alex-mode",
+                        description="Apply approved Alex conventions.",
+                        rules=("Keep replies short.",),
+                        evidence=evidence,
+                    )
+                    write_generated_skill(
+                        target,
+                        draft,
+                        workspace_root=workspace,
+                        operation="create",
+                        approval=self._approval("create"),
+                    )
+                    if mode == "per-file":
+                        (target / "unrelated.bin").write_bytes(
+                            b"x" * (automate_me.MAX_ARTIFACT_BYTES + 1)
+                        )
+                    else:
+                        for name in ("one.bin", "two.bin"):
+                            (target / name).write_bytes(
+                                b"x" * (automate_me.MAX_TOTAL_ARTIFACT_BYTES // 2)
+                            )
+                    with self.assertRaises(ScopeError):
+                        write_generated_skill(
+                            target,
+                            draft,
+                            workspace_root=workspace,
+                            operation="update",
+                            approval=self._approval("update"),
+                        )
 
     def _write_evidence(self, workspace: Path):
         records_dir = workspace / "records"

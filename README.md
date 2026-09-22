@@ -104,10 +104,10 @@ CODEX_SKILLS="${CODEX_HOME:-$HOME/.codex}/skills"
 mkdir -p "$CODEX_SKILLS"
 for skill_dir in "$REPO"/skills/*; do
   skill_name=$(basename "$skill_dir")
-  [ -e "$CODEX_SKILLS/$skill_name" ] && {
+  if [ -e "$CODEX_SKILLS/$skill_name" ] || [ -L "$CODEX_SKILLS/$skill_name" ]; then
     printf 'Skipping existing skill %s\n' "$skill_name"
     continue
-  }
+  fi
   ln -s "$skill_dir" "$CODEX_SKILLS/$skill_name"
 done
 ```

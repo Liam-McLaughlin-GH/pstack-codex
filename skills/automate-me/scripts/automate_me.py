@@ -36,13 +36,22 @@ MODE_RE = re.compile(r"(?<![a-z0-9-])([a-z][a-z0-9-]{0,62})-mode(?![a-z0-9-])")
 NAMED_RE = re.compile(
     r"\b(?:named|called)\s+([a-z][a-z0-9-]{0,62})(?![a-z0-9-])"
 )
-MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]*)\)")
 MARKDOWN_REFERENCE_LINK_RE = re.compile(
     r"(?m)^\s{0,3}\[[^\]]+\]:\s*(?:<([^>]+)>|(\S+))"
 )
+MARKDOWN_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 FRONTMATTER_METADATA_RE = re.compile(
     r"^\s*(slice_id|captured_at|recorded_at):\s*([^#\n]+?)\s*$",
     re.IGNORECASE | re.MULTILINE,
+)
+FRONTMATTER_NON_STRING_RE = re.compile(
+    r"^(?:[-+]?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?|"
+    r"[-+]?0[xX][0-9a-fA-F]+|[-+]?0[oO][0-7]+|[-+]?0[bB][01]+|"
+    r"[-+]?\.(?:inf|nan)|~|null|true|false|yes|no|on|off|"
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[Tt ][^ ]+)?|"
+    r"\[.*\]|\{.*\}|[!&*].*)$",
+    re.IGNORECASE,
 )
 STRUCTURED_SIGNAL_RE = re.compile(
     r"^\s*(preference(?:\s+(?:candidate|evidence))?|observed\s+preference|"
@@ -761,6 +770,18 @@ def _stat_at(parent_fd: int, name: str) -> os.stat_result | None:
         raise ScopeError(f"unable to inspect output entry: {name}") from exc
 
 
+def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev,
+        left.st_ino,
+        stat.S_IFMT(left.st_mode),
+    ) == (
+        right.st_dev,
+        right.st_ino,
+        stat.S_IFMT(right.st_mode),
+    )
+
+
 def _same_file_state(left: os.stat_result, right: os.stat_result) -> bool:
     return (
         left.st_dev,
@@ -777,6 +798,88 @@ def _same_file_state(left: os.stat_result, right: os.stat_result) -> bool:
         right.st_mtime_ns,
         right.st_ctime_ns,
     )
+
+
+def _remove_directory_contents(directory_fd: int) -> None:
+    """Best-effort cleanup through descriptors without following aliases."""
+
+    try:
+        entries = list(os.scandir(directory_fd))
+    except OSError:
+        return
+    for entry in entries:
+        name = entry.name
+        try:
+            entry_info = entry.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISDIR(entry_info.st_mode) and not stat.S_ISLNK(entry_info.st_mode):
+            try:
+                child_fd = _open_directory_at(
+                    directory_fd, name, label="owned cleanup directory"
+                )
+            except ScopeError:
+                continue
+            try:
+                child_info = os.fstat(child_fd)
+                if _same_file_identity(entry_info, child_info):
+                    _remove_directory_contents(child_fd)
+            finally:
+                os.close(child_fd)
+            current_info = _stat_at(directory_fd, name)
+            if current_info is None or not _same_file_identity(entry_info, current_info):
+                continue
+            try:
+                os.rmdir(name, dir_fd=directory_fd)
+            except OSError:
+                continue
+            continue
+        current_info = _stat_at(directory_fd, name)
+        if current_info is None or not _same_file_identity(entry_info, current_info):
+            continue
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except OSError:
+            continue
+
+
+def _remove_owned_directory(
+    parent_fd: int, name: str, expected_info: os.stat_result
+) -> bool:
+    """Remove a directory only while its directory entry is still ours."""
+
+    current_info = _stat_at(parent_fd, name)
+    if (
+        current_info is None
+        or stat.S_ISLNK(current_info.st_mode)
+        or not stat.S_ISDIR(current_info.st_mode)
+        or not _same_file_identity(current_info, expected_info)
+    ):
+        return False
+    try:
+        directory_fd = _open_directory_at(parent_fd, name, label="owned cleanup directory")
+    except ScopeError:
+        return False
+    try:
+        opened_info = os.fstat(directory_fd)
+        if not _same_file_identity(opened_info, expected_info):
+            return False
+        _remove_directory_contents(directory_fd)
+    finally:
+        os.close(directory_fd)
+    current_info = _stat_at(parent_fd, name)
+    if (
+        current_info is None
+        or stat.S_ISLNK(current_info.st_mode)
+        or not stat.S_ISDIR(current_info.st_mode)
+        or not _same_file_identity(current_info, expected_info)
+    ):
+        return current_info is None
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+    except OSError:
+        return False
+    return True
 
 
 def _read_relative_bytes(
@@ -1133,7 +1236,23 @@ def confirmed_signals(
 
     def structured_values(text: str) -> set[str]:
         values: set[str] = set()
+        fence_character: str | None = None
+        fence_length = 0
         for line in text.splitlines():
+            fence = MARKDOWN_FENCE_RE.match(line)
+            if fence_character is not None:
+                if (
+                    fence is not None
+                    and fence.group(1)[0] == fence_character
+                    and len(fence.group(1)) >= fence_length
+                ):
+                    fence_character = None
+                    fence_length = 0
+                continue
+            if fence is not None:
+                fence_character = fence.group(1)[0]
+                fence_length = len(fence.group(1))
+                continue
             if line.lstrip().startswith(">"):
                 continue
             match = NEGATIVE_SIGNAL_RE.match(line)
@@ -1203,7 +1322,10 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
         key, value = match.groups()
         if key in fields:
             raise ValidationError(f"duplicate frontmatter key: {key}")
+        value = value.strip()
         if value.startswith('"'):
+            if len(value) < 2 or not value.endswith('"'):
+                raise ValidationError(f"invalid quoted frontmatter value for {key}")
             try:
                 parsed = json.loads(value)
             except json.JSONDecodeError as exc:
@@ -1211,9 +1333,15 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
             if not isinstance(parsed, str):
                 raise ValidationError(f"frontmatter value must be a string: {key}")
             value = parsed
-        elif value.startswith("'") and value.endswith("'"):
+        elif value.startswith("'"):
+            if len(value) < 2 or not value.endswith("'"):
+                raise ValidationError(f"invalid quoted frontmatter value for {key}")
             value = value[1:-1].replace("''", "'")
-        fields[key] = value.strip()
+        else:
+            plain_value = value.split(" #", 1)[0].rstrip()
+            if FRONTMATTER_NON_STRING_RE.fullmatch(plain_value):
+                raise ValidationError(f"frontmatter value must be a string: {key}")
+        fields[key] = value
     return fields
 
 
@@ -1223,7 +1351,8 @@ def _markdown_link_targets(text: str) -> Iterator[str]:
         if target.startswith("<") and ">" in target:
             target = target[1 : target.find(">")]
         else:
-            target = target.split(None, 1)[0]
+            parts = target.split(None, 1)
+            target = parts[0] if parts else ""
         yield target
     for match in MARKDOWN_REFERENCE_LINK_RE.finditer(text):
         yield (match.group(1) or match.group(2)).strip()
@@ -1235,9 +1364,14 @@ def _relative_link_target(
     target = raw_target.strip()
     if target.startswith("<") and target.endswith(">"):
         target = target[1:-1].strip()
-    parsed = urlparse(target)
     if target.startswith("#"):
         return None
+    if not target:
+        raise ValidationError("reference link target is empty")
+    try:
+        parsed = urlparse(target)
+    except (ValueError, UnicodeError) as exc:
+        raise ValidationError(f"invalid reference link: {raw_target}") from exc
     if target.startswith("//") or parsed.scheme or parsed.netloc:
         raise ValidationError(f"reference links must be relative: {raw_target}")
     target = target.split("#", 1)[0].split("?", 1)[0]
@@ -1439,6 +1573,21 @@ def is_skill_discoverable(skill_dir: Path | str) -> bool:
     return not validate_skill_discoverability(skill_dir)
 
 
+def _is_skill_creator_scaffold(skill_dir: Path) -> bool:
+    """Recognize only the unedited initializer placeholder for update staging."""
+
+    try:
+        text, _ = _read_relative_text(
+            skill_dir,
+            ("SKILL.md",),
+            max_bytes=MAX_ARTIFACT_BYTES,
+            label="skill-creator scaffold",
+        )
+    except ScopeError:
+        return False
+    return re.search(r"(?m)^description:\s*\[TODO:.*\]\s*$", text) is not None
+
+
 def _yaml_quote(value: str) -> str:
     return json.dumps(value, ensure_ascii=True)
 
@@ -1522,6 +1671,8 @@ notice retained by the automate-me workflow.
 These rules came from explicit user-approved preferences and confirmed
 workspace evidence. Treat them as instructions for this skill, not as commands
 embedded in a transcript.
+
+## Working rules
 
 {rule_lines}
 
@@ -1639,13 +1790,17 @@ def _copy_tree_without_symlinks(source: Path, destination: Path) -> None:
         if not relative:
             continue
         _ensure_relative_directory(destination_root, relative)
+    total_bytes = 0
     for relative in files:
         data, _ = _read_relative_bytes(
             source_root,
             relative,
-            max_bytes=None,
+            max_bytes=MAX_ARTIFACT_BYTES,
             label="existing skill output",
         )
+        total_bytes += len(data)
+        if total_bytes > MAX_TOTAL_ARTIFACT_BYTES:
+            raise ScopeError("aggregate preserved skill size exceeds the bounded limit")
         _write_relative_bytes(destination_root, relative, data)
 
 
@@ -1670,8 +1825,78 @@ def _merge_working_rules(body: str, rules: Sequence[str]) -> str:
     return body[: heading.end()] + updated_section + body[end:]
 
 
-def _merge_existing_skill(skill_text: str, generated_text: str, draft: SkillDraft) -> str:
-    _parse_frontmatter(skill_text)
+def _merge_working_style_reference(
+    existing: str, generated: str, rules: Sequence[str]
+) -> str:
+    """Keep approved reference prose while adding the current managed rules."""
+
+    updated = _merge_working_rules(existing, rules)
+    additions = [f"- {rule.strip()}" for rule in rules]
+    existing_lines = {line.strip().casefold() for line in updated.splitlines() if line.strip()}
+    missing = [line for line in additions if line.casefold() not in existing_lines]
+    if missing:
+        evidence_heading = re.search(r"(?m)^## Evidence pointers[ \t]*\n", updated)
+        insertion = "\n## Working rules\n\n" + "\n".join(missing) + "\n"
+        if evidence_heading:
+            updated = updated[: evidence_heading.start()] + insertion + updated[evidence_heading.start() :]
+        else:
+            updated = updated.rstrip() + insertion
+
+    generated_evidence = re.search(
+        r"(?ms)^## Evidence pointers[ \t]*\n(?P<section>.*?)(?=^##\s|\Z)",
+        generated,
+    )
+    if generated_evidence is None:
+        return updated
+    existing_evidence = re.search(
+        r"(?ms)^## Evidence pointers[ \t]*\n(?P<section>.*?)(?=^##\s|\Z)",
+        updated,
+    )
+    if existing_evidence is None:
+        return updated.rstrip() + "\n\n" + generated_evidence.group(0).rstrip() + "\n"
+
+    pointer_lines = [
+        line
+        for line in generated_evidence.group("section").splitlines()
+        if line.strip()
+    ]
+    existing_section = existing_evidence.group("section")
+    for pointer_line in pointer_lines:
+        path_match = re.match(r"\s*-\s+`([^`]+)`\s+\([^)]+\)\s*$", pointer_line)
+        if path_match is None:
+            continue
+        path = re.escape(path_match.group(1))
+        existing_section = re.sub(
+            rf"(?m)^\s*-\s+`{path}`\s+\([^)]+\)\s*$\n?",
+            "",
+            existing_section,
+        )
+    updated_section = existing_section.rstrip()
+    if updated_section:
+        updated_section += "\n"
+    updated_section += "\n".join(pointer_lines) + "\n"
+    return (
+        updated[: existing_evidence.start("section")]
+        + updated_section
+        + updated[existing_evidence.end("section") :]
+    )
+
+
+def _merge_existing_skill(
+    skill_text: str,
+    generated_text: str,
+    draft: SkillDraft,
+    *,
+    allow_skill_creator_scaffold: bool = False,
+) -> str:
+    try:
+        _parse_frontmatter(skill_text)
+    except ValidationError as exc:
+        if not (
+            allow_skill_creator_scaffold
+            and str(exc) == "frontmatter value must be a string: description"
+        ):
+            raise
     end = skill_text.find("\n---\n", 4)
     if end < 0:
         raise ValidationError("existing SKILL.md frontmatter is not closed")
@@ -1713,7 +1938,10 @@ def _prepare_update_tree(
     )
     generated_files = dict(generated_files)
     generated_files["SKILL.md"] = _merge_existing_skill(
-        existing_skill, generated_files["SKILL.md"], draft
+        existing_skill,
+        generated_files["SKILL.md"],
+        draft,
+        allow_skill_creator_scaffold=_is_skill_creator_scaffold(staged_root),
     )
     try:
         provenance, _ = _read_relative_text(
@@ -1732,14 +1960,28 @@ def _prepare_update_tree(
             generated_files["references/provenance.md"] = (
                 provenance.rstrip() + "\n\n" + generated_files["references/provenance.md"]
             )
-    for relative, parts in (
-        ("references/working-style.md", ("references", "working-style.md")),
-        ("agents/openai.yaml", ("agents", "openai.yaml")),
+    try:
+        existing_working_style, _ = _read_relative_text(
+            staged_root,
+            ("references", "working-style.md"),
+            max_bytes=MAX_ARTIFACT_BYTES,
+            label="existing working-style reference",
+        )
+    except ScopeError as exc:
+        if "does not exist" not in str(exc):
+            raise
+    else:
+        generated_files["references/working-style.md"] = _merge_working_style_reference(
+            existing_working_style,
+            generated_files["references/working-style.md"],
+            draft.rules,
+        )
+    if _relative_regular_file_exists(
+        staged_root,
+        ("agents", "openai.yaml"),
+        label="existing generated reference",
     ):
-        if _relative_regular_file_exists(
-            staged_root, parts, label="existing generated reference"
-        ):
-            generated_files.pop(relative, None)
+        generated_files.pop("agents/openai.yaml", None)
     _write_relative_files(staged_root, generated_files)
 
 
@@ -1768,6 +2010,7 @@ def _install_staged_tree(
     operation: str,
     failure_injector: Callable[[str], None] | None,
     target_parent_fd: int,
+    expected_target_info: os.stat_result | None,
     validate_installed: Callable[[], None],
 ) -> None:
     if failure_injector:
@@ -1776,6 +2019,7 @@ def _install_staged_tree(
     if operation == "create":
         target_fd: int | None = None
         stage_fd: int | None = None
+        owned_target_info: os.stat_result | None = None
         try:
             try:
                 os.mkdir(target.name, 0o755, dir_fd=target_parent_fd)
@@ -1784,6 +2028,7 @@ def _install_staged_tree(
             target_fd = _open_directory_at(
                 target_parent_fd, target.name, label="new skill output"
             )
+            owned_target_info = os.fstat(target_fd)
             stage_fd = _open_directory(stage_root, label="staged skill output")
             with os.scandir(stage_fd) as entries:
                 for entry in entries:
@@ -1802,7 +2047,10 @@ def _install_staged_tree(
             if failure_injector:
                 failure_injector("after_install")
         except BaseException:
-            _remove_tree_or_file(target)
+            if owned_target_info is not None:
+                _remove_owned_directory(
+                    target_parent_fd, target.name, owned_target_info
+                )
             raise
         finally:
             if stage_fd is not None:
@@ -1812,42 +2060,99 @@ def _install_staged_tree(
             os.close(stage_parent_fd)
         return
 
+    if expected_target_info is None:
+        raise ScopeError("update publication is missing the expected target identity")
     backup_name = f".{target.name}.backup-{uuid.uuid4().hex}"
-    backup = target.with_name(backup_name)
     stage_fd: int | None = None
+    backup_info: os.stat_result | None = None
+    installed_target_info: os.stat_result | None = None
     try:
+        current_info = _stat_at(target_parent_fd, target.name)
+        if (
+            current_info is None
+            or stat.S_ISLNK(current_info.st_mode)
+            or not stat.S_ISDIR(current_info.st_mode)
+            or not _same_file_identity(current_info, expected_target_info)
+        ):
+            raise ScopeError(f"update target changed before publication: {target}")
         os.rename(
             target.name,
             backup_name,
             src_dir_fd=target_parent_fd,
             dst_dir_fd=target_parent_fd,
         )
+        backup_info = _stat_at(target_parent_fd, backup_name)
+        if (
+            backup_info is None
+            or stat.S_ISLNK(backup_info.st_mode)
+            or not stat.S_ISDIR(backup_info.st_mode)
+            or not _same_file_identity(backup_info, expected_target_info)
+        ):
+            raise ScopeError(f"update target changed while it was moved: {target}")
         if failure_injector:
             failure_injector("after_backup")
         if _stat_at(target_parent_fd, target.name) is not None:
             raise CollisionError(f"update target appeared during publication: {target}")
         stage_fd = _open_directory(stage_root.parent, label="stage parent")
+        staged_info = _stat_at(stage_fd, stage_root.name)
+        if (
+            staged_info is None
+            or stat.S_ISLNK(staged_info.st_mode)
+            or not stat.S_ISDIR(staged_info.st_mode)
+        ):
+            raise ScopeError(f"staged skill output is not a directory: {stage_root}")
         os.rename(
             stage_root.name,
             target.name,
             src_dir_fd=stage_fd,
             dst_dir_fd=target_parent_fd,
         )
+        installed_target_info = _stat_at(target_parent_fd, target.name)
+        if (
+            installed_target_info is None
+            or stat.S_ISLNK(installed_target_info.st_mode)
+            or not stat.S_ISDIR(installed_target_info.st_mode)
+            or not _same_file_identity(installed_target_info, staged_info)
+        ):
+            raise ScopeError(f"installed target changed during publication: {target}")
         validate_installed()
         if failure_injector:
             failure_injector("after_install")
     except BaseException:
-        _remove_tree_or_file(target)
-        if _stat_at(target_parent_fd, backup_name) is not None:
-            os.rename(
-                backup_name,
-                target.name,
-                src_dir_fd=target_parent_fd,
-                dst_dir_fd=target_parent_fd,
+        if installed_target_info is not None:
+            _remove_owned_directory(
+                target_parent_fd, target.name, installed_target_info
             )
+        if backup_info is not None:
+            current_info = _stat_at(target_parent_fd, target.name)
+            if current_info is None:
+                try:
+                    os.rename(
+                        backup_name,
+                        target.name,
+                        src_dir_fd=target_parent_fd,
+                        dst_dir_fd=target_parent_fd,
+                    )
+                except FileExistsError:
+                    pass
+            elif (
+                installed_target_info is not None
+                and _same_file_identity(current_info, installed_target_info)
+                and _remove_owned_directory(
+                    target_parent_fd, target.name, installed_target_info
+                )
+                and _stat_at(target_parent_fd, target.name) is None
+            ):
+                os.rename(
+                    backup_name,
+                    target.name,
+                    src_dir_fd=target_parent_fd,
+                    dst_dir_fd=target_parent_fd,
+                )
         raise
     else:
-        _remove_tree_or_file(backup)
+        if backup_info is not None:
+            _remove_owned_directory(target_parent_fd, backup_name, backup_info)
     finally:
         if stage_fd is not None:
             os.close(stage_fd)
@@ -1911,6 +2216,7 @@ def write_generated_skill(
         parent_fd: int | None = None
         stage_parent: Path | None = None
         stage_root: Path | None = None
+        expected_target_info: os.stat_result | None = None
         try:
             parent_fd = _open_directory_chain(
                 root_fd, canonical_target.relative_parts[:-1], create=True
@@ -1926,6 +2232,7 @@ def write_generated_skill(
                     or not stat.S_ISDIR(existing_info.st_mode)
                 ):
                     raise ScopeError(f"update target is not an existing directory: {target}")
+                expected_target_info = existing_info
                 existing_fd = _open_directory_at(
                     parent_fd, canonical_target.relative_parts[-1], label="update target"
                 )
@@ -1939,10 +2246,17 @@ def write_generated_skill(
                 if existing_errors:
                     if any("symlink" in error for error in existing_errors):
                         raise ScopeError("existing skill tree contains a symlink output")
-                    raise ValidationError(
-                        "update requires a structurally valid existing skill: "
-                        + "; ".join(existing_errors)
-                    )
+                    scaffold_errors = {
+                        "frontmatter value must be a string: description"
+                    }
+                    if not (
+                        _is_skill_creator_scaffold(target)
+                        and set(existing_errors) <= scaffold_errors
+                    ):
+                        raise ValidationError(
+                            "update requires a structurally valid existing skill: "
+                            + "; ".join(existing_errors)
+                        )
 
             stage_parent, stage_root = _new_stage(target)
             if operation == "update":
@@ -1968,6 +2282,7 @@ def write_generated_skill(
                 operation,
                 failure_injector,
                 parent_fd,
+                expected_target_info,
                 validate_installed,
             )
         finally:
