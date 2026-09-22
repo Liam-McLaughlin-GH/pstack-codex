@@ -14,15 +14,21 @@ from urllib.parse import unquote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
-LOCAL_SEAMS = (
-    "~/.cursor",
-    ".cursor/",
-    "subagent_type",
-    "run_in_background",
-    "agent-transcripts",
-    "cursor-team-kit",
-    "AskQuestion",
-    "create-skill",
+ACTIVE_SEAMS = (
+    ("Cursor path", re.compile(r"(?:~/?\.cursor(?:/|$)|\.cursor/)", re.IGNORECASE)),
+    (
+        "Cursor Task call",
+        re.compile(r"(?:\b(?:call|use|invoke)\s+(?:the\s+)?Cursor\s+Task\b|\bCursor\s+Task\s+(?:tool|call)\b)", re.IGNORECASE),
+    ),
+    ("subagent_type", re.compile(r"\bsubagent_type\s*[:=]", re.IGNORECASE)),
+    ("background-agent setting", re.compile(r"\brun_in_background\s*[:=]", re.IGNORECASE)),
+    ("transcript path", re.compile(r"\bagent-transcripts(?:/|\\)", re.IGNORECASE)),
+    ("Cursor team kit", re.compile(r"\bcursor-team-kit(?:/|\\|$)", re.IGNORECASE)),
+    (
+        "AskQuestion call",
+        re.compile(r"(?:\b(?:call|use|invoke)\s+AskQuestion\b|\bAskQuestion\s*\()", re.IGNORECASE),
+    ),
+    ("create-skill call", re.compile(r"(?:/create-skill\b|\bcreate-skill\s+(?:tool|command)\b)", re.IGNORECASE)),
 )
 BOUNDARY_WORDS = re.compile(
     r"\b(?:unsupported|not supported|does not|do not|don't|never|cannot|can't|unavailable|fallback|boundary|not ported|not copied)\b",
@@ -30,7 +36,14 @@ BOUNDARY_WORDS = re.compile(
 )
 TOP_LEVEL_FIELD = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]*(?P<value>.*))?$")
 MARKDOWN_LINK = re.compile(r"(?<!!)\[[^\]]*\]\((?:<(?P<bracket>[^>]+)>|(?P<plain>[^)\s]+))[^)]*\)")
-REFERENCE_LINK = re.compile(r"^\s*\[[^\]]+\]:\s*(?:<(?P<bracket>[^>]+)>|(?P<plain>\S+))\s*$")
+REFERENCE_DEFINITION = re.compile(
+    r"^[ \t]{0,3}\[(?P<label>[^\]]+)\]:[ \t]*(?:<(?P<bracket>[^>]+)>|(?P<plain>\S+))(?:[ \t]+.*)?$"
+)
+REFERENCE_DEFINITION_PREFIX = re.compile(r"^[ \t]{0,3}\[(?P<label>[^\]]+)\]:")
+REFERENCE_USE = re.compile(r"(?<!!)\[(?P<text>[^\]]+)\]\[(?P<label>[^\]]*)\]")
+FENCE = re.compile(r"^\s*(```|~~~)")
+CODE_SPAN = re.compile(r"`[^`]*`")
+TEXT_SUFFIXES = {".md", ".py", ".sh", ".toml", ".ts", ".js", ".json", ".yaml", ".yml"}
 
 
 class ValidationError(ValueError):
@@ -69,7 +82,7 @@ def parse_frontmatter(text: str) -> Frontmatter:
 
     fields: dict[str, str] = {}
     for line in lines[1:closing]:
-        if not line.strip() or line.lstrip().startswith("#") or line[:1].isspace():
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
         match = TOP_LEVEL_FIELD.match(line)
         if not match:
@@ -84,39 +97,72 @@ def parse_frontmatter(text: str) -> Frontmatter:
     return Frontmatter(fields, closing + 1)
 
 
-def _iter_local_links(path: Path, text: str):
+def _reference_label(label: str) -> str:
+    return " ".join(label.split()).casefold()
+
+
+def _markdown_content_lines(text: str) -> list[tuple[int, str]]:
+    lines: list[tuple[int, str]] = []
+    in_fence = False
     for line_number, line in enumerate(text.splitlines(), start=1):
-        for match in MARKDOWN_LINK.finditer(line):
-            target = match.groupdict().get("bracket") or match.groupdict().get("plain")
-            if target:
-                yield line_number, target
-        match = REFERENCE_LINK.match(line)
-        if match:
-            target = match.groupdict().get("bracket") or match.groupdict().get("plain")
-            if target:
-                yield line_number, target
+        if FENCE.match(line):
+            in_fence = not in_fence
+            continue
+        if not in_fence:
+            lines.append((line_number, CODE_SPAN.sub("", line)))
+    return lines
+
+
+def _check_link_target(root: Path, path: Path, line_number: int, target: str, errors: list[str]) -> None:
+    parsed = urlsplit(target)
+    if parsed.scheme or parsed.netloc or target.startswith("#"):
+        return
+    link_path = unquote(parsed.path)
+    if not link_path:
+        return
+    candidate = (path.parent / link_path).resolve()
+    if not candidate.is_relative_to(root.resolve()):
+        errors.append(f"{path.relative_to(root)}:{line_number} link escapes skill/repository scope: {target}")
+    elif not candidate.exists():
+        errors.append(f"{path.relative_to(root)}:{line_number} link target does not exist: {target}")
 
 
 def _check_links(root: Path, path: Path, text: str, errors: list[str]) -> None:
-    for line_number, target in _iter_local_links(path, text):
-        parsed = urlsplit(target)
-        if parsed.scheme or parsed.netloc or target.startswith("#"):
+    definitions: dict[str, str] = {}
+    lines = _markdown_content_lines(text)
+    for line_number, line in lines:
+        prefix = REFERENCE_DEFINITION_PREFIX.match(line)
+        if not prefix:
             continue
-        link_path = unquote(parsed.path)
-        if not link_path:
+        definition = REFERENCE_DEFINITION.match(line)
+        if not definition:
+            errors.append(f"{path.relative_to(root)}:{line_number} has a malformed Markdown reference definition")
             continue
-        candidate = (path.parent / link_path).resolve()
-        if not candidate.is_relative_to(root.resolve()):
-            errors.append(f"{path.relative_to(root)}:{line_number} link escapes skill/repository scope: {target}")
-        elif not candidate.exists():
-            errors.append(f"{path.relative_to(root)}:{line_number} link target does not exist: {target}")
+        label = _reference_label(prefix.group("label"))
+        if label in definitions:
+            errors.append(f"{path.relative_to(root)}:{line_number} repeats Markdown reference definition {label!r}")
+            continue
+        target = definition.groupdict().get("bracket") or definition.groupdict().get("plain")
+        if target:
+            definitions[label] = target
+            _check_link_target(root, path, line_number, target, errors)
+
+    for line_number, line in lines:
+        for match in MARKDOWN_LINK.finditer(line):
+            target = match.groupdict().get("bracket") or match.groupdict().get("plain")
+            if target:
+                _check_link_target(root, path, line_number, target, errors)
+        for match in REFERENCE_USE.finditer(line):
+            label = _reference_label(match.group("label") or match.group("text"))
+            if label not in definitions:
+                errors.append(f"{path.relative_to(root)}:{line_number} unresolved Markdown reference: {label!r}")
 
 
 def _check_boundary_mentions(root: Path, path: Path, text: str, errors: list[str]) -> None:
     lines = text.splitlines()
     for line_number, line in enumerate(lines):
-        for marker in LOCAL_SEAMS:
-            if marker.lower() not in line.lower():
+        for marker, pattern in ACTIVE_SEAMS:
+            if not pattern.search(line):
                 continue
             context = "\n".join(lines[max(0, line_number - 2) : min(len(lines), line_number + 3)])
             if not BOUNDARY_WORDS.search(context):
@@ -200,13 +246,16 @@ def verify_port(root: Path, *, run_helpers: bool = True) -> list[str]:
             errors.append(f"{relative} has invalid frontmatter: {exc}")
             text = ""
 
-        for document in sorted(skill_dir.rglob("*.md")):
+        for document in sorted(
+            path for path in skill_dir.rglob("*") if path.is_file() and path.suffix.lower() in TEXT_SUFFIXES
+        ):
             try:
                 document_text = document.read_text(encoding="utf-8")
             except OSError as exc:
                 errors.append(f"{document.relative_to(root)} cannot be read: {exc}")
                 continue
-            _check_links(root, document, document_text, errors)
+            if document.suffix.lower() == ".md":
+                _check_links(root, document, document_text, errors)
             _check_boundary_mentions(root, document, document_text, errors)
 
     if len(names) != len(skill_dirs):

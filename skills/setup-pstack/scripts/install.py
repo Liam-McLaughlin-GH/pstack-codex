@@ -22,6 +22,16 @@ class InstallError(RuntimeError):
     """Raised when a skill cannot be installed without risking a collision."""
 
 
+def _is_trusted_system_symlink(path: Path) -> bool:
+    if path not in {Path("/var"), Path("/tmp")}:
+        return False
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        return False
+    return resolved in {Path("/private/var"), Path("/private/tmp")}
+
+
 @dataclass(frozen=True)
 class InstallPlan:
     source: Path
@@ -44,21 +54,15 @@ class InstallPlan:
         return result
 
 
-def _is_within(path: Path, parent: Path) -> bool:
-    try:
-        path.relative_to(parent)
-    except ValueError:
-        return False
-    return True
-
-
 def _validate_skill_name(name: str) -> None:
     if not name or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in name):
         raise InstallError(f"invalid skill directory name: {name!r}")
 
 
 def _validate_source(source: Path) -> tuple[str, ...]:
-    source = source.resolve()
+    source = source.expanduser().absolute()
+    if source.is_symlink():
+        raise InstallError(f"skill source is a symlink: {source}")
     if not source.is_dir():
         raise InstallError(f"skill source is not a directory: {source}")
     if not (source / "SKILL.md").is_file():
@@ -72,20 +76,12 @@ def _validate_source(source: Path) -> tuple[str, ...]:
         for directory in directories:
             candidate = current_path / directory
             if candidate.is_symlink():
-                resolved = candidate.resolve(strict=False)
-                if not _is_within(resolved, source):
-                    raise InstallError(f"source symlink escapes skill: {candidate}")
-                if not resolved.exists():
-                    raise InstallError(f"source directory symlink is broken: {candidate}")
+                raise InstallError(f"source contains a symlink: {candidate}")
         for filename in filenames:
             candidate = current_path / filename
             relative = candidate.relative_to(source).as_posix()
             if candidate.is_symlink():
-                resolved = candidate.resolve(strict=False)
-                if not _is_within(resolved, source):
-                    raise InstallError(f"source symlink escapes skill: {candidate}")
-                # Keep an internal broken link in the source long enough for
-                # copytree to fail and exercise the transaction cleanup path.
+                raise InstallError(f"source contains a symlink: {candidate}")
             elif not candidate.is_file():
                 raise InstallError(f"source contains a non-file entry: {candidate}")
             files.append(relative)
@@ -95,18 +91,15 @@ def _validate_source(source: Path) -> tuple[str, ...]:
 def _validate_destination(destination: Path) -> None:
     """Reject an existing symlink anywhere in the destination path."""
 
-    current = destination
-    while True:
-        if current.is_symlink():
+    destination = destination.expanduser().absolute()
+    current = Path(destination.anchor)
+    for component in destination.parts[1:]:
+        current /= component
+        if current.is_symlink() and not _is_trusted_system_symlink(current):
             raise InstallError(f"destination path contains a symlink: {current}")
         if current.exists():
             if not current.is_dir():
                 raise InstallError(f"destination path is not a directory: {current}")
-            return
-        parent = current.parent
-        if parent == current:
-            return
-        current = parent
 
 
 def _read_tree(root: Path) -> dict[str, bytes]:
@@ -139,10 +132,30 @@ def _same_contents(source: Path, target: Path) -> bool:
     return source_files == target_files
 
 
+def _missing_directories(path: Path) -> list[Path]:
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return missing
+
+
+def _cleanup_empty_directories(paths: list[Path]) -> None:
+    for path in sorted(set(paths), key=lambda item: len(item.parts), reverse=True):
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+
+
 def preview_install(source: Path, destination: Path) -> InstallPlan:
     """Build an install plan without creating or changing a path."""
 
-    source = source.resolve()
+    source = source.expanduser().absolute()
     destination = destination.expanduser().absolute()
     _validate_destination(destination)
     files = _validate_source(source)
@@ -175,7 +188,7 @@ def preview_install(source: Path, destination: Path) -> InstallPlan:
 
 
 def apply_install(source: Path, destination: Path) -> InstallPlan:
-    """Install a skill with a staged copy and cleanup on every failure."""
+    """Install a skill with atomic staged publication and cleanup on failure."""
 
     plan = preview_install(source, destination)
     if plan.status != "create":
@@ -184,52 +197,31 @@ def apply_install(source: Path, destination: Path) -> InstallPlan:
         raise InstallError(plan.reason or f"cannot install into {plan.target}")
 
     destination = plan.destination
-    destination.mkdir(parents=True, exist_ok=True)
-    if not destination.is_dir() or destination.is_symlink():
-        raise InstallError(f"destination is not a real directory: {destination}")
-
-    staging = Path(tempfile.mkdtemp(prefix=f".{plan.source.name}.install-", dir=destination))
-    target_created = False
+    created_directories: list[Path] = []
+    staging: Path | None = None
     completed = False
-    moved_children: list[Path] = []
     try:
-        # Do not dereference a symlink outside the validated source tree.
+        created_directories = _missing_directories(destination)
+        for directory in reversed(created_directories):
+            directory.mkdir()
+        _validate_destination(destination)
+        staging = Path(tempfile.mkdtemp(prefix=f".{plan.source.name}.install-", dir=destination))
+        _validate_source(plan.source)
         shutil.copytree(plan.source, staging, symlinks=False, dirs_exist_ok=True)
-
-        # Reserve the final name. mkdir(exist_ok=False) refuses both real
-        # collisions and broken symlinks without following or deleting them.
-        plan.target.mkdir()
-        target_created = True
-        for child in sorted(staging.iterdir(), key=lambda path: path.name):
-            moved = plan.target / child.name
-            shutil.move(str(child), str(moved))
-            moved_children.append(moved)
-        staging.rmdir()
+        _validate_source(plan.source)
+        if os.path.lexists(plan.target):
+            raise InstallError(f"target appeared during install: {plan.target}")
+        os.rename(staging, plan.target)
+        staging = None
         completed = True
         return plan
-    except FileExistsError as exc:
-        raise InstallError(f"target appeared during install: {plan.target}") from exc
     except (OSError, shutil.Error) as exc:
         raise InstallError(f"install failed and was rolled back: {exc}") from exc
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
-        if target_created and not completed and plan.target.exists():
-            # Remove only content created by this invocation. If another
-            # writer appears while the transaction is open, preserve entries
-            # that were not moved from our staging directory.
-            try:
-                known_names = {path.name for path in moved_children}
-                unknown_children = [child for child in plan.target.iterdir() if child.name not in known_names]
-                if not unknown_children:
-                    shutil.rmtree(plan.target)
-                else:
-                    for child in moved_children:
-                        if child.is_dir() and not child.is_symlink():
-                            shutil.rmtree(child)
-                        elif child.exists() or child.is_symlink():
-                            child.unlink()
-            except OSError:
-                pass
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        if not completed:
+            _cleanup_empty_directories(created_directories)
 
 
 def _format_result(plan: InstallPlan, as_json: bool) -> str:

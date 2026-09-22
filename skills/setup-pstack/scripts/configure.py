@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import tomllib
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -79,6 +80,17 @@ ROLE_SPECS = (
     RoleSpec("interrogate-reviewers", "interrogate reviews", fanout=4),
 )
 ROLE_BY_NAME = {spec.role: spec for spec in ROLE_SPECS}
+NO_INFERRED_DEFAULT = object()
+
+
+def _is_trusted_system_symlink(path: Path) -> bool:
+    if path not in {Path("/var"), Path("/tmp")}:
+        return False
+    try:
+        resolved = path.resolve(strict=True)
+    except OSError:
+        return False
+    return resolved in {Path("/private/var"), Path("/private/tmp")}
 
 
 def _catalog_entries(payload: object) -> list[dict[str, object]]:
@@ -196,18 +208,15 @@ def _parse_role_values(values: list[str]) -> dict[str, str]:
 def _validate_agents_root(agents_root: Path) -> None:
     """Reject an existing symlink or non-directory in the write path."""
 
-    current = agents_root
-    while True:
-        if current.is_symlink():
+    agents_root = agents_root.expanduser().absolute()
+    current = Path(agents_root.anchor)
+    for component in agents_root.parts[1:]:
+        current /= component
+        if current.is_symlink() and not _is_trusted_system_symlink(current):
             raise ConfigurationError(f"agents root path contains a symlink: {current}")
         if current.exists():
             if not current.is_dir():
                 raise ConfigurationError(f"agents root path is not a directory: {current}")
-            return
-        parent = current.parent
-        if parent == current:
-            return
-        current = parent
 
 
 def _existing_agents(agents_root: Path) -> dict[str, tuple[str | None, str | None]]:
@@ -248,6 +257,45 @@ def _selected_models(spec: RoleSpec, choice: str | None) -> tuple[str | None, ..
     return tuple(None if value in {"inherit-parent", "auto"} else value for value in values)
 
 
+def _existing_selection(spec: RoleSpec, existing: dict[str, tuple[str | None, str | None]]) -> tuple[str | None, ...]:
+    return tuple(existing.get(_agent_name(spec, index), (None, None))[0] for index in range(1, spec.fanout + 1))
+
+
+def _inferred_default_model(existing: dict[str, tuple[str | None, str | None]]) -> str | None | object:
+    """Infer the previous default from the generated singleton roles.
+
+    Generated files do not record whether a choice came from the default or a
+    role override. The most common singleton-role model is the only durable
+    signal available, while panel lists retain their shape when they differ
+    from that inferred default.
+    """
+
+    values = [
+        existing[_agent_name(spec, 1)][0]
+        for spec in ROLE_SPECS
+        if spec.fanout == 1 and _agent_name(spec, 1) in existing
+    ]
+    if not values:
+        values = [model for model, _effort in existing.values()]
+    if not values:
+        return NO_INFERRED_DEFAULT
+    return Counter(values).most_common(1)[0][0]
+
+
+def _preserve_existing_selection(
+    spec: RoleSpec,
+    existing: dict[str, tuple[str | None, str | None]],
+    inferred_default: str | None | object,
+) -> bool:
+    if inferred_default is NO_INFERRED_DEFAULT:
+        return False
+    names = [_agent_name(spec, index) for index in range(1, spec.fanout + 1)]
+    if not all(name in existing for name in names):
+        return False
+    values = [existing[name][0] for name in names]
+    return values[0] != inferred_default if spec.fanout == 1 else any(value != inferred_default for value in values)
+
+
 def _agent_name(spec: RoleSpec, index: int) -> str:
     base = f"pstack-{spec.role}"
     return base if spec.fanout == 1 else f"{base}-{index}"
@@ -281,10 +329,8 @@ def build_plan(
 ) -> list[AgentPlan]:
     if budget is not None and budget not in BUDGET_TARGET:
         raise ConfigurationError(f"unknown budget: {budget}")
-    if default_model in {"inherit-parent", "auto"}:
-        default_model = None
     choices = _parse_role_values(role_values or [])
-    if default_model is not None and default_model not in models:
+    if default_model not in {None, "inherit-parent", "auto"} and default_model not in models:
         raise ConfigurationError(f"model was not reported by Codex: {default_model}")
     for choice in choices.values():
         for model_name in choice.split(","):
@@ -292,14 +338,21 @@ def build_plan(
                 raise ConfigurationError(f"model was not reported by Codex: {model_name}")
 
     existing = _existing_agents(agents_root)
+    inferred_default = _inferred_default_model(existing)
+    default_is_explicit = default_model is not None
     plan: list[AgentPlan] = []
     for spec in ROLE_SPECS:
-        selected = _selected_models(spec, choices.get(spec.role, default_model))
+        if spec.role in choices:
+            selected = _selected_models(spec, choices[spec.role])
+        elif not default_is_explicit:
+            selected = _existing_selection(spec, existing)
+        elif _preserve_existing_selection(spec, existing, inferred_default):
+            selected = _existing_selection(spec, existing)
+        else:
+            selected = _selected_models(spec, default_model)
         for index, selected_model in enumerate(selected, start=1):
             name = _agent_name(spec, index)
             existing_model, existing_effort = existing.get(name, (None, None))
-            if spec.role not in choices and default_model is None and selected_model is None:
-                selected_model = existing_model
             if selected_model is not None and selected_model not in models:
                 raise ConfigurationError(f"existing or selected model was not reported by Codex: {selected_model}")
             if (
@@ -313,8 +366,11 @@ def build_plan(
                 )
             effort = None
             if selected_model is not None:
-                effort = choose_effort(models[selected_model], budget) if budget else existing_effort
-                if effort is None:
+                if budget:
+                    effort = choose_effort(models[selected_model], budget)
+                elif existing_effort is not None and existing_effort in models[selected_model].efforts:
+                    effort = existing_effort
+                else:
                     raise ConfigurationError(f"choose a budget before configuring {name}")
             content = _render_agent(spec.role, name, spec.description, selected_model, effort)
             path = agents_root / f"{name}.toml"
@@ -327,41 +383,133 @@ def build_plan(
     return plan
 
 
-def apply_plan(plan: list[AgentPlan], agents_root: Path) -> None:
+def _missing_directories(path: Path) -> list[Path]:
+    missing: list[Path] = []
+    current = path
+    while not current.exists():
+        missing.append(current)
+        parent = current.parent
+        if parent == current:
+            break
+        current = parent
+    return missing
+
+
+def _cleanup_empty_directories(paths: list[Path]) -> None:
+    for path in sorted(set(paths), key=lambda item: len(item.parts), reverse=True):
+        try:
+            path.rmdir()
+        except OSError:
+            pass
+
+
+def _validate_plan_targets(plan: list[AgentPlan], agents_root: Path) -> None:
+    for item in plan:
+        if item.status == "unchanged":
+            continue
+        if item.path.parent != agents_root:
+            raise ConfigurationError(f"agent path is outside the configured root: {item.path}")
+        if item.path.is_symlink():
+            raise ConfigurationError(f"refusing to overwrite agent symlink: {item.path}")
+        if item.path.exists() and not item.path.is_file():
+            raise ConfigurationError(f"refusing to overwrite non-file agent path: {item.path}")
+        if item.status == "create" and item.path.exists():
+            raise ConfigurationError(f"agent appeared during configuration: {item.path}")
+        if item.status == "update" and not item.path.exists():
+            raise ConfigurationError(f"agent disappeared during configuration: {item.path}")
+
+
+def _rollback_published(
+    applied: list[tuple[AgentPlan, Path | None, bool]],
+) -> list[str]:
+    errors: list[str] = []
+    for item, backup, existed in reversed(applied):
+        try:
+            if existed:
+                if backup is None:
+                    raise OSError("missing transaction backup")
+                os.replace(backup, item.path)
+            elif item.path.is_symlink():
+                errors.append(f"preserved concurrent symlink at {item.path}")
+            elif item.path.exists():
+                if item.path.read_text(encoding="utf-8") == item.content:
+                    item.path.unlink()
+                else:
+                    errors.append(f"preserved changed file at {item.path}")
+        except OSError as exc:
+            errors.append(f"could not restore {item.path}: {exc}")
+    return errors
+
+
+def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool = False) -> None:
     conflicts = [item.path for item in plan if item.status == "update"]
-    if conflicts:
+    if conflicts and not allow_replace:
         joined = ", ".join(str(path) for path in conflicts)
-        raise ConfigurationError(f"existing agent files differ; preview and review before replacing: {joined}")
+        raise ConfigurationError(f"existing agent files differ; preview and review before replacing, then pass --replace: {joined}")
+    agents_root = agents_root.expanduser().absolute()
     _validate_agents_root(agents_root)
+    changed = [item for item in plan if item.status in {"create", "update"}]
+    if not changed:
+        return
+    parent_directories: list[Path] = []
+    staging: Path | None = None
+    root_was_existing = agents_root.exists()
+    completed = False
     try:
-        agents_root.mkdir(parents=True, exist_ok=True)
+        parent_directories = _missing_directories(agents_root.parent)
+        for directory in reversed(parent_directories):
+            directory.mkdir()
+        if not agents_root.exists():
+            staging = Path(tempfile.mkdtemp(prefix=".pstack-agents-", dir=agents_root.parent))
+            for item in changed:
+                (staging / item.path.name).write_text(item.content, encoding="utf-8")
+            if os.path.lexists(agents_root):
+                raise ConfigurationError(f"agents root appeared during configuration: {agents_root}")
+            os.rename(staging, agents_root)
+            staging = None
+            completed = True
+            return
+
+        _validate_agents_root(agents_root)
+        _validate_plan_targets(plan, agents_root)
         staging = Path(tempfile.mkdtemp(prefix=".pstack-agents-", dir=agents_root.parent))
-    except OSError as exc:
-        raise ConfigurationError(f"cannot create agents root staging area: {exc}") from exc
-    created: list[Path] = []
-    try:
-        for item in plan:
-            if item.status == "unchanged":
-                continue
+        backup_directory = staging / ".backups"
+        backup_directory.mkdir()
+        records: list[tuple[AgentPlan, Path, Path | None, bool]] = []
+        for index, item in enumerate(changed):
             staged = staging / item.path.name
             staged.write_text(item.content, encoding="utf-8")
-            # A hard link creates the destination only if it is still absent.
-            # This avoids replacing a file or symlink that appeared after the
-            # preview, while keeping the staged write on the same filesystem.
-            os.link(staged, item.path)
-            staged.unlink()
-            created.append(item.path)
+            backup: Path | None = None
+            existed = item.path.exists()
+            if existed:
+                backup = backup_directory / f"{index}.bak"
+                shutil.copy2(item.path, backup)
+            records.append((item, staged, backup, existed))
+        _validate_plan_targets(plan, agents_root)
+
+        applied: list[tuple[AgentPlan, Path | None, bool]] = []
+        try:
+            for item, staged, backup, existed in records:
+                if existed:
+                    os.replace(staged, item.path)
+                else:
+                    os.link(staged, item.path)
+                    staged.unlink()
+                applied.append((item, backup, existed))
+        except OSError as exc:
+            rollback_errors = _rollback_published(applied)
+            if rollback_errors:
+                detail = "; ".join(rollback_errors)
+                raise ConfigurationError(f"configuration failed and rollback was incomplete: {detail}") from exc
+            raise ConfigurationError(f"configuration failed and was rolled back: {exc}") from exc
+        completed = True
     except OSError as exc:
-        for path in created:
-            if not path.is_symlink() and path.is_file():
-                try:
-                    if path.read_text(encoding="utf-8") == next(item.content for item in plan if item.path == path):
-                        path.unlink()
-                except OSError:
-                    pass
-        raise ConfigurationError(f"configuration failed and was rolled back: {exc}") from exc
+        raise ConfigurationError(f"configuration failed before publication: {exc}") from exc
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
+        if staging is not None:
+            shutil.rmtree(staging, ignore_errors=True)
+        if not root_was_existing and not completed:
+            _cleanup_empty_directories(parent_directories)
 
 
 def _self_test() -> None:
@@ -403,6 +551,7 @@ def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--budget", choices=sorted(BUDGET_TARGET), help="effort ceiling to apply")
     parser.add_argument("--default-model", help="reported model to use for roles without an override")
     parser.add_argument("--role", action="append", default=[], metavar="ROLE=MODEL", help="override a role; repeat for multiple roles")
+    parser.add_argument("--replace", action="store_true", help="allow a reviewed apply to replace differing generated files")
     parser.add_argument("--json", action="store_true", help="print a machine-readable plan")
 
 
@@ -440,7 +589,9 @@ def main(argv: list[str] | None = None) -> int:
             role_values=args.role,
         )
         if args.command == "apply":
-            apply_plan(plan, args.agents_root.expanduser().absolute())
+            apply_plan(plan, args.agents_root.expanduser().absolute(), allow_replace=args.replace)
+        elif args.replace:
+            raise ConfigurationError("--replace is only valid with apply")
         result = {"action": args.command, "agents": [item.as_dict() for item in plan]}
         print(json.dumps(result, indent=2 if args.json else None, sort_keys=True))
         return 0

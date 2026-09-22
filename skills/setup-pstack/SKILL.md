@@ -43,11 +43,11 @@ python3 scripts/configure.py preview \
   --json
 ```
 
-Use `--role ROLE=MODEL_ID` for a role-specific choice. Panel roles accept one model for every runner or a comma-separated list with the panel's exact fan-out. `inherit-parent` and `auto` mean that the generated agent omits `model`; they are input aliases, not Codex configuration values.
+Use `--role ROLE=MODEL_ID` for a role-specific choice. Panel roles accept one model for every runner or a comma-separated list with the panel's exact fan-out. `inherit-parent` and `auto` mean that the generated agent omits `model`; they are input aliases, not Codex configuration values. On a rerun, existing role overrides, panel lists, and aliases remain in place unless the current invocation explicitly changes that role or default.
 
-Show the full preview and obtain user confirmation before running the same command with `apply`. The helper refuses an unreported model, a broken or valid symlink, and an existing agent file with different contents. Re-running an unchanged plan is a no-op. A changed existing agent needs a deliberate manual edit or a reviewed replacement; do not overwrite it as part of an implicit rerun.
+Show the full preview and obtain user confirmation before running the same command with `apply`. The helper refuses an unreported model, a broken or valid symlink, and an existing agent file with different contents. Re-running an unchanged plan is a no-op. A changed generated file is replaced only when the reviewed apply includes `--replace`; the complete staged set is then published with rollback on failure.
 
-Use [scripts/configure.py](scripts/configure.py) for model discovery and agent configuration. Use [scripts/install.py](scripts/install.py) only to install this skill into an explicit Codex discovery directory. It defaults to preview, stages copies before applying them, leaves collisions untouched, and cleans staged or partially created paths on failure. Run its self-check for isolated repeat, existing-directory, broken-symlink, and rollback coverage:
+Use [scripts/configure.py](scripts/configure.py) for model discovery and agent configuration. Use [scripts/install.py](scripts/install.py) only to install this skill into an explicit Codex discovery directory. It defaults to preview, rejects all source symlinks, stages copies before atomic publication, leaves collisions untouched, and cleans staged or partially created paths on failure. Run its self-check for isolated repeat, existing-directory, broken-symlink, and rollback coverage:
 
 ```sh
 python3 scripts/install.py --self-test
