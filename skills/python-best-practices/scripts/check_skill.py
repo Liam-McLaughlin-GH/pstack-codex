@@ -36,20 +36,37 @@ FRONTEND_BOUNDARY_UNSUPPORTED = (
     "Do not apply Django or deployment rules",
 )
 FAB_LIST_RE = re.compile(r"\bfab\s+--list(?:\s|$)")
-FAB_ROLLING_UPDATE_RE = re.compile(
-    r"\bfab\s+(?:demo|beta|live|prod|production)\s+web\.rolling_update(?:\s|$)"
+FAB_ENVIRONMENT_RE = re.compile(
+    r"\bfab\s+(?:demo|beta|live|prod|production)\b"
 )
 KUBECTL_MUTATION_RE = re.compile(
     r"\bkubectl\s+(?:apply|create|delete|patch|replace|rollout|scale|set)\b"
 )
-FAB_MUTATION_RE = re.compile(
-    r"\bfab\s+(?:demo|beta|live|prod|production)\s+"
-    r"(?:web\.)?(?:apply|create|delete|patch|replace|rollout|rolling_update|scale|set)\b"
+MUTATION_TOKEN = (
+    r"(?<![a-z0-9])(?:apply|change|create|delete|deploy(?:ed|ing|ment)?|"
+    r"destroy|edit|flush|migrat(?:e|ed|ing|ion|ions)?|modify|mutat(?:e|ed|ing|ion|ions)?|"
+    r"patch|promote|provision|publish|release|replace|reset|restart|roll(?:out|ing)?|"
+    r"rolling|scale|seed|set|truncate|update|upgrade)(?![a-z0-9])"
 )
-ENVIRONMENT_RE = re.compile(r"\b(?:production|prod|live|www\.showpass\.com)\b")
-MUTATION_RE = re.compile(
-    r"\b(?:apply|create|delete|deploy|migrate|migration|patch|replace|rollout|"
-    r"rolling_update|scale|set)\b"
+FAB_MUTATION_RE = re.compile(
+    r"\bfab(?:ric)?\b[^\n]*" + MUTATION_TOKEN
+)
+ENVIRONMENT_RE = re.compile(
+    r"(?<![a-z0-9])(?:beta|demo|live|prod|production|staging|"
+    r"beta\.showpass\.com|demo\.showpass\.com|www\.showpass\.com)(?![a-z0-9])"
+)
+MUTATION_RE = re.compile(MUTATION_TOKEN)
+DEPLOYMENT_OPERATION_RE = re.compile(
+    r"(?<![a-z0-9])(?:deploy(?:ed|ing|ment)?|promote|provision|publish|release|"
+    r"roll(?:out|ing)?|rolling|scale)"
+    r"(?![a-z0-9])"
+)
+BACKEND_CUE_RE = re.compile(r"\b(?:web-app|django|drf|orm|manage\.py|celery)\b")
+FRONTEND_CUE_RE = re.compile(
+    r"\b(?:showpass-frontend|next(?:\.js|js)?|react(?:\s+native)?|frontend|client)\b"
+)
+FRONTEND_OWNER_CUE_RE = re.compile(
+    r"\b(?:showpass-frontend|next(?:\.js|js)?|react(?:\s+native)?)\b"
 )
 
 
@@ -62,9 +79,27 @@ NEGATIVE_STATUS_CASES = (
     ("unsafe-marked-verified", 6, "unsafe", SAFE_COMMAND_STATUS),
 )
 
+ROUTING_GUARD_CASES = (
+    ("nested-fabric-beta-rollout", "fab beta web.frontend.deploy_nextjs", "unsafe"),
+    ("nested-fabric-live-rollout", "fab live web.quick_rolling_update", "unsafe"),
+    ("production-deployment-wording", "Run a production deployment", "unsafe"),
+    ("beta-deployment-wording", "Deploy to beta", "unsafe"),
+    ("unrecognized-deployment-wording", "Review an unrecognized deployment operation", "unsafe"),
+    (
+        "mixed-django-nextjs",
+        "Review a Django-backed Next.js API route",
+        "ambiguous",
+    ),
+    (
+        "mixed-django-client",
+        "Change a web-app Django view and its Next.js client",
+        "ambiguous",
+    ),
+)
+
 
 def route_for_task(task: str) -> str:
-    """Return the route the skill's task table describes for a short task cue."""
+    """Return a safe repository route for a short task cue."""
 
     text = task.lower()
     infrastructure = any(
@@ -72,18 +107,24 @@ def route_for_task(task: str) -> str:
         for marker in ("web-k8s", "kubectl", "gcloud")
     ) or bool(re.search(r"\bfab(?:\s|$)", text))
     cluster_mutation = bool(
-        FAB_ROLLING_UPDATE_RE.search(text)
+        FAB_ENVIRONMENT_RE.search(text)
         or FAB_MUTATION_RE.search(text)
         or KUBECTL_MUTATION_RE.search(text)
     )
     environment_mutation = bool(ENVIRONMENT_RE.search(text) and MUTATION_RE.search(text))
-    if cluster_mutation or environment_mutation:
+    deployment_mutation = bool(DEPLOYMENT_OPERATION_RE.search(text))
+    if cluster_mutation or environment_mutation or deployment_mutation:
         return "unsafe"
+
+    backend_cue = bool(BACKEND_CUE_RE.search(text))
+    frontend_cue = bool(FRONTEND_CUE_RE.search(text))
+    if backend_cue and frontend_cue:
+        return "ambiguous"
     if FAB_LIST_RE.search(text) or infrastructure or "fabric" in text:
         return "web-k8s"
-    if "showpass-frontend" in text or "next.js" in text or "react native" in text:
+    if FRONTEND_OWNER_CUE_RE.search(text):
         return "showpass-frontend"
-    if any(term in text for term in ("web-app", "django", "drf", "orm", "manage.py", "celery")):
+    if backend_cue:
         return "web-app"
     return "general"
 
@@ -295,6 +336,11 @@ def check_negative_cases(skill_text: str, ledger: Dict[str, Any]) -> List[str]:
     """Prove that stale statuses and source-register drift fail closed."""
 
     errors: List[str] = []
+    for name, task, expected in ROUTING_GUARD_CASES:
+        actual = route_for_task(task)
+        if actual != expected:
+            errors.append("routing guard %s returned %s, expected %s" % (name, actual, expected))
+
     for name, index, safety, status in NEGATIVE_STATUS_CASES:
         candidate = copy.deepcopy(ledger)
         command = candidate["commands"][index]
@@ -353,7 +399,7 @@ def main() -> int:
     rule_count = len(ledger.get("rules", []))
     command_count = len(ledger.get("commands", []))
     if args.scenario == "negative":
-        case_count = len(NEGATIVE_STATUS_CASES) + 3
+        case_count = len(NEGATIVE_STATUS_CASES) + len(ROUTING_GUARD_CASES) + 3
     else:
         case_count = len(ledger.get("routing_cases", [])) if scenario is None else sum(
             case.get("safety") == scenario for case in ledger.get("routing_cases", [])

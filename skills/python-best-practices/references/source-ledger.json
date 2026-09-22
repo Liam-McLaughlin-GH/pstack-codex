@@ -230,9 +230,23 @@
     {"name": "frontend-ui", "safety": "safe", "input": "Change a showpass-frontend Next.js component", "expected": "showpass-frontend"},
     {"name": "fab-list", "safety": "safe", "input": "fab --list", "expected": "web-k8s"},
     {"name": "fab-beta-rolling-update", "safety": "unsafe", "input": "fab beta web.rolling_update", "expected": "unsafe"},
+    {"name": "fab-beta-quick-rolling-update", "safety": "unsafe", "input": "fab beta web.quick_rolling_update", "expected": "unsafe"},
+    {"name": "fab-beta-frontend-deploy", "safety": "unsafe", "input": "fab beta web.frontend.deploy_nextjs", "expected": "unsafe"},
+    {"name": "fab-beta-task-rolling-update", "safety": "unsafe", "input": "fab beta web.tasks.rolling_update", "expected": "unsafe"},
+    {"name": "fab-demo-scale-up-on-sale", "safety": "unsafe", "input": "fab demo web.scale_up_on_sale", "expected": "unsafe"},
+    {"name": "fab-beta-ingress-rolling-update", "safety": "unsafe", "input": "fab beta ingress.rolling_update", "expected": "unsafe"},
+    {"name": "fab-live-quick-rolling-update", "safety": "unsafe", "input": "fab live web.quick_rolling_update", "expected": "unsafe"},
     {"name": "prod-web-k8s-rollout", "safety": "unsafe", "input": "Run a prod web-k8s rollout", "expected": "unsafe"},
-    {"name": "mixed-frontend-deployment", "safety": "safe", "input": "Deploy the showpass-frontend Next.js image with kubectl", "expected": "web-k8s"},
+    {"name": "production-deployment", "safety": "unsafe", "input": "Run a production deployment", "expected": "unsafe"},
+    {"name": "unrecognized-deployment", "safety": "unsafe", "input": "Review an unrecognized deployment operation", "expected": "unsafe"},
+    {"name": "beta-deployment", "safety": "unsafe", "input": "Deploy to beta", "expected": "unsafe"},
+    {"name": "demo-deployment", "safety": "unsafe", "input": "Deploy to demo", "expected": "unsafe"},
+    {"name": "live-migration", "safety": "unsafe", "input": "Run a live migration", "expected": "unsafe"},
+    {"name": "frontend-deployment", "safety": "unsafe", "input": "Deploy the showpass-frontend Next.js image with kubectl", "expected": "unsafe"},
     {"name": "production-frontend-source", "safety": "safe", "input": "Write a production showpass-frontend Next.js component", "expected": "showpass-frontend"},
-    {"name": "live-mutation", "safety": "unsafe", "input": "Run the live web-k8s rollout and production migration", "expected": "unsafe"}
+    {"name": "live-mutation", "safety": "unsafe", "input": "Run the live web-k8s rollout and production migration", "expected": "unsafe"},
+    {"name": "mixed-django-nextjs", "safety": "safe", "input": "Review a web-app Django QuerySet and Next.js serializer boundary", "expected": "ambiguous"},
+    {"name": "mixed-django-nextjs-api", "safety": "safe", "input": "Review a Django-backed Next.js API route", "expected": "ambiguous"},
+    {"name": "mixed-django-client", "safety": "safe", "input": "Change a web-app Django view and its Next.js client", "expected": "ambiguous"}
   ]
 }
