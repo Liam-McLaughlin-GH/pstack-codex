@@ -805,6 +805,97 @@ class ReflectBehaviorTests(unittest.TestCase):
             accepted = result.stdout.split("## Accepted", 1)[1].split("## Rejected", 1)[0]
             self.assertEqual(accepted.strip(), "- None.")
 
+    def test_declared_criterion_conflict_stays_unknown_across_three_lanes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "fixture-workspace"
+            workspace.mkdir()
+            transcript = self.write_jsonl(
+                workspace,
+                "decision.jsonl",
+                [
+                    {
+                        "id": "decision-1",
+                        "timestamp": "2026-01-15T10:00:00Z",
+                        "workspace": workspace.name,
+                        "topic": "payments",
+                        "state": "in_progress",
+                        "claim": "Still working.",
+                    }
+                ],
+            )
+
+            def finding(finding_id: str, proposal: str, durability: int) -> dict[str, object]:
+                return {
+                    "id": finding_id,
+                    "problem": "Choose one bounded implementation.",
+                    "proposal": proposal,
+                    "routing": "skills/why/SKILL.md",
+                    "evidence": ["decision-1"],
+                    "enforcement": "judgment",
+                    "criteria": {
+                        "durability": durability,
+                        "specificity": 0,
+                        "decision_changing": 0,
+                        "evidence": 0,
+                        "routing": 0,
+                    },
+                }
+
+            packets = [
+                self.write_packet(
+                    workspace,
+                    "judgment",
+                    [
+                        finding("a-judgment", "Use candidate A.", 2),
+                        finding("b-judgment-1", "Use candidate B.", 0),
+                        finding("b-judgment-2", "Use candidate B.", 0),
+                    ],
+                    agent_id="agent-a",
+                    model="gpt-5.6",
+                ),
+                self.write_packet(
+                    workspace,
+                    "tooling",
+                    [
+                        finding("a-tooling", "Use candidate A.", 1),
+                        finding("b-tooling-1", "Use candidate B.", 0),
+                        finding("b-tooling-2", "Use candidate B.", 0),
+                    ],
+                    agent_id="agent-b",
+                    model="gpt-5.6",
+                ),
+                self.write_packet(
+                    workspace,
+                    "divergent",
+                    [
+                        finding("a-divergent", "Use candidate A.", 2),
+                        finding("b-divergent-1", "Use candidate B.", 0),
+                        finding("b-divergent-2", "Use candidate B.", 0),
+                    ],
+                    agent_id="agent-c",
+                    model="gpt-5.6",
+                ),
+            ]
+
+            result = run_helper(
+                workspace,
+                *self.command_args(workspace, transcript, packets),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('status="inconclusive"', result.stdout)
+            self.assertIn('selected_decision="none (inconclusive)"', result.stdout)
+            self.assertIn(
+                '"a-judgment":{"durability":"unknown","specificity":0,"decision_changing":0,"evidence":0,"routing":0,"rank":0}',
+                result.stdout,
+            )
+            self.assertIn(
+                '"b-judgment-1":{"durability":0,"specificity":0,"decision_changing":0,"evidence":0,"routing":0,"rank":0}',
+                result.stdout,
+            )
+            accepted = result.stdout.split("## Accepted", 1)[1].split("## Rejected", 1)[0]
+            self.assertEqual(accepted.strip(), "- None.")
+
     def test_structural_enforcement_survives_deduplication(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory) / "fixture-workspace"

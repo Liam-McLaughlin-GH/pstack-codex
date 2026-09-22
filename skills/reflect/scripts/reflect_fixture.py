@@ -45,6 +45,18 @@ SHARED_CRITERIA = (
     "evidence",
     "routing",
 )
+
+
+class _UninitializedCriterion:
+    """Sentinel for a criterion that no finding has declared yet."""
+
+    __slots__ = ()
+
+
+_UNINITIALIZED_CRITERION = _UninitializedCriterion()
+CriterionValue = int | None | _UninitializedCriterion
+
+
 STRUCTURAL_ENFORCEMENT = {
     "automation",
     "lint",
@@ -107,7 +119,7 @@ class ReviewerFinding:
     routing: str
     evidence: tuple[str, ...]
     enforcement: str
-    criteria: dict[str, int | None]
+    criteria: dict[str, CriterionValue]
 
 
 @dataclass(frozen=True)
@@ -470,8 +482,8 @@ def validate_route(raw_route: Any) -> str:
     return route
 
 
-def parse_criteria(raw: Any, *, field: str) -> dict[str, int | None]:
-    criteria = {name: None for name in SHARED_CRITERIA}
+def parse_criteria(raw: Any, *, field: str) -> dict[str, CriterionValue]:
+    criteria = {name: _UNINITIALIZED_CRITERION for name in SHARED_CRITERIA}
     if raw is None:
         return criteria
     if not isinstance(raw, dict) or len(raw) > len(SHARED_CRITERIA):
@@ -948,23 +960,33 @@ def classify_candidate(item: dict[str, Any]) -> tuple[str, str | None]:
     return "accepted", None
 
 
-def merge_criteria(current: dict[str, int | None], incoming: dict[str, int | None]) -> dict[str, int | None]:
-    merged: dict[str, int | None] = {}
+def merge_criteria(
+    current: dict[str, CriterionValue],
+    incoming: dict[str, CriterionValue],
+) -> dict[str, CriterionValue]:
+    merged: dict[str, CriterionValue] = {}
     for name in SHARED_CRITERIA:
-        if current[name] is None:
-            merged[name] = incoming[name]
-        elif incoming[name] is None or current[name] == incoming[name]:
-            merged[name] = current[name]
+        current_value = current[name]
+        incoming_value = incoming[name]
+        if current_value is _UNINITIALIZED_CRITERION:
+            merged[name] = incoming_value
+        elif current_value is None:
+            merged[name] = None
+        elif incoming_value is _UNINITIALIZED_CRITERION or current_value == incoming_value:
+            merged[name] = current_value
         else:
             merged[name] = None
     return merged
 
 
 def score_candidate(item: dict[str, Any]) -> tuple[dict[str, int | None], int]:
-    criteria = dict(item["criteria"])
-    if criteria["evidence"] is None:
+    criteria: dict[str, int | None] = {}
+    for name in SHARED_CRITERIA:
+        value = item["criteria"][name]
+        criteria[name] = None if value is _UNINITIALIZED_CRITERION else value
+    if item["criteria"]["evidence"] is _UNINITIALIZED_CRITERION:
         criteria["evidence"] = 2 if item["evidence"] else 0
-    if criteria["routing"] is None:
+    if item["criteria"]["routing"] is _UNINITIALIZED_CRITERION:
         criteria["routing"] = 2
     rank = sum(criteria[name] or 0 for name in SHARED_CRITERIA)
     return criteria, rank
@@ -1049,7 +1071,9 @@ def compare_candidates(problem: str, candidates: list[dict[str, Any]]) -> tuple[
 
 def public_score(score: dict[str, Any]) -> dict[str, Any]:
     rendered: dict[str, Any] = {
-        name: "unknown" if score.get(name) is None else score.get(name)
+        name: "unknown"
+        if score.get(name) is None or score.get(name) is _UNINITIALIZED_CRITERION
+        else score.get(name)
         for name in SHARED_CRITERIA
     }
     rank = score.get("rank")
@@ -1217,7 +1241,7 @@ def synthesize(
                     "evidence": [],
                     "lenses": [],
                     "enforcement_categories": [],
-                    "criteria": {name: None for name in SHARED_CRITERIA},
+                    "criteria": {name: _UNINITIALIZED_CRITERION for name in SHARED_CRITERIA},
                 },
             )
             item["finding_ids"].append(finding.finding_id)
