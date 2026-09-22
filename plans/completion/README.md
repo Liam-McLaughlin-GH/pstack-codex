@@ -1,6 +1,6 @@
 # pstack completion plan
 
-Status: PLANNED. No implementation workers have been launched by this planning task.
+Status: PLANNED. No implementation workers have been launched by this planning task. The exceptional review model is Astra Low, per the user's latest instruction.
 
 Start with [GOAL.md](GOAL.md). Paste its complete contents into a Codex conversation running in this repository. It begins with /goal and delegates the development program from one coordinator.
 

@@ -1,6 +1,6 @@
 # Models and usage controls
 
-Use the local task-model-routing policy, adjusted for the user's scarce remaining usage. The installed models_cache.json advertises gpt-5.6-luna, gpt-5.6-terra and gpt-5.6-sol with the reasoning levels below. codex login status reports ChatGPT authentication. Catalog presence does not prove quota availability; verify the first launch and record errors.
+Use the local task-model-routing policy, adjusted for the user's scarce remaining usage. The installed models_cache.json advertises gpt-5.6-luna, gpt-5.6-terra and gpt-6-astra with the reasoning levels below. The user explicitly selected Astra Low in place of Sol-level review; this selection is a user preference, not a measured cost or quality comparison. codex login status reports ChatGPT authentication. Catalog presence does not prove quota availability; verify the first launch and record errors.
 
 | Role | Model | Effort | Allocation |
 | --- | --- | --- | --- |
@@ -9,9 +9,9 @@ Use the local task-model-routing policy, adjusted for the user's scarce remainin
 | Three repo scouts | gpt-5.6-luna | max | Sequential subtasks inside #10 worker, reuse findings for #9 |
 | Independent review | gpt-5.6-luna | max | Three bounded batches, different agent from authors |
 | Architecture escalation | gpt-5.6-terra | max | Zero routine calls; at most two short consultations for primary ten issues |
-| Security/correctness escalation | gpt-5.6-sol | xhigh | Zero routine calls; at most one focused review across primary ten issues |
+| Security/correctness escalation | gpt-6-astra | low | User-selected replacement for Sol; zero routine calls, at most one focused review across primary ten issues |
 
-Do not dispatch Terra just to repeat this plan. Two meaningful failed Luna repairs on the same cause, or an unresolved cross-skill contract that blocks multiple issues, earns one Terra consultation. Return implementation to Luna with its decision. Sol is reserved for unresolved unsafe install behavior, cross-session disclosure, or similarly consequential contradictions that Luna/Terra cannot clear. It receives only the disputed diff and evidence.
+Do not dispatch Terra just to repeat this plan. Two meaningful failed Luna repairs on the same cause, or an unresolved cross-skill contract that blocks multiple issues, earns one Terra consultation. Return implementation to Luna with its decision. Astra Low is reserved for unresolved unsafe install behavior, cross-session disclosure, or similarly consequential contradictions that Luna/Terra cannot clear. It receives only the disputed diff and evidence.
 
 Planning estimate: 10 implementation sessions + 3 batch reviews + 1 combined-tree validation = 14 primary worker sessions, plus the coordinator. At most 3 primary escalations makes 17. Repairs and supplemental parity work add sessions; record each before launch. These counts are scheduling estimates, not token or quota guarantees. A single Max session can consume more than several small tasks.
 

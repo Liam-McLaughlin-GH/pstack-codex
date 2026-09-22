@@ -2,7 +2,7 @@
 
 State: PLANNED; workers not started.
 Primary target: 10 verified issue PRs.
-Implementation sessions: 0. Review sessions: 0. Terra escalations: 0/2. Sol escalations: 0/1.
+Implementation sessions: 0. Review sessions: 0. Terra escalations: 0/2. Astra Low reviews: 0/1.
 Remaining account quota: UNKNOWN.
 Live baseline: issues #1–#10 OPEN; no PRs at planning time.
 

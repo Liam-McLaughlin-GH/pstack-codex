@@ -18,7 +18,7 @@ Permission envelope:
 - Real user runtime installation: leave for review; test installation in isolated temporary directories.
 - Beads tracking: none required. Use the file ledger; do not introduce a new tracking service.
 
-Internal work: Use two concurrent Luna workers at most, in separate worktrees. Follow models.md, with Luna coordination and bounded Terra/Sol escalation. Native subagents may be used only when their model can be selected and verified. Otherwise use supervised codex exec workers with explicit model flags. Do not silently inherit an expensive parent model.
+Internal work: Use two concurrent Luna workers at most, in separate worktrees. Follow models.md, with Luna coordination and bounded Terra/Astra Low escalation. Native subagents may be used only when their model can be selected and verified. Otherwise use supervised codex exec workers with explicit model flags. Do not silently inherit an expensive parent model.
 Tooling delegation plan: delegate issue implementation, scoped repository research and batched independent reviews. Parent reads required instructions, owns the ledger, shared integration, staging/commits/pushes, PR publication and final checks.
 Result persistence: plans/completion/status.md and results/issue-NN.md; sanitized final evidence is committed to the relevant task branch. Raw process logs, auth and transcripts stay outside tracked paths.
 Constraints: default service tier, Fast off, ChatGPT login, max two concurrent workers. No arena/model voting. Read the exact issue brief and necessary source paths per worker, not the whole session transcript.
