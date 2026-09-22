@@ -1,0 +1,277 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import re
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[2]
+SCRIPT = ROOT / "skills" / "figure-it-out" / "scripts" / "figure_it_out.py"
+SKILL = ROOT / "skills" / "figure-it-out" / "SKILL.md"
+
+spec = importlib.util.spec_from_file_location("figure_it_out", SCRIPT)
+assert spec and spec.loader
+figure_it_out = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = figure_it_out
+spec.loader.exec_module(figure_it_out)
+
+
+def make_plan(*, phase_count: int = 2, max_checkpoints: int = 8) -> dict:
+    phases = []
+    for index in range(phase_count):
+        phase_id = f"phase-{index + 1}"
+        phases.append(
+            {
+                "id": phase_id,
+                "name": f"Phase {index + 1}",
+                "hypothesis": f"The phase-{index + 1} approach will advance the predicate",
+                "output": f"Output for {phase_id}",
+                "verification": {
+                    "id": f"check-{index + 1}",
+                    "method": f"Run the independent check for {phase_id}",
+                },
+            }
+        )
+    return {
+        "desired_outcome": "A verified bounded workflow fixture",
+        "scope": {
+            "included": ["src/", "tests/"],
+            "excluded": ["deployment", "unrelated files"],
+            "allowed_actions": ["read", "write", "run-tests"],
+            "allowed_paths": ["src/", "tests/"],
+            "out_of_scope_actions": ["deploy", "push", "send-message"],
+        },
+        "constraints": ["Use local evidence", "Do not broaden the task"],
+        "terminal_predicate": {
+            "description": "Every phase and every named terminal check passes",
+            "checks": ["focused-tests", "artifact-inspection"],
+        },
+        "limits": {
+            "max_attempts_per_phase": 2,
+            "max_checkpoints": max_checkpoints,
+            "max_replans": 2,
+            "max_decisions": 32,
+        },
+        "phases": phases,
+    }
+
+
+class WorkflowBehaviorTests(unittest.TestCase):
+    def workflow(self, root: Path, *, phase_count: int = 2, max_checkpoints: int = 8):
+        return figure_it_out.Workflow.create(
+            root / "run.json",
+            make_plan(phase_count=phase_count, max_checkpoints=max_checkpoints),
+            workspace_root=root,
+        )
+
+    def test_normal_completion_requires_outputs_and_terminal_predicate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root)
+
+            self.assertEqual(workflow.state["status"], "planned")
+            self.assertEqual(workflow.state["next_action"], "start phase phase-1")
+            workflow.guard_action("write", "src/change.py")
+            workflow.start_phase()
+            workflow.checkpoint("baseline captured", ["artifacts/baseline.txt"], "implement phase-1")
+            workflow.complete_phase(
+                {"baseline": "captured"},
+                {"check_id": "check-1", "passed": True, "evidence": ["tests/baseline-pass.txt"]},
+            )
+            self.assertEqual(workflow.state["current_phase"], "phase-2")
+            self.assertEqual(workflow.state["phases"][1]["status"], "pending")
+
+            workflow.start_phase()
+            workflow.complete_phase(
+                "implementation output",
+                {"check_id": "check-2", "passed": True, "evidence": ["tests/phase-2-pass.txt"]},
+            )
+            with self.assertRaises(figure_it_out.PredicateError):
+                workflow.finish()
+            workflow.record_predicate("focused-tests", True, ["tests/focused.txt"])
+            workflow.record_predicate("artifact-inspection", True, ["artifacts/inspection.txt"])
+            completed = workflow.finish()
+
+            self.assertEqual(completed["status"], "completed")
+            self.assertIsNone(completed["next_action"])
+            self.assertEqual([phase["status"] for phase in completed["phases"]], ["passed", "passed"])
+            audit_path = workflow.export_audit(root / "audit.tsv")
+            audit_lines = audit_path.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(audit_lines[0], "ts\tphase\tdecision\twhy\tevidence\tresult")
+            self.assertGreater(len(audit_lines), 1)
+            self.assertTrue(any("phase-1" in line and "verified" in line for line in audit_lines[1:]))
+
+    def test_failed_phase_requires_replan_before_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            workflow.start_phase()
+            failed = workflow.fail_phase(
+                "baseline check disagreed",
+                ["tests/baseline-fail.txt"],
+                "recheck the fixture boundary",
+            )
+            self.assertEqual(failed["status"], "failed")
+            self.assertEqual(failed["phases"][0]["status"], "failed")
+            with self.assertRaises(figure_it_out.ReplanRequired):
+                workflow.start_phase()
+
+            workflow.replan(
+                "Use the fixture boundary as the first check",
+                ["tests/baseline-fail.txt"],
+                "start the replacement phase",
+                {
+                    "id": "phase-1",
+                    "name": "Replanned phase",
+                    "hypothesis": "The fixture boundary will make the check deterministic",
+                    "output": "A fixture-scoped output",
+                    "verification": {"id": "check-1-replanned", "method": "Run the replacement check"},
+                },
+            )
+            self.assertEqual(workflow.state["status"], "planned")
+            self.assertEqual(workflow.state["next_action"], "start replanned phase phase-1")
+            workflow.start_phase()
+            workflow.complete_phase(
+                "replacement output",
+                {"check_id": "check-1-replanned", "passed": True, "evidence": ["tests/replanned-pass.txt"]},
+            )
+            self.assertEqual(workflow.state["phases"][0]["status"], "passed")
+            self.assertEqual(len(workflow.state["replans"]), 1)
+
+    def test_interrupted_run_resumes_from_persisted_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            workflow.start_phase()
+            workflow.checkpoint("safe stopping point", ["artifacts/checkpoint.txt"], "resume phase-1")
+            workflow.interrupt("session ended after the bounded checkpoint")
+
+            resumed = figure_it_out.Workflow.load(root / "run.json", workspace_root=root)
+            self.assertEqual(resumed.state["status"], "interrupted")
+            self.assertEqual(resumed.state["phases"][0]["status"], "interrupted")
+            self.assertEqual(resumed.state["checkpoints"][0]["id"], "cp-1")
+            resumed.resume()
+            resumed.complete_phase(
+                "resumed output",
+                {"check_id": "check-1", "passed": True, "evidence": ["tests/resumed-pass.txt"]},
+            )
+            resumed.record_predicate("focused-tests", True, ["tests/focused.txt"])
+            resumed.record_predicate("artifact-inspection", True, ["artifacts/inspection.txt"])
+            resumed.finish()
+
+            final_state = json.loads((root / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(final_state["status"], "completed")
+            self.assertEqual(final_state["resume_count"], 1)
+            self.assertTrue(any(event["event"] == "interrupted" for event in final_state["events"]))
+            self.assertTrue(any(event["event"] == "resumed" for event in final_state["events"]))
+
+    def test_blocked_state_keeps_evidence_and_next_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            blocked = workflow.block(
+                "required fixture is not available",
+                ["fixtures/missing.json"],
+                "obtain the fixture or record an owner decision",
+            )
+            self.assertEqual(blocked["status"], "blocked")
+            self.assertEqual(blocked["blocker"]["evidence"], ["fixtures/missing.json"])
+            self.assertEqual(blocked["next_action"], "obtain the fixture or record an owner decision")
+            self.assertEqual(blocked["decisions"][-1]["result"], "blocked")
+
+    def test_checkpoint_budget_blocks_instead_of_growing_without_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1, max_checkpoints=1)
+            workflow.start_phase()
+            workflow.checkpoint("one bounded checkpoint", ["artifacts/one.txt"], "continue phase-1")
+            with self.assertRaises(figure_it_out.StateError):
+                workflow.checkpoint("second checkpoint", ["artifacts/two.txt"], "continue phase-1")
+            self.assertEqual(workflow.state["status"], "blocked")
+            self.assertIn("checkpoint limit", workflow.state["blocker"]["reason"])
+            self.assertTrue(workflow.state["blocker"]["next_action"])
+
+    def test_out_of_scope_action_is_refused_and_recorded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            with self.assertRaises(figure_it_out.ScopeRefusal) as context:
+                workflow.guard_action("deploy", "production")
+            refusal = context.exception.refusal
+            self.assertEqual(refusal["status"], "refused")
+            self.assertIn("next_action", refusal)
+            self.assertEqual(workflow.state["decisions"][-1]["result"], "blocked")
+            with self.assertRaises(figure_it_out.ScopeRefusal):
+                workflow.guard_action("write", "../outside.py")
+            with self.assertRaises(figure_it_out.ScopeRefusal):
+                workflow.guard_action("write", r"src\..\outside.py")
+            with self.assertRaises(figure_it_out.ScopeRefusal):
+                workflow.guard_action("write", "src/ok.py\nforged")
+
+    def test_validation_rejects_unbounded_or_incomplete_plans(self):
+        plan = make_plan()
+        del plan["limits"]["max_checkpoints"]
+        with self.assertRaises(figure_it_out.PlanError):
+            figure_it_out.validate_plan(plan)
+        plan = make_plan()
+        plan["phases"][0]["verification"] = {"id": "check-1"}
+        with self.assertRaises(figure_it_out.PlanError):
+            figure_it_out.validate_plan(plan)
+
+    def test_cli_init_writes_a_loadable_state_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plan_path = root / "plan.json"
+            plan_path.write_text(json.dumps(make_plan(phase_count=1)), encoding="utf-8")
+            result = subprocess.run(
+                [sys.executable, str(SCRIPT), "init", "--plan", str(plan_path), "--state", "run.json", "--workspace-root", str(root)],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            state = json.loads((root / "run.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["status"], "planned")
+            self.assertEqual(json.loads(result.stdout)["run_id"], state["run_id"])
+
+
+class SkillContractTests(unittest.TestCase):
+    def test_frontmatter_and_local_links_are_valid(self):
+        text = SKILL.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("---\n"))
+        end = text.find("\n---", 4)
+        self.assertGreater(end, 0)
+        frontmatter = text[4:end]
+        fields = {}
+        for line in frontmatter.splitlines():
+            if not line.strip():
+                continue
+            key, separator, value = line.partition(":")
+            self.assertEqual(separator, ":")
+            fields[key.strip()] = value.strip()
+        self.assertEqual(set(fields), {"name", "description"})
+        self.assertEqual(fields["name"], "figure-it-out")
+        self.assertTrue(fields["description"])
+
+        links = re.findall(r"\[[^\]]+\]\(([^)]+)\)", text)
+        self.assertGreaterEqual(len(links), 8)
+        for destination in links:
+            if re.match(r"^[a-z]+://", destination):
+                continue
+            target = destination.split("#", 1)[0]
+            self.assertTrue((SKILL.parent / target).is_file(), destination)
+
+    def test_skill_has_no_runtime_specific_seams(self):
+        text = SKILL.read_text(encoding="utf-8")
+        for marker in (".cursor/", "agent-transcripts", "subagent_type", "run_in_background", "playbooks/"):
+            self.assertNotIn(marker, text)
+
+
+if __name__ == "__main__":
+    unittest.main()

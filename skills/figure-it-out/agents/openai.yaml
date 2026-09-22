@@ -1,0 +1,4 @@
+interface:
+  display_name: "Figure It Out"
+  short_description: "Run bounded, auditable multi-phase work"
+  default_prompt: "Use $figure-it-out to plan and run a complex task with checkpoints and evidence."
