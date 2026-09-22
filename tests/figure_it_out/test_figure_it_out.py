@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
 
@@ -260,6 +261,160 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 self.assertEqual(refusal_context.exception.refusal["status"], "refused")
                 self.assertTrue(refusal_context.exception.refusal["reason"])
                 self.assertTrue(refusal_context.exception.refusal["next_action"])
+
+    def test_guard_action_refuses_stopped_blocked_failed_and_completed_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for stopped_status in ("interrupted", "blocked", "failed", "completed"):
+                with self.subTest(status=stopped_status):
+                    run_root = root / stopped_status
+                    workflow = self.workflow(run_root, phase_count=1)
+                    if stopped_status == "interrupted":
+                        workflow.start_phase()
+                        workflow.checkpoint("safe stop", ["artifacts/checkpoint.txt"], "resume phase-1")
+                        workflow.interrupt("session stopped")
+                    elif stopped_status == "blocked":
+                        workflow.block("fixture unavailable", ["fixtures/missing.json"], "obtain the fixture")
+                    elif stopped_status == "failed":
+                        workflow.start_phase()
+                        workflow.fail_phase("check disagreed", ["tests/failure.txt"], "replan the phase")
+                    else:
+                        workflow.start_phase()
+                        workflow.complete_phase(
+                            "completed output",
+                            {"check_id": "check-1", "passed": True, "evidence": ["tests/phase-pass.txt"]},
+                        )
+                        workflow.record_predicate("focused-tests", True, ["tests/focused.txt"])
+                        workflow.record_predicate("artifact-inspection", True, ["artifacts/inspection.txt"])
+                        workflow.finish()
+
+                    with self.assertRaises(figure_it_out.ScopeRefusal) as context:
+                        workflow.guard_action("write", "src/after-stop.py")
+
+                    self.assertEqual(context.exception.refusal["status"], "refused")
+                    persisted = figure_it_out.Workflow.load(run_root / "run.json", workspace_root=run_root)
+                    self.assertEqual(persisted.state["status"], stopped_status)
+                    decision = persisted.state["decisions"][-1]
+                    self.assertEqual(decision["status"], "refused")
+                    self.assertEqual(decision["result"], "blocked")
+                    self.assertTrue(decision["reason"])
+                    self.assertTrue(decision["next_action"])
+                    self.assertTrue(decision["evidence"])
+                    self.assertTrue(
+                        any(
+                            event["event"] == "action_refused" and event["target"] == "src/after-stop.py"
+                            for event in persisted.state["events"]
+                        )
+                    )
+                    self.assertFalse(
+                        any(
+                            event["event"] == "action_allowed" and event.get("target") == "src/after-stop.py"
+                            for event in persisted.state["events"]
+                        )
+                    )
+
+    def test_completed_run_cannot_mutate_terminal_results(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            workflow.start_phase()
+            workflow.complete_phase(
+                "completed output",
+                {"check_id": "check-1", "passed": True, "evidence": ["tests/phase-pass.txt"]},
+            )
+            workflow.record_predicate("focused-tests", True, ["tests/focused.txt"])
+            workflow.record_predicate("artifact-inspection", True, ["artifacts/inspection.txt"])
+            workflow.finish()
+            terminal_before = deepcopy(workflow.state["terminal"])
+            predicate_results_before = deepcopy(workflow.state["predicate_results"])
+            decisions_before = deepcopy(workflow.state["decisions"])
+
+            with self.assertRaises(figure_it_out.PredicateError):
+                workflow.record_predicate("focused-tests", False, ["tests/failed-after-completion.txt"], status="failed")
+            with self.assertRaises(figure_it_out.StateError):
+                workflow.record_decision("run", "contradict completion", "should be refused", ["tests/late.txt"], "failed")
+
+            self.assertEqual(workflow.state["terminal"], terminal_before)
+            self.assertEqual(workflow.state["predicate_results"], predicate_results_before)
+            self.assertEqual(workflow.state["decisions"], decisions_before)
+            persisted = figure_it_out.Workflow.load(root / "run.json", workspace_root=root)
+            self.assertEqual(persisted.state["terminal"], terminal_before)
+            self.assertEqual(persisted.state["predicate_results"], predicate_results_before)
+            self.assertEqual(persisted.state["decisions"], decisions_before)
+
+    def test_malformed_persisted_state_is_rejected_before_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            state_path = root / "run.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+            missing_status = deepcopy(state)
+            del missing_status["status"]
+            state_path.write_text(json.dumps(missing_status), encoding="utf-8")
+            with self.assertRaises(figure_it_out.StateError) as missing_error:
+                figure_it_out.Workflow.load(state_path, workspace_root=root)
+            self.assertIn("missing required fields", str(missing_error.exception))
+            self.assertNotIn("KeyError", str(missing_error.exception))
+
+            invalid_run_status = deepcopy(state)
+            invalid_run_status["status"] = {"unexpected": "shape"}
+            state_path.write_text(json.dumps(invalid_run_status), encoding="utf-8")
+            with self.assertRaises(figure_it_out.StateError) as run_status_error:
+                figure_it_out.Workflow.load(state_path, workspace_root=root)
+            self.assertIn("status must be one of", str(run_status_error.exception))
+
+            invalid_phase_status = deepcopy(state)
+            invalid_phase_status["phases"][0]["status"] = "finished"
+            state_path.write_text(json.dumps(invalid_phase_status), encoding="utf-8")
+            with self.assertRaises(figure_it_out.StateError) as phase_error:
+                figure_it_out.Workflow.load(state_path, workspace_root=root)
+            self.assertIn("status is not supported", str(phase_error.exception))
+
+            valid_workflow = self.workflow(root / "in-memory", phase_count=1)
+            valid_workflow.state.pop("status")
+            with self.assertRaises(figure_it_out.StateError) as start_error:
+                valid_workflow.start_phase()
+            self.assertIn("missing required fields", str(start_error.exception))
+
+    def test_cli_replan_rejects_invalid_json_without_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            workflow.start_phase()
+            workflow.fail_phase("check disagreed", ["tests/failure.txt"], "replan the phase")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "replan",
+                    "--state",
+                    str(root / "run.json"),
+                    "--workspace-root",
+                    str(root),
+                    "--reason",
+                    "change the approach",
+                    "--evidence",
+                    "tests/failure.txt",
+                    "--next-action",
+                    "start the replacement",
+                    "--replacement",
+                    "{not valid json",
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            error = json.loads(result.stderr)
+            self.assertEqual(error["status"], "error")
+            self.assertIn("valid JSON", error["error"])
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertEqual(
+                figure_it_out.Workflow.load(root / "run.json", workspace_root=root).state["status"],
+                "failed",
+            )
 
     def test_targetless_logical_actions_are_explicit_in_path_scopes(self):
         with tempfile.TemporaryDirectory() as directory:

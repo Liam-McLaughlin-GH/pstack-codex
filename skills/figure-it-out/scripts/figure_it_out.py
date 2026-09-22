@@ -28,6 +28,9 @@ DEFAULT_LIMITS = {
 }
 VALID_RESULTS = {"open", "verified", "failed", "reverted", "blocked", "not_run", "inconclusive"}
 CHECK_STATUSES = {"verified", "failed", "blocked", "not_run", "inconclusive"}
+RUN_STATUSES = {"planned", "running", "failed", "interrupted", "blocked", "completed"}
+PHASE_STATUSES = {"pending", "in_progress", "passed", "failed", "interrupted", "blocked"}
+ACTION_REFUSAL_STATUSES = {"failed", "interrupted", "blocked", "completed"}
 STRUCTURED_EVIDENCE_KINDS = {"artifact", "blocker", "command", "path", "reference", "test"}
 EVIDENCE_PLACEHOLDERS = {
     "agent report",
@@ -338,13 +341,223 @@ def _state_path(path: str | os.PathLike[str], workspace_root: str | os.PathLike[
     return candidate, root
 
 
+def _state_text(value: Any, field: str) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise StateError(f"invalid state: {field} must be a non-empty string")
+
+
+def _require_state_fields(value: Mapping[str, Any], fields: set[str], label: str) -> None:
+    missing = sorted(fields - set(value))
+    if missing:
+        raise StateError(f"invalid state: {label} is missing required fields: {', '.join(missing)}")
+
+
 def _require_state_object(state: Mapping[str, Any]) -> None:
-    if state.get("schema_version") != SCHEMA_VERSION:
-        raise StateError("unsupported state schema")
-    if not isinstance(state.get("plan"), Mapping):
-        raise StateError("state has no plan")
-    if not isinstance(state.get("phases"), list) or not state["phases"]:
-        raise StateError("state has no phases")
+    if not isinstance(state, Mapping):
+        raise StateError("invalid state: root must be an object")
+
+    required_fields = {
+        "schema_version",
+        "run_id",
+        "created_at",
+        "updated_at",
+        "status",
+        "plan",
+        "phases",
+        "current_phase",
+        "checkpoints",
+        "decisions",
+        "replans",
+        "predicate_results",
+        "resume_count",
+        "next_action",
+        "terminal",
+        "blocker",
+        "interruption",
+        "events",
+    }
+    _require_state_fields(state, required_fields, "root")
+    if state["schema_version"] != SCHEMA_VERSION:
+        raise StateError("invalid state: unsupported state schema")
+    for field in ("run_id", "created_at", "updated_at"):
+        _state_text(state[field], field)
+
+    status = state["status"]
+    if not isinstance(status, str) or status not in RUN_STATUSES:
+        raise StateError(f"invalid state: status must be one of {sorted(RUN_STATUSES)}")
+
+    plan = state["plan"]
+    if not isinstance(plan, Mapping):
+        raise StateError("invalid state: plan must be an object")
+    if plan.get("schema_version") != SCHEMA_VERSION:
+        raise StateError("invalid state: plan has an unsupported schema")
+    try:
+        validated_plan = validate_plan(plan)
+    except (WorkflowError, TypeError, ValueError, KeyError, AttributeError) as exc:
+        raise StateError(f"invalid state.plan: {exc}") from exc
+
+    phases = state["phases"]
+    if not isinstance(phases, list) or not phases:
+        raise StateError("invalid state: phases must be a non-empty list")
+    if len(phases) != len(validated_plan["phases"]):
+        raise StateError("invalid state: phases do not match the plan")
+    phase_ids = [phase["id"] for phase in validated_plan["phases"]]
+    for index, (phase, spec) in enumerate(zip(phases, validated_plan["phases"])):
+        if not isinstance(phase, Mapping):
+            raise StateError(f"invalid state: phases[{index}] must be an object")
+        _require_state_fields(
+            phase,
+            {
+                "id",
+                "name",
+                "hypothesis",
+                "output",
+                "verification",
+                "status",
+                "attempt",
+                "output_value",
+                "verification_result",
+                "failure",
+                "checkpoints",
+            },
+            f"phases[{index}]",
+        )
+        if phase["id"] != spec["id"]:
+            raise StateError(f"invalid state: phases[{index}].id does not match the plan")
+        if not isinstance(phase["status"], str) or phase["status"] not in PHASE_STATUSES:
+            raise StateError(f"invalid state: phases[{index}].status is not supported")
+        if isinstance(phase["attempt"], bool) or not isinstance(phase["attempt"], int) or phase["attempt"] < 0:
+            raise StateError(f"invalid state: phases[{index}].attempt must be a non-negative integer")
+        if not isinstance(phase["verification"], Mapping):
+            raise StateError(f"invalid state: phases[{index}].verification must be an object")
+        if phase["verification"] != spec["verification"]:
+            raise StateError(f"invalid state: phases[{index}].verification does not match the plan")
+        if not isinstance(phase["checkpoints"], list):
+            raise StateError(f"invalid state: phases[{index}].checkpoints must be a list")
+        if phase["verification_result"] is not None and not isinstance(phase["verification_result"], Mapping):
+            raise StateError(f"invalid state: phases[{index}].verification_result must be an object or null")
+        if phase["failure"] is not None and not isinstance(phase["failure"], Mapping):
+            raise StateError(f"invalid state: phases[{index}].failure must be an object or null")
+
+    current_phase = state["current_phase"]
+    if current_phase is not None and (not isinstance(current_phase, str) or current_phase not in phase_ids):
+        raise StateError("invalid state: current_phase must name a declared phase or be null")
+    if status == "completed" and current_phase is not None:
+        raise StateError("invalid state: completed runs cannot have a current phase")
+
+    if isinstance(state["resume_count"], bool) or not isinstance(state["resume_count"], int) or state["resume_count"] < 0:
+        raise StateError("invalid state: resume_count must be a non-negative integer")
+    if status == "completed":
+        if state["next_action"] is not None:
+            raise StateError("invalid state: completed runs cannot have a next action")
+    else:
+        _state_text(state["next_action"], "next_action")
+
+    for field in ("checkpoints", "decisions", "replans", "events"):
+        if not isinstance(state[field], list):
+            raise StateError(f"invalid state: {field} must be a list")
+
+    predicate_results = state["predicate_results"]
+    if not isinstance(predicate_results, Mapping):
+        raise StateError("invalid state: predicate_results must be an object")
+    check_ids = set(validated_plan["terminal_predicate"]["checks"])
+    if set(predicate_results) != check_ids:
+        raise StateError("invalid state: predicate_results do not match the terminal predicate")
+    for check_id, result in predicate_results.items():
+        if result is None:
+            continue
+        if not isinstance(result, Mapping):
+            raise StateError(f"invalid state: predicate_results[{check_id}] must be an object or null")
+        _require_state_fields(result, {"check_id", "passed", "status", "evidence", "observed", "at"}, f"predicate_results[{check_id}]")
+        if result["check_id"] != check_id or not isinstance(result["passed"], bool):
+            raise StateError(f"invalid state: predicate_results[{check_id}] has an invalid check result")
+        if not isinstance(result["status"], str) or result["status"] not in CHECK_STATUSES or not isinstance(result["evidence"], list):
+            raise StateError(f"invalid state: predicate_results[{check_id}] has an invalid status or evidence")
+        _state_text(result["observed"], f"predicate_results[{check_id}].observed")
+        _state_text(result["at"], f"predicate_results[{check_id}].at")
+
+    for index, decision in enumerate(state["decisions"]):
+        if not isinstance(decision, Mapping):
+            raise StateError(f"invalid state: decisions[{index}] must be an object")
+        _require_state_fields(decision, {"at", "phase", "decision", "why", "evidence", "result"}, f"decisions[{index}]")
+        for field in ("at", "phase", "decision", "why"):
+            _state_text(decision[field], f"decisions[{index}].{field}")
+        if not isinstance(decision["result"], str) or decision["result"] not in VALID_RESULTS or not isinstance(decision["evidence"], list):
+            raise StateError(f"invalid state: decisions[{index}] has an invalid result or evidence")
+        decision_status = decision.get("status")
+        if decision_status is not None and (not isinstance(decision_status, str) or decision_status not in {"blocked", "refused"}):
+            raise StateError(f"invalid state: decisions[{index}].status is not supported")
+        if ("reason" in decision) != ("next_action" in decision):
+            raise StateError(f"invalid state: decisions[{index}] must contain reason and next_action together")
+        if "reason" in decision:
+            _state_text(decision["reason"], f"decisions[{index}].reason")
+            _state_text(decision["next_action"], f"decisions[{index}].next_action")
+
+    for index, checkpoint in enumerate(state["checkpoints"]):
+        if not isinstance(checkpoint, Mapping):
+            raise StateError(f"invalid state: checkpoints[{index}] must be an object")
+        _require_state_fields(checkpoint, {"id", "at", "phase", "label", "evidence", "next_action"}, f"checkpoints[{index}]")
+        for field in ("id", "at", "phase", "label", "next_action"):
+            _state_text(checkpoint[field], f"checkpoints[{index}].{field}")
+        if not isinstance(checkpoint["evidence"], list):
+            raise StateError(f"invalid state: checkpoints[{index}].evidence must be a list")
+
+    for index, replan in enumerate(state["replans"]):
+        if not isinstance(replan, Mapping):
+            raise StateError(f"invalid state: replans[{index}] must be an object")
+        _require_state_fields(replan, {"number", "at", "phase", "reason", "evidence", "next_action", "replacement"}, f"replans[{index}]")
+        if isinstance(replan["number"], bool) or not isinstance(replan["number"], int) or replan["number"] < 1:
+            raise StateError(f"invalid state: replans[{index}].number must be a positive integer")
+        for field in ("at", "phase", "reason", "next_action"):
+            _state_text(replan[field], f"replans[{index}].{field}")
+        if not isinstance(replan["evidence"], list) or not isinstance(replan["replacement"], Mapping):
+            raise StateError(f"invalid state: replans[{index}] has an invalid evidence or replacement")
+
+    for index, event in enumerate(state["events"]):
+        if not isinstance(event, Mapping):
+            raise StateError(f"invalid state: events[{index}] must be an object")
+        _require_state_fields(event, {"at", "event"}, f"events[{index}]")
+        _state_text(event["at"], f"events[{index}].at")
+        _state_text(event["event"], f"events[{index}].event")
+
+    blocker = state["blocker"]
+    if blocker is not None:
+        if not isinstance(blocker, Mapping):
+            raise StateError("invalid state: blocker must be an object or null")
+        _require_state_fields(blocker, {"at", "phase", "reason", "evidence", "next_action"}, "blocker")
+        _state_text(blocker["at"], "blocker.at")
+        _state_text(blocker["reason"], "blocker.reason")
+        _state_text(blocker["next_action"], "blocker.next_action")
+        if not isinstance(blocker["evidence"], list):
+            raise StateError("invalid state: blocker.evidence must be a list")
+    if status == "blocked" and blocker is None:
+        raise StateError("invalid state: blocked runs require a blocker")
+
+    interruption = state["interruption"]
+    if interruption is not None:
+        if not isinstance(interruption, Mapping):
+            raise StateError("invalid state: interruption must be an object or null")
+        _require_state_fields(interruption, {"at", "phase", "checkpoint", "reason"}, "interruption")
+        for field in ("at", "phase", "checkpoint", "reason"):
+            _state_text(interruption[field], f"interruption.{field}")
+    if status == "interrupted" and interruption is None:
+        raise StateError("invalid state: interrupted runs require interruption details")
+
+    terminal = state["terminal"]
+    if status == "completed":
+        if not isinstance(terminal, Mapping):
+            raise StateError("invalid state: completed runs require terminal details")
+        _require_state_fields(terminal, {"at", "predicate", "checks"}, "terminal")
+        _state_text(terminal["at"], "terminal.at")
+        _state_text(terminal["predicate"], "terminal.predicate")
+        if not isinstance(terminal["checks"], Mapping) or terminal["checks"] != predicate_results:
+            raise StateError("invalid state: terminal checks do not match predicate_results")
+        if any(phase["status"] != "passed" for phase in phases):
+            raise StateError("invalid state: completed runs require every phase to be passed")
+        if any(result is None or result.get("passed") is not True or result.get("status") != "verified" for result in predicate_results.values()):
+            raise StateError("invalid state: completed runs require every predicate check to be verified")
+    elif terminal is not None:
+        raise StateError("invalid state: only completed runs may have terminal details")
 
 
 class Workflow:
@@ -355,6 +568,7 @@ class Workflow:
         self.state_path = state_path
         self.workspace_root = workspace_root
         self.state = state
+        self._validate_state_limits()
 
     @classmethod
     def create(
@@ -424,12 +638,15 @@ class Workflow:
             raise StateError(f"state file does not exist: {path}") from exc
         except json.JSONDecodeError as exc:
             raise StateError(f"state file is not valid JSON: {path}") from exc
+        except (OSError, UnicodeError) as exc:
+            raise StateError(f"state file could not be read: {path}") from exc
         if not isinstance(state, dict):
             raise StateError("state root must be an object")
         return cls(path, root, state)
 
     def _persist(self) -> None:
         self.state["updated_at"] = _now()
+        _require_state_object(self.state)
         self._validate_state_limits()
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(prefix=f".{self.state_path.name}.", suffix=".tmp", dir=str(self.state_path.parent))
@@ -449,11 +666,15 @@ class Workflow:
         if len(self.state["checkpoints"]) > limits["max_checkpoints"]:
             raise StateError("checkpoint limit exceeded")
         decision_limit = limits["max_decisions"]
+        last_decision = self.state["decisions"][-1] if self.state["decisions"] else None
         decision_overflow = (
             len(self.state["decisions"]) == decision_limit + 1
-            and self.state.get("status") == "blocked"
-            and self.state["decisions"][-1].get("result") == "blocked"
-            and self.state["decisions"][-1].get("status") == "blocked"
+            and last_decision is not None
+            and last_decision.get("result") == "blocked"
+            and (
+                (self.state.get("status") == "blocked" and last_decision.get("status") == "blocked")
+                or last_decision.get("status") == "refused"
+            )
         )
         if len(self.state["decisions"]) > decision_limit and not decision_overflow:
             raise StateError("decision limit exceeded")
@@ -471,6 +692,9 @@ class Workflow:
         self.state["events"].append({"at": _now(), "event": event, **details})
 
     def _require_current(self, status: str) -> dict[str, Any]:
+        _require_state_object(self.state)
+        if self.state["status"] == "completed":
+            raise StateError("completed workflow is terminal and immutable")
         phase = self._phase()
         if phase["status"] != status:
             raise StateError(f"phase {phase['id']} is {phase['status']}; expected {status}")
@@ -536,6 +760,7 @@ class Workflow:
         self._persist()
 
     def start_phase(self) -> dict[str, Any]:
+        _require_state_object(self.state)
         if self.state["status"] == "failed":
             raise ReplanRequired(f"phase {self.state['current_phase']} failed; replan before retry")
         if self.state["status"] == "interrupted":
@@ -563,6 +788,7 @@ class Workflow:
         return deepcopy(self.state)
 
     def checkpoint(self, label: str, evidence: Sequence[Any] | str, next_action: str) -> dict[str, Any]:
+        _require_state_object(self.state)
         phase = self._require_current("in_progress")
         label = _text(label, "checkpoint.label", max_length=200)
         evidence_values = _evidence(evidence, "checkpoint.evidence")
@@ -591,6 +817,7 @@ class Workflow:
         return deepcopy(checkpoint)
 
     def complete_phase(self, output: Any, verification: Mapping[str, Any]) -> dict[str, Any]:
+        _require_state_object(self.state)
         phase = self._require_current("in_progress")
         if output is None or output == "" or output == {} or output == []:
             raise StateError("phase output must be present")
@@ -639,6 +866,7 @@ class Workflow:
         return None
 
     def fail_phase(self, reason: str, evidence: Sequence[Any] | str, next_action: str) -> dict[str, Any]:
+        _require_state_object(self.state)
         phase = self._require_current("in_progress")
         reason = _text(reason, "failure.reason", max_length=1000)
         evidence_values = _evidence(evidence, "failure.evidence")
@@ -666,6 +894,7 @@ class Workflow:
         next_action: str,
         replacement: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        _require_state_object(self.state)
         if self.state["status"] != "failed":
             raise StateError("replan requires a failed phase")
         reason = _text(reason, "replan.reason", max_length=1000)
@@ -716,6 +945,7 @@ class Workflow:
         return deepcopy(self.state)
 
     def interrupt(self, reason: str) -> dict[str, Any]:
+        _require_state_object(self.state)
         if self.state["status"] != "running":
             raise StateError("only a running workflow can be interrupted")
         phase = self._require_current("in_progress")
@@ -732,6 +962,7 @@ class Workflow:
         return deepcopy(self.state)
 
     def resume(self) -> dict[str, Any]:
+        _require_state_object(self.state)
         if self.state["status"] != "interrupted":
             raise StateError("resume requires an interrupted workflow")
         phase = self._require_current("interrupted")
@@ -759,6 +990,7 @@ class Workflow:
         self._event("blocked", phase=current_id, reason=reason)
 
     def block(self, reason: str, evidence: Sequence[Any] | str, next_action: str) -> dict[str, Any]:
+        _require_state_object(self.state)
         if self.state["status"] == "completed":
             raise StateError("completed workflow cannot be blocked")
         self._block_and_persist(reason, evidence, next_action)
@@ -778,6 +1010,9 @@ class Workflow:
         persist: bool = True,
         _allow_limit_overflow: bool = False,
     ) -> dict[str, Any]:
+        _require_state_object(self.state)
+        if self.state["status"] == "completed":
+            raise StateError("completed workflow is terminal and immutable")
         phase = _text(phase, "decision.phase", max_length=100)
         decision = _text(decision, "decision.decision", max_length=1000)
         why = _text(why, "decision.why", max_length=1000)
@@ -825,6 +1060,9 @@ class Workflow:
         observed: str = "",
         status: str | None = None,
     ) -> dict[str, Any]:
+        _require_state_object(self.state)
+        if self.state["status"] == "completed":
+            raise PredicateError("completed workflow is terminal and immutable")
         check_id = _text(check_id, "predicate.check_id", max_length=100)
         if not isinstance(passed, bool):
             raise PredicateError("predicate.passed must be a boolean")
@@ -870,6 +1108,7 @@ class Workflow:
         return deepcopy(result)
 
     def finish(self) -> dict[str, Any]:
+        _require_state_object(self.state)
         if self.state["status"] != "running":
             raise PredicateError(f"cannot finish a {self.state['status']} workflow")
         if any(phase["status"] != "passed" for phase in self.state["phases"]):
@@ -907,13 +1146,12 @@ class Workflow:
             "reason": reason,
             "next_action": next_action,
         }
-        self.state["events"].append({"event": "action_refused", **refusal})
         action_reference = action if SAFE_ACTION.fullmatch(action) else "invalid-action"
         evidence = [
             {"kind": "reference", "ref": f"scope:{action_reference}"},
             {"kind": "reference", "ref": "target:provided" if target is not None else "target:none"},
         ]
-        self.record_decision(
+        record = self._decision_record(
             self.state.get("current_phase") or "run",
             f"refused action {action_reference}",
             reason,
@@ -922,12 +1160,21 @@ class Workflow:
             status="refused",
             reason=reason,
             next_action=next_action,
-            persist=False,
         )
+        event = {"event": "action_refused", **refusal}
+        decision_limit = self.state["plan"]["limits"]["max_decisions"]
+        try:
+            self._append_decision_record(record, allow_limit_overflow=len(self.state["decisions"]) == decision_limit)
+        except StateError:
+            # The refusal event remains complete when the bounded decision list
+            # has already used its one permitted overflow record.
+            event["decision"] = deepcopy(record)
+        self.state["events"].append(event)
         self._persist()
         raise ScopeRefusal(reason, refusal)
 
     def guard_action(self, action: str, target: str | None = None) -> dict[str, Any]:
+        _require_state_object(self.state)
         action_value = (
             action
             if isinstance(action, str)
@@ -935,6 +1182,23 @@ class Workflow:
             and not any(unicodedata.category(char) in {"Cc", "Cf"} for char in action)
             else "<invalid-action>"
         )
+        target_display: str | None
+        if not isinstance(target, str):
+            target_display = None if target is None else "<invalid-target>"
+        elif len(target) > 500 or any(unicodedata.category(char) in {"Cc", "Cf"} for char in target):
+            target_display = "<invalid-target>"
+        else:
+            target_display = target
+
+        if self.state["status"] in ACTION_REFUSAL_STATUSES:
+            lifecycle_reasons = {
+                "failed": "run is failed; replan before authorizing another action",
+                "interrupted": "run is stopped; resume before authorizing another action",
+                "blocked": "run is blocked; resolve the recorded blocker before authorizing another action",
+                "completed": "run is completed; its terminal state is immutable",
+            }
+            self._refuse_action(action_value, target_display, lifecycle_reasons[self.state["status"]])
+
         action_invalid_reason: str | None = None
         if not isinstance(action, str):
             action_invalid_reason = "action name is not a string"
@@ -951,12 +1215,10 @@ class Workflow:
         if action_invalid_reason:
             self._refuse_action(action_value, None, action_invalid_reason)
         assert isinstance(action, str)
-        if self.state["status"] == "completed":
-            raise StateError("completed workflow cannot authorize another action")
 
         target_provided = target is not None
         target_invalid_reason: str | None = None
-        target_display: str | None = target if isinstance(target, str) else None
+        target_display = target if isinstance(target, str) else None
         if target_provided and not isinstance(target, str):
             target_invalid_reason = "target is not a string"
             target_display = "<invalid-target>"
@@ -1066,6 +1328,13 @@ def _load_json(path: str) -> Any:
         raise PlanError(f"JSON file does not exist: {path}") from exc
     except json.JSONDecodeError as exc:
         raise PlanError(f"JSON file is invalid: {path}") from exc
+
+
+def _parse_json_argument(value: str, field: str) -> Any:
+    try:
+        return json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise PlanError(f"{field} must be valid JSON") from exc
 
 
 def _print_state(state: Mapping[str, Any]) -> None:
@@ -1183,7 +1452,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "fail-phase":
             result = workflow.fail_phase(args.reason, args.evidence, args.next_action)
         elif args.command == "replan":
-            replacement = json.loads(args.replacement) if args.replacement else None
+            replacement = _parse_json_argument(args.replacement, "replan replacement") if args.replacement else None
             result = workflow.replan(args.reason, args.evidence, args.next_action, replacement)
         elif args.command == "interrupt":
             result = workflow.interrupt(args.reason)
