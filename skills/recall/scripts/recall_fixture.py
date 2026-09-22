@@ -62,8 +62,9 @@ TEXT_FIELD_PATTERN = re.compile(
     r"\s*:\s*(?P<value>[^\r\n]*)$"
 )
 EXPORT_MARKER_PATTERN = re.compile(
-    r"(?i)^codex[- _]?recall[- _]?export\s*:\s*(?P<version>[^\s]+)$"
+    r"^Codex-Recall-Export:\s*(?P<version>[^\s]+)$"
 )
+EXPORT_VERSION = "1"
 MAX_ARTIFACTS = 32
 MAX_FILE_BYTES = 1_000_000
 MAX_WINDOW_DAYS = 31
@@ -226,7 +227,73 @@ def resolve_artifact(workspace: Path, raw_artifact: str) -> Path:
     return resolved
 
 
-def open_checked_artifact(workspace: Path, resolved: Path) -> int:
+def stat_identity(info: os.stat_result) -> tuple[int, int, int, int]:
+    """Identify one filesystem object across path and descriptor views."""
+
+    return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), info.st_ctime_ns)
+
+
+def close_fd(file_descriptor: int | None) -> None:
+    if file_descriptor is None:
+        return
+    try:
+        os.close(file_descriptor)
+    except OSError:
+        pass
+
+
+def open_workspace_descriptor(workspace: Path) -> tuple[int, tuple[int, int, int, int]]:
+    """Bind the canonical workspace path to a no-follow directory descriptor."""
+
+    no_follow = getattr(os, "O_NOFOLLOW", 0)
+    close_on_exec = getattr(os, "O_CLOEXEC", 0)
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    nonblocking = getattr(os, "O_NONBLOCK", 0)
+    if not no_follow or not directory_flag or not nonblocking:
+        raise RecallError("safe descriptor-based artifact reads are unavailable")
+    try:
+        expected = os.stat(workspace, follow_symlinks=False)
+        if not stat.S_ISDIR(expected.st_mode):
+            raise RecallError(f"workspace is not a directory: {quote_path(workspace)}")
+        directory_flags = os.O_RDONLY | close_on_exec | no_follow | directory_flag | nonblocking
+        workspace_fd = os.open(str(workspace), directory_flags)
+        actual = os.fstat(workspace_fd)
+        if (
+            not stat.S_ISDIR(actual.st_mode)
+            or stat_identity(actual) != stat_identity(expected)
+        ):
+            close_fd(workspace_fd)
+            raise RecallError(
+                f"workspace changed before safe open: {quote_path(workspace)}"
+            )
+        return workspace_fd, stat_identity(expected)
+    except RecallError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise RecallError(f"workspace cannot be opened safely: {quote_path(workspace)}") from exc
+
+
+def revalidate_workspace(
+    workspace: Path, expected_identity: tuple[int, int, int, int]
+) -> None:
+    """Reject replacement of the canonical workspace path during the read."""
+
+    try:
+        current = os.stat(workspace, follow_symlinks=False)
+    except (OSError, ValueError) as exc:
+        raise RecallError(f"workspace changed during read: {quote_path(workspace)}") from exc
+    if not stat.S_ISDIR(current.st_mode) or stat_identity(current) != expected_identity:
+        raise RecallError(f"workspace changed during read: {quote_path(workspace)}")
+
+
+def open_checked_artifact(
+    workspace: Path,
+    resolved: Path,
+    *,
+    workspace_fd: int | None = None,
+    workspace_identity: tuple[int, int, int, int] | None = None,
+    expected_target_identity: tuple[int, int, int, int] | None = None,
+) -> int:
     """Open the resolved target beneath a directory descriptor without following links."""
 
     try:
@@ -244,40 +311,108 @@ def open_checked_artifact(workspace: Path, resolved: Path) -> int:
     directory_flags = os.O_RDONLY | close_on_exec | no_follow | directory_flag | nonblocking
     file_flags = os.O_RDONLY | close_on_exec | no_follow | nonblocking
     parent_fd: int | None = None
+    artifact_fd: int | None = None
     try:
-        parent_fd = os.open(str(workspace), directory_flags)
+        if workspace_fd is None:
+            parent_fd, opened_workspace_identity = open_workspace_descriptor(workspace)
+            if (
+                workspace_identity is not None
+                and opened_workspace_identity != workspace_identity
+            ):
+                raise RecallError(
+                    f"workspace changed before safe open: {quote_path(workspace)}"
+                )
+            workspace_identity = opened_workspace_identity
+        else:
+            parent_fd = os.dup(workspace_fd)
+            opened_workspace = os.fstat(parent_fd)
+            if (
+                workspace_identity is not None
+                and stat_identity(opened_workspace) != workspace_identity
+            ):
+                raise RecallError(
+                    f"workspace descriptor changed during read: {quote_path(workspace)}"
+                )
         for component in relative.parts[:-1]:
             child_fd = os.open(component, directory_flags, dir_fd=parent_fd)
-            os.close(parent_fd)
+            try:
+                child_stat = os.fstat(child_fd)
+            except (OSError, ValueError):
+                close_fd(child_fd)
+                raise
+            if not stat.S_ISDIR(child_stat.st_mode):
+                close_fd(child_fd)
+                raise RecallError(f"artifact parent is not a directory: {quote_path(resolved)}")
+            close_fd(parent_fd)
             parent_fd = child_fd
         target_stat = os.stat(relative.parts[-1], dir_fd=parent_fd, follow_symlinks=False)
         if not stat.S_ISREG(target_stat.st_mode):
             raise RecallError(f"artifact is not a regular file: {quote_path(resolved)}")
+        if target_stat.st_nlink != 1:
+            raise RecallError(f"hardlinked artifacts are not permitted: {quote_path(resolved)}")
+        if target_stat.st_size > MAX_FILE_BYTES:
+            raise RecallError(f"artifact exceeds {MAX_FILE_BYTES} bytes: {quote_path(resolved)}")
+        if (
+            expected_target_identity is not None
+            and stat_identity(target_stat) != expected_target_identity
+        ):
+            raise RecallError(f"artifact changed before safe open: {quote_path(resolved)}")
         artifact_fd = os.open(relative.parts[-1], file_flags, dir_fd=parent_fd)
+        opened_target = os.fstat(artifact_fd)
+        if (
+            not stat.S_ISREG(opened_target.st_mode)
+            or opened_target.st_nlink != 1
+            or stat_identity(opened_target) != stat_identity(target_stat)
+            or (
+                expected_target_identity is not None
+                and stat_identity(opened_target) != expected_target_identity
+            )
+        ):
+            raise RecallError(f"artifact changed before safe open: {quote_path(resolved)}")
         return artifact_fd
+    except RecallError:
+        close_fd(artifact_fd)
+        raise
     except (OSError, ValueError) as exc:
-        if isinstance(exc, RecallError):
-            raise
+        close_fd(artifact_fd)
         raise RecallError(f"artifact cannot be opened safely: {quote_path(resolved)}") from exc
     finally:
-        if parent_fd is not None:
-            try:
-                os.close(parent_fd)
-            except OSError:
-                pass
+        close_fd(parent_fd)
 
 
-def read_checked_artifact(workspace: Path, resolved: Path) -> str:
+def read_checked_artifact(
+    workspace: Path,
+    resolved: Path,
+    *,
+    workspace_fd: int | None = None,
+    workspace_identity: tuple[int, int, int, int] | None = None,
+    expected_target_identity: tuple[int, int, int, int] | None = None,
+) -> str:
     """Read a bounded regular file from the descriptor that was size-checked."""
 
+    if expected_target_identity is None:
+        try:
+            expected_target_identity = stat_identity(
+                os.stat(resolved, follow_symlinks=False)
+            )
+        except (OSError, ValueError) as exc:
+            raise RecallError(f"artifact cannot be checked safely: {quote_path(resolved)}") from exc
     try:
-        artifact_fd = open_checked_artifact(workspace, resolved)
+        artifact_fd = open_checked_artifact(
+            workspace,
+            resolved,
+            workspace_fd=workspace_fd,
+            workspace_identity=workspace_identity,
+            expected_target_identity=expected_target_identity,
+        )
     except RecallError:
         raise
     try:
         before = os.fstat(artifact_fd)
         if not stat.S_ISREG(before.st_mode):
             raise RecallError(f"artifact is not a regular file: {quote_path(resolved)}")
+        if before.st_nlink != 1:
+            raise RecallError(f"hardlinked artifacts are not permitted: {quote_path(resolved)}")
         if before.st_size > MAX_FILE_BYTES:
             raise RecallError(f"artifact exceeds {MAX_FILE_BYTES} bytes: {quote_path(resolved)}")
 
@@ -294,9 +429,11 @@ def read_checked_artifact(workspace: Path, resolved: Path) -> str:
 
         after = os.fstat(artifact_fd)
         if (
-            after.st_size != before.st_size
+            stat_identity(after) != stat_identity(before)
+            or after.st_size != before.st_size
             or after.st_mtime_ns != before.st_mtime_ns
             or after.st_ctime_ns != before.st_ctime_ns
+            or after.st_nlink != 1
         ):
             raise RecallError(f"artifact changed while it was being read: {quote_path(resolved)}")
         try:
@@ -577,16 +714,6 @@ def iter_text_lines(text: str) -> Iterable[str]:
             yield line
 
 
-def export_marker_versions(text: str) -> list[str]:
-    versions: list[str] = []
-    for line in iter_text_lines(text):
-        candidate = strip_allowed_text_prefixes(line)
-        match = EXPORT_MARKER_PATTERN.fullmatch(candidate)
-        if match is not None:
-            versions.append(match.group("version"))
-    return versions
-
-
 def parse_text_artifact(
     path: Path,
     text: str,
@@ -597,16 +724,6 @@ def parse_text_artifact(
     as_of: datetime,
 ) -> list[dict[str, Any]]:
     """Extract only the bounded, line-oriented Codex export fields we document."""
-
-    marker_versions = export_marker_versions(text)
-    if not marker_versions:
-        return []
-    for value in marker_versions:
-        if value not in {"1", "v1", "1.0"}:
-            raise RecallError(
-                f"{quote_path(path)}: unsupported Codex recall export version "
-                f"{quote_data(clean_text(value))}"
-            )
 
     raw: dict[str, Any] = {
         "id": path.stem,
@@ -626,9 +743,23 @@ def parse_text_artifact(
         "next_moves": [],
         "body": text,
     }
+    marker_seen = False
     recognized = False
     format_name = ""
     for line in iter_text_lines(text):
+        candidate = strip_allowed_text_prefixes(line)
+        marker = EXPORT_MARKER_PATTERN.fullmatch(candidate)
+        if marker is not None:
+            version = marker.group("version")
+            if version != EXPORT_VERSION:
+                raise RecallError(
+                    f"{quote_path(path)}: unsupported Codex recall export version "
+                    f"{quote_data(clean_text(version))}"
+                )
+            marker_seen = True
+            continue
+        if not marker_seen:
+            continue
         field = extract_text_field(line)
         if field is None:
             continue
@@ -695,7 +826,7 @@ def parse_text_artifact(
                 raw["facts"].append(f"Claim: {value}")
             recognized = True
 
-    if not recognized:
+    if not marker_seen or not recognized:
         return []
     if raw["next_moves"]:
         raw["next_move"] = raw["next_moves"][0]
@@ -831,69 +962,91 @@ def read_artifacts(
     opaque: list[str] = []
     resolved_paths: list[Path] = []
     authorized_history_export = False
-    for raw_path, default_origin, provenance in zip(artifacts, defaults, provenance_defaults):
-        path = resolve_artifact(workspace, raw_path)
-        resolved_paths.append(path)
-        text = read_checked_artifact(workspace, path)
-        suffix = path.suffix.lower()
-        artifact_contributed = False
-        if suffix in OPAQUE_SUFFIXES:
-            parsed = parse_text_artifact(
+    workspace_fd, workspace_identity = open_workspace_descriptor(workspace)
+    try:
+        for raw_path, default_origin, provenance in zip(artifacts, defaults, provenance_defaults):
+            revalidate_workspace(workspace, workspace_identity)
+            path = resolve_artifact(workspace, raw_path)
+            resolved_paths.append(path)
+            revalidate_workspace(workspace, workspace_identity)
+            try:
+                expected_target_identity = stat_identity(
+                    os.stat(path, follow_symlinks=False)
+                )
+            except (OSError, ValueError) as exc:
+                raise RecallError(
+                    f"artifact cannot be checked safely: {quote_path(path)}"
+                ) from exc
+            text = read_checked_artifact(
+                workspace,
                 path,
-                text,
-                default_origin=default_origin,
-                workspace_id=workspace_id,
-                topic=topic,
-                as_of=as_of,
+                workspace_fd=workspace_fd,
+                workspace_identity=workspace_identity,
+                expected_target_identity=expected_target_identity,
             )
-            if parsed:
-                for raw in parsed:
-                    normalized = normalize_scoped_record(
-                        raw,
-                        source=str(path),
-                        default_origin=default_origin,
-                        workspace_id=workspace_id,
-                        topic=topic,
-                        start=start,
-                        as_of=as_of,
-                    )
-                    if normalized is not None:
-                        records.append(normalized)
-                        artifact_contributed = True
+            revalidate_workspace(workspace, workspace_identity)
+            suffix = path.suffix.lower()
+            artifact_contributed = False
+            if suffix in OPAQUE_SUFFIXES:
+                parsed = parse_text_artifact(
+                    path,
+                    text,
+                    default_origin=default_origin,
+                    workspace_id=workspace_id,
+                    topic=topic,
+                    as_of=as_of,
+                )
+                if parsed:
+                    for raw in parsed:
+                        normalized = normalize_scoped_record(
+                            raw,
+                            source=str(path),
+                            default_origin=default_origin,
+                            workspace_id=workspace_id,
+                            topic=topic,
+                            start=start,
+                            as_of=as_of,
+                        )
+                        if normalized is not None:
+                            records.append(normalized)
+                            artifact_contributed = True
+                else:
+                    if default_origin not in ALLOWED_ORIGINS:
+                        raise RecallError(
+                            f"{quote_path(path)}: opaque documents require "
+                            "--artifact-origin synthetic or user"
+                        )
+                    opaque.append(str(path))
+            elif suffix == ".jsonl":
+                parsed_records = parse_jsonl_artifact(
+                    path,
+                    text,
+                    default_origin=default_origin,
+                    workspace_id=workspace_id,
+                    topic=topic,
+                    start=start,
+                    as_of=as_of,
+                )
+                records.extend(parsed_records)
+                artifact_contributed = bool(parsed_records)
             else:
-                if default_origin not in ALLOWED_ORIGINS:
-                    raise RecallError(
-                        f"{quote_path(path)}: opaque documents require "
-                        "--artifact-origin synthetic or user"
-                    )
-                opaque.append(str(path))
-        elif suffix == ".jsonl":
-            parsed_records = parse_jsonl_artifact(
-                path,
-                text,
-                default_origin=default_origin,
-                workspace_id=workspace_id,
-                topic=topic,
-                start=start,
-                as_of=as_of,
-            )
-            records.extend(parsed_records)
-            artifact_contributed = bool(parsed_records)
-        else:
-            parsed_records = parse_json_artifact(
-                path,
-                text,
-                default_origin=default_origin,
-                workspace_id=workspace_id,
-                topic=topic,
-                start=start,
-                as_of=as_of,
-            )
-            records.extend(parsed_records)
-            artifact_contributed = bool(parsed_records)
-        if provenance == AUTHORIZED_HISTORY_EXPORT and artifact_contributed:
-            authorized_history_export = True
-    return records, opaque, resolved_paths, authorized_history_export
+                parsed_records = parse_json_artifact(
+                    path,
+                    text,
+                    default_origin=default_origin,
+                    workspace_id=workspace_id,
+                    topic=topic,
+                    start=start,
+                    as_of=as_of,
+                )
+                records.extend(parsed_records)
+                artifact_contributed = bool(parsed_records)
+            if provenance == AUTHORIZED_HISTORY_EXPORT and artifact_contributed:
+                authorized_history_export = True
+        revalidate_workspace(workspace, workspace_identity)
+        return records, opaque, resolved_paths, authorized_history_export
+    finally:
+        close_fd(workspace_fd)
 
 
 def source_ref(record: dict[str, Any], workspace: Path) -> str:
