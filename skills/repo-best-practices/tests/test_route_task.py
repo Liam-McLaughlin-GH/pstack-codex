@@ -58,6 +58,53 @@ class RouteTaskTests(unittest.TestCase):
         self.assertEqual(decision["repositories"], ["web-app"])
 
 
+    def test_explicit_legacy_frontend_overrides_generic_frontend_wording(self) -> None:
+        for request in (
+            "Fix the AngularJS frontend bridge",
+            "Fix the legacy frontend template redirect",
+        ):
+            with self.subTest(request=request):
+                decision = run_route(request)
+                self.assertEqual(decision["category"], "legacy-frontend")
+                self.assertEqual(decision["repositories"], ["web-app"])
+
+
+    def test_distinct_modern_signal_keeps_legacy_request_mixed(self) -> None:
+        decision = run_route("Fix the AngularJS frontend bridge and update the React component")
+        self.assertEqual(decision["category"], "mixed")
+        self.assertEqual(decision["repositories"], ["web-app", "showpass-frontend"])
+
+
+    def test_weak_terms_do_not_override_django_owner(self) -> None:
+        for request in ("Fix a Django page", "Update a Django route"):
+            with self.subTest(request=request):
+                decision = run_route(request)
+                self.assertEqual(decision["category"], "backend")
+                self.assertEqual(decision["repositories"], ["web-app"])
+
+
+    def test_weak_terms_need_modern_context(self) -> None:
+        for request in ("Review repository setup", "Update a page", "Update a route", "Edit a template"):
+            with self.subTest(request=request):
+                decision = run_route(request)
+                self.assertEqual(decision["category"], "unknown")
+                self.assertEqual(decision["repositories"], [])
+
+
+    def test_next_template_is_modern_frontend_not_legacy(self) -> None:
+        decision = run_route("Update the Next.js template")
+        self.assertEqual(decision["category"], "frontend")
+        self.assertEqual(decision["repositories"], ["showpass-frontend"])
+
+
+    def test_monitoring_and_environment_route_to_infrastructure(self) -> None:
+        for request in ("Review the monitoring configuration", "Update environment configuration"):
+            with self.subTest(request=request):
+                decision = run_route(request)
+                self.assertEqual(decision["category"], "infrastructure")
+                self.assertEqual(decision["repositories"], ["web-k8s"])
+
+
     def test_unknown_request_requires_source_trace(self) -> None:
         decision = run_route("Write a project status summary")
         self.assertEqual(decision["category"], "unknown")

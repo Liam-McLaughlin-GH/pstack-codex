@@ -35,15 +35,22 @@ BACKEND_SIGNALS = (
     "basket",
 )
 
-FRONTEND_SIGNALS = (
+MODERN_FRONTEND_SIGNALS = (
     "react",
     "next.js",
     "nextjs",
     "next app",
-    "frontend",
-    "client",
     "mobile",
     "desktop",
+    "showpass-frontend",
+)
+
+GENERIC_FRONTEND_SIGNALS = (
+    "frontend",
+    "client",
+)
+
+FRONTEND_CONTEXT_SIGNALS = (
     "repository",
     "service hook",
     "component",
@@ -56,11 +63,13 @@ LEGACY_FRONTEND_SIGNALS = (
     "angularjs",
     "angular",
     "django template",
-    "template",
+    "legacy frontend",
+    "legacy template",
     "gulp",
     "apps/main/static",
+    "apps/main/templates",
     "legacy bridge",
-    "redirect",
+    "legacy redirect",
     "embedded page",
 )
 
@@ -80,6 +89,11 @@ INFRA_SIGNALS = (
     "helm",
     "infrastructure",
     "infra",
+    "web-k8s",
+    "monitoring",
+    "environment configuration",
+    "environment config",
+    "environment selection",
 )
 
 
@@ -107,20 +121,28 @@ def route_request(request: str) -> RouteDecision:
         raise ValueError("request must not be empty")
 
     backend = _matched(normalized, BACKEND_SIGNALS)
-    modern_frontend = _matched(normalized, FRONTEND_SIGNALS)
     legacy_frontend = _matched(normalized, LEGACY_FRONTEND_SIGNALS)
+    explicit_modern_frontend = _matched(normalized, MODERN_FRONTEND_SIGNALS)
+    generic_modern_frontend = _matched(normalized, GENERIC_FRONTEND_SIGNALS)
+    if legacy_frontend and not explicit_modern_frontend:
+        generic_modern_frontend = ()
+    frontend_context = (
+        _matched(normalized, FRONTEND_CONTEXT_SIGNALS)
+        if explicit_modern_frontend or generic_modern_frontend
+        else ()
+    )
+    modern_frontend = explicit_modern_frontend + generic_modern_frontend + frontend_context
     infrastructure = _matched(normalized, INFRA_SIGNALS)
 
     repositories: list[str] = []
     signals: list[str] = []
-    if backend:
+    if backend or legacy_frontend:
         repositories.append("web-app")
+    if backend:
         signals.extend(f"backend:{signal}" for signal in backend)
     if modern_frontend:
         repositories.append("showpass-frontend")
         signals.extend(f"frontend:{signal}" for signal in modern_frontend)
-    if legacy_frontend and "web-app" not in repositories:
-        repositories.append("web-app")
     signals.extend(f"legacy-frontend:{signal}" for signal in legacy_frontend)
     if infrastructure:
         repositories.append("web-k8s")
@@ -132,7 +154,7 @@ def route_request(request: str) -> RouteDecision:
     elif len(repositories) > 1:
         category = "mixed"
         next_step = "Trace the backend contract, then the client adapter, then deployment configuration; include only changed owners."
-    elif legacy_frontend and not backend and not modern_frontend and not infrastructure:
+    elif legacy_frontend and not modern_frontend and not infrastructure:
         category = "legacy-frontend"
         next_step = "Read web-app root AGENTS.md and the legacy frontend/domain guidance before editing."
     elif repositories == ["web-app"]:

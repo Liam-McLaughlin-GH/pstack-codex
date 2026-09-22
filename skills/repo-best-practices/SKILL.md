@@ -20,12 +20,14 @@ The helper is a keyword hint. Exact source paths, symbols, and current repositor
 | Request shape | Primary owner | Boundary |
 | --- | --- | --- |
 | Django, DRF, models, ViewSets, serializers, services, Celery, durable records, permissions, API contracts, ledger, or backend tests | `web-app` | Check the domain owner, not only the URL prefix. Postgres and backend contracts are authoritative for durable behavior. |
-| React, Next.js, mobile, desktop, shared client core, repositories, service hooks, or client tests | `showpass-frontend` | Keep routes thin. Follow `API -> Repository -> Service Hook -> use-case/composition hook -> UI`; inspect the backend contract first. |
+| React, Next.js, mobile, desktop, shared client core, repositories, service hooks, or client tests with modern client context | `showpass-frontend` | Keep routes thin. Follow `API -> Repository -> Service Hook -> use-case/composition hook -> UI`; inspect the backend contract first. |
 | AngularJS, Django templates, `apps/main/static`, Gulp, redirects, embedded pages, or legacy bridge code | `web-app` | This is a legacy frontend surface in the backend repository, not a reason to move the change to the modern frontend monorepo. |
 | Fabric, Kubernetes, Jinja, `gcloud`, `kubectl`, ingress, rollout, monitoring, HPA, KEDA, or environment configuration | `web-k8s` | Select the environment first. Treat deployment commands as operational actions requiring explicit authorization. |
 | A backend contract plus a modern client plus deployment or ingress changes | Split by owner | Trace backend contract first, then the client adapter, then deployment configuration. Include only repositories whose source actually changes. |
 
 Do not infer ownership from a ticket label, API prefix, package name, or a neighboring repository. Read the current root guidance and the smallest relevant architecture/domain document when the helper is insufficient.
+
+Explicit legacy terms take precedence over generic `frontend` or `client` wording. A request that names AngularJS, a Django template, the legacy bridge, Gulp, or `apps/main/static` stays in `web-app`; it becomes `mixed` only when it also names a distinct modern signal such as React or Next.js. Generic `page`, `route`, `template`, and `repository` terms need the surrounding Django or modern-client context before they select an owner.
 
 ## Trace the request flow
 
@@ -54,13 +56,22 @@ Run commands only in the matching checkout, record the exact revision, and repor
 ```sh
 ./quick_install.sh --preflight
 $PY -m conf.docs.check
-python -m unittest conf.docs.test_check
+$PY -m unittest conf.docs.test_check
 bash conf/ruff/changed_files.sh
 $PY manage.py test <focused.labels> --keepdb
 $PY -m tools.api_surface --check
 ```
 
-Use the repository's resolved Python environment for `$PY`. Backend integration behavior such as basket, checkout, permission, serializer, or database effects needs a routed integration test where applicable. Do not substitute a bare full suite for a focused proof.
+Resolve `PY` once from the web-app checkout. Use `PY=python` only when the active virtualenv belongs to that checkout; otherwise select the first executable at `.venv/bin/python`, `venv/bin/python`, or `venv3.*/bin/python`. Do not fall back to system Python. Verify `$PY --version` and the Django import before running the checks. Backend integration behavior such as basket, checkout, permission, serializer, or database effects needs a routed integration test where applicable. Do not substitute a bare full suite for a focused proof.
+
+For legacy AngularJS, Django template, or asset changes, use the source-documented Gulp commands and inspect the management commands before assuming a plain `collectstatic` path:
+
+```sh
+$PY manage.py gulp_test
+$PY manage.py gulp_watch
+```
+
+Status for this read-only skill snapshot: `NOT RUN: the web-app checkout and its frontend commands were not executed in this worker`.
 
 `showpass-frontend` local checks, selected from the changed package:
 
@@ -82,7 +93,7 @@ Use the least expensive command that proves the changed boundary. The build is r
 ```sh
 python3.9 --version
 ruff check .
-python3.9 -m compileall -q .
+python3.9 -m compileall -q deploy tests fabfile.py settings.py
 python3.9 -m tests
 fab --list
 git diff --check
