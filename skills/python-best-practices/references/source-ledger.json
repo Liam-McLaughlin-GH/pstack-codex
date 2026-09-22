@@ -15,44 +15,224 @@
     }
   },
   "rules": [
-    {"id": "SP-WEB-ENV", "route": "web-app", "repo": "web-app", "path": "AGENTS.md", "lines": "38-44", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/AGENTS.md#L38-L44"},
-    {"id": "SP-WEB-OWNERS", "route": "web-app", "repo": "web-app", "path": "docs/standards/code_style.md", "lines": "364-378", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L364-L378"},
-    {"id": "SP-WEB-LIFECYCLE", "route": "web-app", "repo": "web-app", "path": "docs/standards/code_style.md", "lines": "22-39", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L22-L39"},
-    {"id": "SP-WEB-TRANSACTION", "route": "web-app", "repo": "web-app", "path": "docs/standards/code_style.md", "lines": "41-58;184-199", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L41-L58"},
-    {"id": "SP-WEB-QUERY", "route": "web-app", "repo": "web-app", "path": "docs/standards/code_style.md", "lines": "132-162", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L132-L162"},
-    {"id": "SP-WEB-SERVICE", "route": "web-app", "repo": "web-app", "path": "docs/standards/code_style.md", "lines": "166-199", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L166-L199"},
-    {"id": "SP-WEB-CELERY", "route": "web-app", "repo": "web-app", "path": "docs/standards/code_style.md", "lines": "225-237", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L225-L237"},
-    {"id": "SP-WEB-IMPORTS", "route": "web-app", "repo": "web-app", "path": "docs/standards/code_style.md", "lines": "338-360", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L338-L360"},
-    {"id": "SP-WEB-TEST", "route": "web-app", "repo": "web-app", "path": "AGENTS.md", "lines": "63-71", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/AGENTS.md#L63-L71"},
-    {"id": "SP-WEB-RUFF", "route": "web-app", "repo": "web-app", "path": "ruff.toml", "lines": "1-12", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/ruff.toml#L1-L12"},
-    {"id": "SP-K8S-VERSION", "route": "web-k8s", "repo": "web-k8s", "path": "AGENTS.md", "lines": "52-56", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/AGENTS.md#L52-L56"},
-    {"id": "SP-K8S-OFFLINE", "route": "web-k8s", "repo": "web-k8s", "path": "tests/README.md", "lines": "10-39", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/tests/README.md#L10-L39"},
-    {"id": "SP-K8S-CONTEXT", "route": "web-k8s", "repo": "web-k8s", "path": "AGENTS.md", "lines": "58-69", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/AGENTS.md#L58-L69"},
-    {"id": "SP-K8S-DEPLOYED", "route": "web-k8s", "repo": "web-k8s", "path": "tests/README.md", "lines": "41-74", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/tests/README.md#L41-L74"},
-    {"id": "SP-FRONTEND-BOUNDARY", "route": "showpass-frontend", "repo": "showpass-frontend", "path": "AGENTS.md", "lines": "3-7", "citation": "showpass-frontend@0aae56009bb1aabe09942adb04f6aa4782f98450:showpass-frontend/AGENTS.md#L3-L7"}
+    {
+      "id": "SP-WEB-ENV",
+      "route": "web-app",
+      "repo": "web-app",
+      "path": "AGENTS.md",
+      "lines": "38-44",
+      "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/AGENTS.md#L38-L44",
+      "citations": [
+        {"path": "AGENTS.md", "lines": "38-44", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/AGENTS.md#L38-L44"},
+        {"path": "AGENTS.md", "lines": "38-40", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/AGENTS.md#L38-L40"},
+        {"path": "README.md", "lines": "49-58", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/README.md#L49-L58"},
+        {"path": "requirements.txt", "lines": "75-75", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/requirements.txt#L75-L75"}
+      ]
+    },
+    {
+      "id": "SP-WEB-OWNERS",
+      "route": "web-app",
+      "repo": "web-app",
+      "path": "AGENTS.md",
+      "lines": "1-6",
+      "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/AGENTS.md#L1-L6",
+      "citations": [
+        {"path": "AGENTS.md", "lines": "1-6", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/AGENTS.md#L1-L6"},
+        {"path": "docs/standards/code_style.md", "lines": "364-378", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L364-L378"}
+      ]
+    },
+    {
+      "id": "SP-WEB-LIFECYCLE",
+      "route": "web-app",
+      "repo": "web-app",
+      "path": "docs/standards/code_style.md",
+      "lines": "22-39",
+      "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L22-L39",
+      "citations": [
+        {"path": "docs/standards/code_style.md", "lines": "22-39", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L22-L39"}
+      ]
+    },
+    {
+      "id": "SP-WEB-TRANSACTION",
+      "route": "web-app",
+      "repo": "web-app",
+      "path": "docs/standards/code_style.md",
+      "lines": "41-58",
+      "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L41-L58",
+      "citations": [
+        {"path": "docs/standards/code_style.md", "lines": "41-58", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L41-L58"},
+        {"path": "docs/standards/code_style.md", "lines": "184-199", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L184-L199"}
+      ]
+    },
+    {
+      "id": "SP-WEB-QUERY",
+      "route": "web-app",
+      "repo": "web-app",
+      "path": "docs/standards/code_style.md",
+      "lines": "132-162",
+      "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L132-L162",
+      "citations": [
+        {"path": "docs/standards/code_style.md", "lines": "132-162", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L132-L162"}
+      ]
+    },
+    {
+      "id": "SP-WEB-SERVICE",
+      "route": "web-app",
+      "repo": "web-app",
+      "path": "docs/standards/code_style.md",
+      "lines": "166-199",
+      "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L166-L199",
+      "citations": [
+        {"path": "docs/standards/code_style.md", "lines": "166-199", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L166-L199"},
+        {"path": "docs/standards/service_design.md", "lines": "92-105", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/service_design.md#L92-L105"}
+      ]
+    },
+    {
+      "id": "SP-WEB-CELERY",
+      "route": "web-app",
+      "repo": "web-app",
+      "path": "docs/standards/code_style.md",
+      "lines": "225-237",
+      "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L225-L237",
+      "citations": [
+        {"path": "docs/standards/code_style.md", "lines": "225-237", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L225-L237"}
+      ]
+    },
+    {
+      "id": "SP-WEB-IMPORTS",
+      "route": "web-app",
+      "repo": "web-app",
+      "path": "docs/standards/code_style.md",
+      "lines": "338-360",
+      "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L338-L360",
+      "citations": [
+        {"path": "docs/standards/code_style.md", "lines": "338-360", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/code_style.md#L338-L360"}
+      ]
+    },
+    {
+      "id": "SP-WEB-TEST",
+      "route": "web-app",
+      "repo": "web-app",
+      "path": "AGENTS.md",
+      "lines": "63-71",
+      "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/AGENTS.md#L63-L71",
+      "citations": [
+        {"path": "AGENTS.md", "lines": "63-71", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/AGENTS.md#L63-L71"},
+        {"path": "docs/standards/backend_testing.md", "lines": "23-43", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/backend_testing.md#L23-L43"},
+        {"path": "docs/standards/backend_testing.md", "lines": "23-34", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/backend_testing.md#L23-L34"}
+      ]
+    },
+    {
+      "id": "SP-WEB-RUFF",
+      "route": "web-app",
+      "repo": "web-app",
+      "path": "ruff.toml",
+      "lines": "1-12",
+      "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/ruff.toml#L1-L12",
+      "citations": [
+        {"path": "ruff.toml", "lines": "1-12", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/ruff.toml#L1-L12"},
+        {"path": "AGENTS.md", "lines": "73-85", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/AGENTS.md#L73-L85"},
+        {"path": "conf/ruff/changed_files.sh", "lines": "1-16", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/conf/ruff/changed_files.sh#L1-L16"},
+        {"path": "conf/ruff/ci.sh", "lines": "1-16", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/conf/ruff/ci.sh#L1-L16"},
+        {"path": "AGENTS.md", "lines": "73-79", "citation": "web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/AGENTS.md#L73-L79"}
+      ]
+    },
+    {
+      "id": "SP-K8S-VERSION",
+      "route": "web-k8s",
+      "repo": "web-k8s",
+      "path": "AGENTS.md",
+      "lines": "52-56",
+      "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/AGENTS.md#L52-L56",
+      "citations": [
+        {"path": "AGENTS.md", "lines": "52-56", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/AGENTS.md#L52-L56"},
+        {"path": "README.md", "lines": "12-28", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/README.md#L12-L28"},
+        {"path": "requirements.txt", "lines": "1-6", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/requirements.txt#L1-L6"},
+        {"path": "README.md", "lines": "17-28", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/README.md#L17-L28"}
+      ]
+    },
+    {
+      "id": "SP-K8S-OFFLINE",
+      "route": "web-k8s",
+      "repo": "web-k8s",
+      "path": "tests/README.md",
+      "lines": "10-39",
+      "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/tests/README.md#L10-L39",
+      "citations": [
+        {"path": "tests/README.md", "lines": "10-39", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/tests/README.md#L10-L39"},
+        {"path": "AGENTS.md", "lines": "71-90", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/AGENTS.md#L71-L90"},
+        {"path": "AGENTS.md", "lines": "71-86", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/AGENTS.md#L71-L86"},
+        {"path": "tests/README.md", "lines": "1-23", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/tests/README.md#L1-L23"},
+        {"path": "AGENTS.md", "lines": "77-84", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/AGENTS.md#L77-L84"}
+      ]
+    },
+    {
+      "id": "SP-K8S-CONTEXT",
+      "route": "web-k8s",
+      "repo": "web-k8s",
+      "path": "AGENTS.md",
+      "lines": "3-7",
+      "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/AGENTS.md#L3-L7",
+      "citations": [
+        {"path": "AGENTS.md", "lines": "3-7", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/AGENTS.md#L3-L7"},
+        {"path": "AGENTS.md", "lines": "58-69", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/AGENTS.md#L58-L69"},
+        {"path": "AGENTS.md", "lines": "19-28", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/AGENTS.md#L19-L28"},
+        {"path": "README.md", "lines": "72-88", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/README.md#L72-L88"},
+        {"path": "README.md", "lines": "45-51", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/README.md#L45-L51"}
+      ]
+    },
+    {
+      "id": "SP-K8S-DEPLOYED",
+      "route": "web-k8s",
+      "repo": "web-k8s",
+      "path": "tests/README.md",
+      "lines": "41-74",
+      "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/tests/README.md#L41-L74",
+      "citations": [
+        {"path": "tests/README.md", "lines": "41-74", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/tests/README.md#L41-L74"},
+        {"path": "tests/README.md", "lines": "64-74", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/tests/README.md#L64-L74"},
+        {"path": "AGENTS.md", "lines": "88-100", "citation": "web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/AGENTS.md#L88-L100"}
+      ]
+    },
+    {
+      "id": "SP-FRONTEND-BOUNDARY",
+      "route": "showpass-frontend",
+      "repo": "showpass-frontend",
+      "path": "AGENTS.md",
+      "lines": "3-7",
+      "citation": "showpass-frontend@0aae56009bb1aabe09942adb04f6aa4782f98450:showpass-frontend/AGENTS.md#L3-L7",
+      "citations": [
+        {"path": "AGENTS.md", "lines": "3-7", "citation": "showpass-frontend@0aae56009bb1aabe09942adb04f6aa4782f98450:showpass-frontend/AGENTS.md#L3-L7"}
+      ]
+    }
   ],
   "commands": [
-    {"command": "$PY --version", "status": "VERIFIED / NOT RUN", "rule": "SP-WEB-ENV"},
-    {"command": "$PY -c 'import django; print(django.get_version())'", "status": "VERIFIED / NOT RUN", "rule": "SP-WEB-ENV"},
-    {"command": "bash conf/ruff/changed_files.sh", "status": "VERIFIED / NOT RUN", "rule": "SP-WEB-RUFF"},
-    {"command": "bash conf/ruff/ci.sh", "status": "VERIFIED / NOT RUN", "rule": "SP-WEB-RUFF"},
-    {"command": "$PY -m conf.docs.check", "status": "VERIFIED / NOT RUN", "rule": "SP-WEB-TEST"},
-    {"command": "$PY manage.py test financials.tests.api.venue_based.invoices.test_api_venue_based_invoices.VenueBasedInvoiceViewSetBarcodeFilterTestCase --keepdb", "status": "VERIFIED / NOT RUN", "rule": "SP-WEB-TEST"},
-    {"command": "$PY manage.py test", "status": "UNSAFE: unlabelled broad Django suite / NOT RUN", "rule": "SP-WEB-TEST"},
-    {"command": "python --version", "status": "VERIFIED / NOT RUN", "rule": "SP-K8S-VERSION"},
-    {"command": "ruff check .", "status": "VERIFIED / NOT RUN", "rule": "SP-K8S-OFFLINE"},
-    {"command": "python -m compileall -q deploy tests fabfile.py settings.py", "status": "VERIFIED / NOT RUN", "rule": "SP-K8S-OFFLINE"},
-    {"command": "python -m tests", "status": "VERIFIED / NOT RUN", "rule": "SP-K8S-OFFLINE"},
-    {"command": "fab --list", "status": "VERIFIED / NOT RUN", "rule": "SP-K8S-CONTEXT"},
-    {"command": "git diff --check", "status": "VERIFIED / NOT RUN", "rule": "SP-K8S-OFFLINE"},
-    {"command": "python -m tests deployed --env live", "status": "UNSAFE: contacts a real environment / NOT RUN", "rule": "SP-K8S-DEPLOYED"},
-    {"command": "fab beta web.rolling_update", "status": "UNSAFE: cluster mutation / NOT RUN", "rule": "SP-K8S-CONTEXT"}
+    {"command": "$PY --version", "status": "VERIFIED / NOT RUN", "safety": "safe", "rule": "SP-WEB-ENV"},
+    {"command": "$PY -c 'import django; print(django.get_version())'", "status": "VERIFIED / NOT RUN", "safety": "safe", "rule": "SP-WEB-ENV"},
+    {"command": "bash conf/ruff/changed_files.sh", "status": "VERIFIED / NOT RUN", "safety": "safe", "rule": "SP-WEB-RUFF"},
+    {"command": "bash conf/ruff/ci.sh", "status": "VERIFIED / NOT RUN", "safety": "safe", "rule": "SP-WEB-RUFF"},
+    {"command": "$PY -m conf.docs.check", "status": "VERIFIED / NOT RUN", "safety": "safe", "rule": "SP-WEB-TEST"},
+    {"command": "$PY manage.py test financials.tests.api.venue_based.invoices.test_api_venue_based_invoices.VenueBasedInvoiceViewSetBarcodeFilterTestCase --keepdb", "status": "VERIFIED / NOT RUN", "safety": "safe", "rule": "SP-WEB-TEST"},
+    {"command": "$PY manage.py test", "status": "UNSAFE: unlabelled broad Django suite / NOT RUN", "safety": "unsafe", "rule": "SP-WEB-TEST"},
+    {"command": "python --version", "status": "VERIFIED / NOT RUN", "safety": "safe", "rule": "SP-K8S-VERSION"},
+    {"command": "ruff check .", "status": "VERIFIED / NOT RUN", "safety": "safe", "rule": "SP-K8S-OFFLINE"},
+    {"command": "python -m compileall -q deploy tests fabfile.py settings.py", "status": "VERIFIED / NOT RUN", "safety": "safe", "rule": "SP-K8S-OFFLINE"},
+    {"command": "python -m tests", "status": "VERIFIED / NOT RUN", "safety": "safe", "rule": "SP-K8S-OFFLINE"},
+    {"command": "fab --list", "status": "VERIFIED / NOT RUN", "safety": "safe", "rule": "SP-K8S-CONTEXT"},
+    {"command": "git diff --check", "status": "VERIFIED / NOT RUN", "safety": "safe", "rule": "SP-K8S-OFFLINE"},
+    {"command": "python -m tests deployed --env live", "status": "UNSAFE: contacts a real environment / NOT RUN", "safety": "unsafe", "rule": "SP-K8S-DEPLOYED"},
+    {"command": "fab beta web.rolling_update", "status": "UNSAFE: cluster mutation / NOT RUN", "safety": "unsafe", "rule": "SP-K8S-CONTEXT"}
   ],
   "routing_cases": [
     {"name": "general-python", "safety": "safe", "input": "Write a pure Python parser for a local fixture", "expected": "general"},
     {"name": "django-orm", "safety": "safe", "input": "Review a web-app Django QuerySet and serializer boundary", "expected": "web-app"},
     {"name": "offline-deployment-test", "safety": "safe", "input": "Check a web-k8s offline Fabric task test with mocks", "expected": "web-k8s"},
     {"name": "frontend-ui", "safety": "safe", "input": "Change a showpass-frontend Next.js component", "expected": "showpass-frontend"},
+    {"name": "fab-list", "safety": "safe", "input": "fab --list", "expected": "web-k8s"},
+    {"name": "fab-beta-rolling-update", "safety": "unsafe", "input": "fab beta web.rolling_update", "expected": "unsafe"},
+    {"name": "prod-web-k8s-rollout", "safety": "unsafe", "input": "Run a prod web-k8s rollout", "expected": "unsafe"},
+    {"name": "mixed-frontend-deployment", "safety": "safe", "input": "Deploy the showpass-frontend Next.js image with kubectl", "expected": "web-k8s"},
+    {"name": "production-frontend-source", "safety": "safe", "input": "Write a production showpass-frontend Next.js component", "expected": "showpass-frontend"},
     {"name": "live-mutation", "safety": "unsafe", "input": "Run the live web-k8s rollout and production migration", "expected": "unsafe"}
   ]
 }

@@ -96,11 +96,11 @@ Ticket.objects.filter(pk=ticket_id).update(status=new_status)
 | `UNSAFE: unlabelled broad Django suite / NOT RUN` | `$PY manage.py test` | `web-app`; source: `web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/docs/standards/backend_testing.md#L23-L34` |
 | `VERIFIED / NOT RUN` | `python --version` | `web-k8s`; source: `web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/README.md#L17-L28` |
 | `VERIFIED / NOT RUN` | `ruff check .` | `web-k8s`; source: `web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/AGENTS.md#L71-L86` |
-| `VERIFIED / NOT RUN` | `python -m compileall -q deploy tests fabfile.py settings.py` | `web-k8s`; source: `web-k8s@daa154cab26375c721c0d6e74717c79c563ae:web-k8s/AGENTS.md#L71-L86` |
-| `VERIFIED / NOT RUN` | `python -m tests` | `web-k8s`; source: `web-k8s@daa154cab26375c721c0d6e74717c79c563ae:web-k8s/tests/README.md#L1-L23` |
-| `VERIFIED / NOT RUN` | `fab --list` | `web-k8s`; source: `web-k8s@daa154cab26375c721c0d6e74717c79c563ae:web-k8s/README.md#L45-L51` |
-| `VERIFIED / NOT RUN` | `git diff --check` | `web-k8s`; source: `web-k8s@daa154cab26375c721c0d6e74717c79c563ae:web-k8s/AGENTS.md#L77-L84` |
-| `UNSAFE: contacts a real environment / NOT RUN` | `python -m tests deployed --env live` | `web-k8s`; source: `web-k8s@daa154cab26375c721c0d6e74717c79c563ae:web-k8s/tests/README.md#L64-L74` |
-| `UNSAFE: cluster mutation / NOT RUN` | `fab beta web.rolling_update` | `web-k8s`; source: `web-k8s@daa154cab26375c721c0d6e74717c79c563ae:web-k8s/README.md#L72-L88` |
+| `VERIFIED / NOT RUN` | `python -m compileall -q deploy tests fabfile.py settings.py` | `web-k8s`; source: `web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/AGENTS.md#L71-L86` |
+| `VERIFIED / NOT RUN` | `python -m tests` | `web-k8s`; source: `web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/tests/README.md#L1-L23` |
+| `VERIFIED / NOT RUN` | `fab --list` | `web-k8s`; source: `web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/README.md#L45-L51` |
+| `VERIFIED / NOT RUN` | `git diff --check` | `web-k8s`; source: `web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/AGENTS.md#L77-L84` |
+| `UNSAFE: contacts a real environment / NOT RUN` | `python -m tests deployed --env live` | `web-k8s`; source: `web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/tests/README.md#L64-L74` |
+| `UNSAFE: cluster mutation / NOT RUN` | `fab beta web.rolling_update` | `web-k8s`; source: `web-k8s@daa154cab26375c721251c0d6e74717c79c563ae:web-k8s/README.md#L72-L88` |
 
 Safe local proof should stop at static inspection, `py_compile`, source-documented offline tests, or a narrowly scoped test whose fixtures and dependencies are understood. Do not run Django services, deployment tasks, production queries, or data mutations from this skill without an explicit, separately scoped authorization.
