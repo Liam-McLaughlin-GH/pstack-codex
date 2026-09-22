@@ -42,9 +42,11 @@ same bounded criteria:
 4. source evidence;
 5. routing.
 
-Each criterion is scored from 0 to 2 or kept unknown. Record every score and
-the comparison rationale. Select a candidate only when the bounded result has
-a unique highest score. Record every rejected alternative and its reason. A
+Each criterion is scored from 0 to 2 or kept unknown. Render every candidate's
+score, including unknown values, for both the selected candidate and rejected
+alternatives in Comparisons and the durable decision trail. Record the comparison
+rationale beside those scores. Select a candidate only when the bounded result
+has a unique highest score. Record every rejected alternative and its reason. A
 tie is inconclusive and cannot produce an Accepted row.
 
 Reflect performs this comparison locally. If a parent chooses to delegate it
@@ -77,8 +79,8 @@ reference. A structural duplicate stays here even when a later judgment packet
 also contributes to the same candidate.
 
 The durable decision trail records the run id, lane and synthesizer status,
-comparison owner and route, shared criteria, candidate scores, selected
-decisions, rejected alternatives with reasons, source references, and unresolved
-unknowns. The full result is a proposal. The parent must show all three
-sections and the trail to the user, then wait for explicit approval before
-applying any persistent skill edit.
+comparison owner and route, shared criteria, every candidate score (including
+unknowns), selected decisions, rejected alternatives with scores and reasons,
+source references, and unresolved unknowns. The full result is a proposal. The
+parent must show all three sections and the trail to the user, then wait for
+explicit approval before applying any persistent skill edit.

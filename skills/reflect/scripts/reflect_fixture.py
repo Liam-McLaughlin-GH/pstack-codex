@@ -132,6 +132,7 @@ class Delegation:
     synthesizer_agent_id: str
     synthesizer_model: str
     synthesizer_reason: str
+    reviewer_independence_reason: str = ""
 
 
 def clean_text(value: str, *, limit: int = MAX_TEXT_LENGTH) -> str:
@@ -595,16 +596,39 @@ def normalize_capabilities(raw: Any) -> dict[str, bool]:
 
 
 def reviewer_independence(lanes: Iterable[ReviewerLane]) -> str:
-    usable = [lane for lane in lanes if lane.status == "complete"]
-    packet_paths = [lane.packet_path for lane in usable]
-    if len(packet_paths) != len({path for path in packet_paths if path is not None}):
-        return "failed"
+    return reviewer_independence_details(lanes)[0]
+
+
+def reviewer_independence_details(lanes: Iterable[ReviewerLane]) -> tuple[str, str]:
+    """Return the independence state and a durable reason for that state."""
+
+    lane_list = list(lanes)
+    usable = [lane for lane in lane_list if lane.status == "complete"]
+    packet_paths = [lane.packet_path for lane in usable if lane.packet_path is not None]
+    if len(packet_paths) != len(set(packet_paths)):
+        return "failed", "complete reviewer lanes do not have distinct packet identities"
+    if len(packet_paths) != len(usable):
+        return "inconclusive", "reviewer independence is inconclusive because a complete lane has no packet identity"
+
     identities = [lane.agent_id for lane in usable if lane.agent_id != "unreported"]
     if len(identities) != len(set(identities)):
-        return "failed"
-    if len(usable) != len(LENSES) or len(identities) != len(LENSES):
-        return "inconclusive"
-    return "verified"
+        return "failed", "complete reviewer lanes do not have distinct agent identities"
+    incomplete = [lane.lens for lane in lane_list if lane.status != "complete"]
+    if len(usable) != len(LENSES):
+        missing = ", ".join(incomplete) or "one or more required lanes"
+        return "inconclusive", f"reviewer independence is inconclusive because reviewer lanes are not complete: {missing}"
+    missing_identity = [
+        lane.lens
+        for lane in usable
+        if lane.agent_id == "unreported" or lane.model == "unreported"
+    ]
+    if missing_identity:
+        return (
+            "inconclusive",
+            "reviewer independence is inconclusive because agent/model identity is unreported for: "
+            + ", ".join(missing_identity),
+        )
+    return "verified", ""
 
 
 def ensure_unique_finding_ids(lanes: Iterable[ReviewerLane]) -> None:
@@ -636,6 +660,14 @@ def synth_identity(raw: Any, field: str) -> tuple[str, str, str, str]:
             f"{field}.reason",
             limit=MAX_TEXT_LENGTH,
         )
+    elif agent_id == "unreported":
+        reason = validate_metadata(
+            raw.get("reason") or "complete synthesizer lane has no independently identifiable agent",
+            f"{field}.reason",
+            limit=MAX_TEXT_LENGTH,
+        )
+    elif raw.get("reason"):
+        reason = validate_metadata(raw["reason"], f"{field}.reason", limit=MAX_TEXT_LENGTH)
     return status, agent_id, model, reason
 
 
@@ -700,13 +732,27 @@ def load_delegation_manifest(workspace: Path, raw_path: str) -> Delegation:
     synth_status, synth_agent, synth_model, synth_reason = synth_identity(payload.get("synthesizer"), f"{path}#synthesizer")
     if not capabilities["synthesizer"]:
         synth_status = "unavailable"
-        synth_reason = "Codex synthesizer capability was unavailable"
+        synth_reason = "; ".join(
+            reason
+            for reason in (synth_reason, "Codex synthesizer capability was unavailable")
+            if reason
+        )
+    elif synth_status == "complete" and synth_agent in {
+        lane.agent_id for lane in lanes if lane.agent_id != "unreported"
+    }:
+        synth_reason = "; ".join(
+            reason
+            for reason in (synth_reason, "synthesizer agent identity overlaps a reviewer identity")
+            if reason
+        )
     execution_mode = "parallel" if capabilities["reviewer_delegation"] and capabilities["parallel"] else "sequential-fallback"
+    independence, independence_reason = reviewer_independence_details(lanes)
     return Delegation(
         run_id=run_id,
         capabilities=capabilities,
         execution_mode=execution_mode,
-        reviewer_independence=reviewer_independence(lanes),
+        reviewer_independence=independence,
+        reviewer_independence_reason=independence_reason,
         lanes=tuple(sorted(lanes, key=lambda lane: LENSES.index(lane.lens))),
         synthesizer_status=synth_status,
         synthesizer_agent_id=synth_agent,
@@ -738,11 +784,13 @@ def load_delegation(workspace: Path, raw_paths: list[str], manifest_path: str | 
         lanes.sort(key=lambda lane: LENSES.index(lane.lens))
         ensure_unique_finding_ids(lanes)
         status = "complete" if all(lane.status == "complete" for lane in lanes) else "inconclusive"
+        independence, independence_reason = reviewer_independence_details(lanes)
         return Delegation(
             run_id="direct-fixture",
             capabilities={"reviewer_delegation": False, "parallel": False, "synthesizer": True},
             execution_mode="sequential-fallback",
-            reviewer_independence=reviewer_independence(lanes),
+            reviewer_independence=independence,
+            reviewer_independence_reason=independence_reason,
             lanes=tuple(lanes),
             synthesizer_status=status,
             synthesizer_agent_id="local-fixture-synthesizer",
@@ -767,6 +815,7 @@ def load_delegation(workspace: Path, raw_paths: list[str], manifest_path: str | 
         capabilities={"reviewer_delegation": False, "parallel": False, "synthesizer": False},
         execution_mode="sequential-fallback",
         reviewer_independence="inconclusive",
+        reviewer_independence_reason="reviewer independence could not be verified because no reviewer lanes were supplied",
         lanes=lanes,
         synthesizer_status="unavailable",
         synthesizer_agent_id="unreported",
@@ -954,6 +1003,7 @@ def compare_candidates(problem: str, candidates: list[dict[str, Any]]) -> tuple[
                 "id": candidate["id"],
                 "reason": "comparison inconclusive",
                 "detail": "shared criteria produced a tied bounded score; no candidate was selected",
+                "scores": scores[candidate["id"]],
             }
             for candidate in candidates
         ]
@@ -977,6 +1027,9 @@ def compare_candidates(problem: str, candidates: list[dict[str, Any]]) -> tuple[
             "id": candidate["id"],
             "reason": "rejected alternative",
             "detail": f"bounded score {candidate['rank']} is below selected candidate {selected['id']} at {selected['rank']}",
+            "scores": scores[candidate["id"]],
+            "selected_id": selected["id"],
+            "selected_scores": scores[selected["id"]],
         }
         for candidate in candidates
         if candidate is not selected
@@ -994,6 +1047,73 @@ def compare_candidates(problem: str, candidates: list[dict[str, Any]]) -> tuple[
         },
         rejected,
     )
+
+
+def public_score(score: dict[str, Any]) -> dict[str, Any]:
+    rendered: dict[str, Any] = {
+        name: "unknown" if score.get(name) is None else score.get(name)
+        for name in SHARED_CRITERIA
+    }
+    rank = score.get("rank")
+    if isinstance(rank, tuple):
+        rendered["rank"] = list(rank)
+    elif rank is not None:
+        rendered["rank"] = rank
+    return rendered
+
+
+def render_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+
+
+def render_scores(scores: dict[str, dict[str, Any]]) -> str:
+    return render_json({candidate_id: public_score(score) for candidate_id, score in scores.items()})
+
+
+def render_rejected_alternatives(alternatives: list[dict[str, Any]]) -> str:
+    rendered: list[dict[str, Any]] = []
+    for alternative in alternatives:
+        item = {
+            "id": alternative["id"],
+            "reason": alternative["reason"],
+            "detail": alternative["detail"],
+        }
+        if "scores" in alternative:
+            item["scores"] = public_score(alternative["scores"])
+        if "selected_id" in alternative:
+            item["selected_id"] = alternative["selected_id"]
+        if "selected_scores" in alternative:
+            item["selected_scores"] = public_score(alternative["selected_scores"])
+        rendered.append(item)
+    return render_json(rendered)
+
+
+def synthesis_block_reasons(delegation: Delegation) -> list[str]:
+    reasons: list[str] = []
+    if delegation.reviewer_independence != "verified":
+        reasons.append(
+            delegation.reviewer_independence_reason
+            or f"reviewer independence is {delegation.reviewer_independence}"
+        )
+    if delegation.synthesizer_status != "complete":
+        reasons.append(
+            delegation.synthesizer_reason
+            or f"synthesizer lane is {delegation.synthesizer_status}"
+        )
+    elif delegation.synthesizer_agent_id == "unreported":
+        reasons.append(
+            delegation.synthesizer_reason
+            or "complete synthesizer lane has no independently identifiable agent"
+        )
+    else:
+        reviewer_ids = {
+            lane.agent_id
+            for lane in delegation.lanes
+            if lane.status == "complete" and lane.agent_id != "unreported"
+        }
+        if delegation.synthesizer_agent_id in reviewer_ids:
+            reasons.append("synthesizer agent identity must be separate from reviewer identities")
+    return unique(reasons)
 
 
 def synthesize(
@@ -1014,6 +1134,7 @@ def synthesize(
             capabilities={"reviewer_delegation": False, "parallel": False, "synthesizer": True},
             execution_mode="sequential-fallback",
             reviewer_independence="inconclusive",
+            reviewer_independence_reason="reviewer independence is inconclusive because direct synthesis has no packet or agent identities",
             lanes=lanes,
             synthesizer_status="complete",
             synthesizer_agent_id="unreported",
@@ -1022,13 +1143,15 @@ def synthesize(
         )
 
     all_complete = all(lane.status == "complete" for lane in delegation.lanes)
-    synthesis_status = delegation.synthesizer_status if all_complete else "inconclusive"
+    block_reasons = synthesis_block_reasons(delegation)
+    synthesis_status = "complete" if all_complete and delegation.synthesizer_status == "complete" else "inconclusive"
     base_trail: dict[str, Any] = {
         "trail_id": f"reflect:{delegation.run_id}",
         "status": synthesis_status,
         "comparison_owner": comparison_owner,
         "comparison_route": "skills/arena/SKILL.md" if comparison_owner == "arena" else "local reflect synthesizer",
         "criteria": list(SHARED_CRITERIA),
+        "candidate_scores": [],
         "selected_decisions": [],
         "rejected_alternatives": [],
         "source_references": [
@@ -1043,16 +1166,12 @@ def synthesize(
         "comparisons": [],
         "decision_trail": base_trail,
     }
-    if synthesis_status != "complete" or delegation.reviewer_independence == "failed":
-        if delegation.reviewer_independence == "failed" and synthesis_status == "complete":
-            synthesis_status = "inconclusive"
-            empty["status"] = synthesis_status
-            base_trail["status"] = synthesis_status
+    if synthesis_status != "complete" or block_reasons:
+        synthesis_status = "inconclusive"
+        empty["status"] = synthesis_status
+        base_trail["status"] = synthesis_status
         base_trail["selected_decision"] = "none (inconclusive)"
-        base_trail["reason"] = (
-            delegation.synthesizer_reason
-            or "all reviewer lenses were not complete and independently identified"
-        )
+        base_trail["reason"] = "; ".join(block_reasons) or "all reviewer lanes were not complete and independently identified"
         return empty
 
     if comparison_owner == "arena":
@@ -1117,6 +1236,15 @@ def synthesize(
         comparison, alternatives = compare_candidates(problem, candidates)
         comparisons.append(comparison)
         rejected.extend(alternatives)
+        base_trail["candidate_scores"].append(
+            {
+                "problem": problem,
+                "scores": comparison["scores"],
+                "selected_id": comparison["selected_id"],
+                "status": comparison["status"],
+                "rationale": comparison["rationale"],
+            }
+        )
         selected_id = comparison["selected_id"]
         if selected_id is None:
             continue
@@ -1136,6 +1264,8 @@ def synthesize(
                 "candidate_id": selected["id"],
                 "outcome": outcome,
                 "finding_ids": selected["finding_ids"],
+                "scores": comparison["scores"],
+                "rationale": comparison["rationale"],
             }
         )
     base_trail["rejected_alternatives"] = rejected
@@ -1224,7 +1354,11 @@ def render_result(
     lines.append(f"- contract={quoted(DELEGATION_SCHEMA)}; run_id={quoted(delegation.run_id)}.")
     capability_text = ", ".join(f"{name}={str(value).lower()}" for name, value in delegation.capabilities.items())
     lines.append(f"- capability_detection: {capability_text}; execution_mode={quoted(delegation.execution_mode)}.")
-    lines.append(f"- reviewer_independence={quoted(delegation.reviewer_independence)}; fallback_order={quoted(', '.join(LENSES))}.")
+    independence_reason = f"; reason={quoted(delegation.reviewer_independence_reason)}" if delegation.reviewer_independence_reason else ""
+    lines.append(
+        f"- reviewer_independence={quoted(delegation.reviewer_independence)};"
+        f" fallback_order={quoted(', '.join(LENSES))}{independence_reason}."
+    )
     for lane in delegation.lanes:
         packet = "<none>" if lane.packet_path is None else lane.packet_path.relative_to(workspace).as_posix()
         reason = f"; reason={quoted(lane.reason)}" if lane.reason else ""
@@ -1271,7 +1405,9 @@ def render_result(
             lines.append(
                 f"- problem={quoted(comparison['problem'])}; candidates={quoted(', '.join(comparison['candidate_ids']))}; "
                 f"selected_decision={quoted(selected)}; status={quoted(comparison['status'])}; "
-                f"criteria={quoted(', '.join(comparison['criteria']))}; rationale={quoted(comparison['rationale'])}."
+                f"criteria={quoted(', '.join(comparison['criteria']))}; scores={render_scores(comparison['scores'])}; "
+                f"rejected_alternatives={render_rejected_alternatives(comparison['rejected_alternatives'])}; "
+                f"rationale={quoted(comparison['rationale'])}."
             )
     else:
         lines.append("- None. Comparison is unavailable until all required lanes are usable.")
@@ -1282,18 +1418,25 @@ def render_result(
     lines.append(f"- source_references={quoted(', '.join(trail.get('source_references', [])) or 'none')}.")
     lines.append(f"- unresolved_unknowns={quoted('; '.join(inspection['unknowns']) or 'none')}.")
     lines.append(f"- selected_decision={quoted(trail.get('selected_decision', 'none (inconclusive)'))}.")
+    lines.append(f"- candidate_scores={render_json([{**item, 'scores': {candidate_id: public_score(score) for candidate_id, score in item['scores'].items()}} for item in trail.get('candidate_scores', [])])}.")
     if trail["selected_decisions"]:
         for selected in trail["selected_decisions"]:
             lines.append(
                 f"- selected candidate={quoted(selected['candidate_id'])}; problem={quoted(selected['problem'])}; "
-                f"outcome={quoted(selected['outcome'])}; finding_ids={quoted(', '.join(selected['finding_ids']))}."
+                f"outcome={quoted(selected['outcome'])}; finding_ids={quoted(', '.join(selected['finding_ids']))}; "
+                f"scores={render_scores(selected['scores'])}; rationale={quoted(selected['rationale'])}."
             )
     else:
         lines.append("- selected candidates: none; the unresolved choice remains inconclusive.")
     if trail["rejected_alternatives"]:
         lines.append("- rejected alternatives:")
         for item in trail["rejected_alternatives"]:
-            lines.append(f"- rejected alternative={item['id']}; reason={quoted(item['reason'])}; detail={quoted(item['detail'])}.")
+            scores = f"; scores={render_json(public_score(item['scores']))}" if "scores" in item else ""
+            selected_scores = f"; selected_scores={render_json(public_score(item['selected_scores']))}" if "selected_scores" in item else ""
+            lines.append(
+                f"- rejected alternative={item['id']}; reason={quoted(item['reason'])}; detail={quoted(item['detail'])}"
+                f"{scores}{selected_scores}."
+            )
     else:
         lines.append("- rejected alternatives: none.")
     if trail.get("reason"):

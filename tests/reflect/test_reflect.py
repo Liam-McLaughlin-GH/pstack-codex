@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -458,6 +459,72 @@ class ReflectBehaviorTests(unittest.TestCase):
             self.assertIn('[judgment] status="complete"; agent_id="codex-reviewer-judgment"; model="gpt-5.6-judgment"; packet="judgment.json"', ordered.stdout)
             self.assertIn('[tooling] status="complete"; agent_id="codex-reviewer-tooling"; model="gpt-5.6-tooling"; packet="tooling.json"', ordered.stdout)
 
+    def test_inconclusive_reviewer_or_synthesizer_identity_cannot_accept(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "fixture-workspace"
+            workspace.mkdir()
+            transcript = self.write_jsonl(
+                workspace,
+                "decision.jsonl",
+                [
+                    {
+                        "id": "decision-1",
+                        "timestamp": "2026-01-15T10:00:00Z",
+                        "workspace": workspace.name,
+                        "topic": "payments",
+                        "state": "in_progress",
+                        "claim": "Still working.",
+                    }
+                ],
+            )
+            reviewer_packets = self.write_reviewers(workspace)
+            for packet_path in reviewer_packets:
+                packet = json.loads(packet_path.read_text(encoding="utf-8"))
+                packet.pop("agent_id")
+                packet.pop("model")
+                packet_path.write_text(json.dumps(packet), encoding="utf-8")
+
+            missing_reviewers = run_helper(
+                workspace,
+                *self.command_args(workspace, transcript, reviewer_packets),
+            )
+            self.assertEqual(missing_reviewers.returncode, 0, missing_reviewers.stderr)
+            self.assertIn('reviewer_independence="inconclusive"', missing_reviewers.stdout)
+            self.assertIn('agent_id="unreported"; model="unreported"', missing_reviewers.stdout)
+            self.assertIn("identity is unreported", missing_reviewers.stdout)
+            accepted = missing_reviewers.stdout.split("## Accepted", 1)[1].split("## Rejected", 1)[0]
+            self.assertEqual(accepted.strip(), "- None.")
+
+            reviewer_packets = self.write_reviewers(workspace)
+            manifest = self.write_manifest(workspace, reviewer_packets)
+            manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+            manifest_payload["synthesizer"].pop("agent_id")
+            manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
+            missing_synthesizer = run_helper(
+                workspace,
+                *self.command_args(workspace, transcript, []),
+                "--delegation-manifest",
+                str(manifest),
+            )
+            self.assertEqual(missing_synthesizer.returncode, 0, missing_synthesizer.stderr)
+            self.assertIn('[synthesizer] status="complete"; agent_id="unreported"', missing_synthesizer.stdout)
+            self.assertIn("no independently identifiable agent", missing_synthesizer.stdout)
+            accepted = missing_synthesizer.stdout.split("## Accepted", 1)[1].split("## Rejected", 1)[0]
+            self.assertEqual(accepted.strip(), "- None.")
+
+            manifest_payload["synthesizer"]["agent_id"] = "manifest-judgment"
+            manifest.write_text(json.dumps(manifest_payload), encoding="utf-8")
+            overlapping_synthesizer = run_helper(
+                workspace,
+                *self.command_args(workspace, transcript, []),
+                "--delegation-manifest",
+                str(manifest),
+            )
+            self.assertEqual(overlapping_synthesizer.returncode, 0, overlapping_synthesizer.stderr)
+            self.assertIn("synthesizer agent identity overlaps a reviewer identity", overlapping_synthesizer.stdout)
+            accepted = overlapping_synthesizer.stdout.split("## Accepted", 1)[1].split("## Rejected", 1)[0]
+            self.assertEqual(accepted.strip(), "- None.")
+
     def test_unavailable_lanes_are_explicit_and_not_empty_success(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory) / "fixture-workspace"
@@ -575,7 +642,9 @@ class ReflectBehaviorTests(unittest.TestCase):
                 score: int,
                 *,
                 problem: str = "Choose one bounded implementation.",
+                unknown: set[str] | None = None,
             ) -> dict[str, object]:
+                unknown = unknown or set()
                 return {
                     "id": finding_id,
                     "problem": problem,
@@ -583,14 +652,17 @@ class ReflectBehaviorTests(unittest.TestCase):
                     "routing": "skills/why/SKILL.md",
                     "evidence": ["decision-1"],
                     "enforcement": "judgment",
-                    "criteria": {name: score for name in ("durability", "specificity", "decision_changing", "evidence", "routing")},
+                    "criteria": {
+                        name: "unknown" if name in unknown else score
+                        for name in ("durability", "specificity", "decision_changing", "evidence", "routing")
+                    },
                 }
 
             judgment = self.write_packet(
                 workspace,
                 "judgment",
                 [
-                    finding("a-1", "Use candidate A.", 2),
+                    finding("a-1", "Use candidate A.", 2, unknown={"specificity"}),
                     finding("j-2", "Keep the source reference.", 2, problem="Preserve the evidence link."),
                     finding("j-3", "Keep the unknown state.", 2, problem="Preserve uncertainty."),
                 ],
@@ -601,7 +673,7 @@ class ReflectBehaviorTests(unittest.TestCase):
                 workspace,
                 "tooling",
                 [
-                    finding("b-1", "Use candidate B.", 1),
+                    finding("b-1", "Use candidate B.", 1, unknown={"specificity"}),
                     finding("t-2", "Record the command.", 2, problem="Record verification."),
                     finding("t-3", "Keep the bounded input.", 2, problem="Bound the input."),
                 ],
@@ -612,7 +684,7 @@ class ReflectBehaviorTests(unittest.TestCase):
                 workspace,
                 "divergent",
                 [
-                    finding("a-2", "Use candidate A.", 2),
+                    finding("a-2", "Use candidate A.", 2, unknown={"specificity"}),
                     finding("d-2", "Keep alternatives.", 2, problem="Preserve alternatives."),
                     finding("d-3", "Record unavailable lanes.", 2, problem="Record unavailable work."),
                 ],
@@ -628,6 +700,11 @@ class ReflectBehaviorTests(unittest.TestCase):
             self.assertIn('[b-1] reason="rejected alternative"', result.stdout)
             self.assertIn("candidate A", result.stdout)
             self.assertIn("rejected alternatives", result.stdout)
+            self.assertIn('scores={"a-1":{"durability":2,"specificity":"unknown"', result.stdout)
+            self.assertIn('"b-1":{"durability":1,"specificity":"unknown"', result.stdout)
+            self.assertIn('rejected_alternatives=[{"id":"b-1"', result.stdout)
+            self.assertIn("candidate_scores=", result.stdout)
+            self.assertIn("selected_scores=", result.stdout)
 
             arena = run_helper(
                 workspace,
@@ -806,6 +883,20 @@ class ReflectStructureTests(unittest.TestCase):
             "synthesizer.md",
         ):
             self.assertTrue((SKILL.parent / "references" / reference).is_file())
+        links = re.findall(r"\[[^\]]+\]\(([^)]+)\)", text)
+        expected_links = {f"references/{reference}" for reference in (
+            "reviewer-contract.md",
+            "judgment-reviewer.md",
+            "tooling-reviewer.md",
+            "divergent-reviewer.md",
+            "synthesizer.md",
+        )}
+        self.assertTrue(expected_links.issubset(set(links)))
+        for link in links:
+            if link.startswith(("http://", "https://", "#")):
+                continue
+            target = (SKILL.parent / link.split("#", 1)[0]).resolve()
+            self.assertTrue(target.is_file(), f"unresolved SKILL.md link: {link}")
         metadata = (SKILL.parent / "agents" / "openai.yaml").read_text(encoding="utf-8")
         self.assertIn("allow_implicit_invocation: false", metadata)
 
