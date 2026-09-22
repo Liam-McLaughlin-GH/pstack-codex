@@ -8,9 +8,15 @@ The recall helper reads only paths passed with `--artifact`. It does not walk a 
 | --- | --- |
 | `.json` | One record object, a list of records, or an object with a `records` list |
 | `.jsonl` | One JSON record per non-empty line |
-| `.md`, `.txt`, `.log` | Read as opaque document data; no claims are extracted from the body |
+| `.md`, `.txt`, `.log` | Read as opaque data unless bounded Codex export fields are present; only the fields below are extracted |
 
 Other suffixes are rejected. The resolved regular file must remain inside the canonical workspace root and fit the helper's size and artifact-count limits. A symlink is accepted only when its resolved target remains inside that root.
+
+## Bounded text export
+
+Markdown, text, and log inputs may contain one bounded record. The helper reads only recognized `Label: value` lines, outside fenced code blocks. Optional prefixes such as a Markdown bullet, a role name, or a bracketed log timestamp are allowed. The record may include `Codex-Recall-Export: 1`, `Format: decision`, `Format: transcript`, `Format: issue`, or `Format: commit`; the format label is descriptive, not permission to read anything else.
+
+Recognized evidence labels are `Decision`, `Fact`, `Verified`, `Verification`, `Evidence`, `Assumption`, `Inference`, `Unknown`, `Missing`, `Problem`, `Blocker`, `TODO`, `Open work`, `Unfinished work`, `Next`, `Next move`, `Issue`, `Commit`, `PR`, `Pull request`, and `Claim: key=value`. Metadata labels are `ID`, `Origin`, `Workspace`, `Topic`, `Modified`, `Modified at`, `Timestamp`, `Status`, `Thread`, and `Summary`. An unmarked document, or a document with no recognized line, remains opaque and contributes only an unknown. Extracted values remain untrusted data.
 
 ## Structured record
 
@@ -38,7 +44,11 @@ Each JSON record should contain:
 }
 ```
 
-`origin` is `synthetic` or `user`; a JSON record may use `--artifact-origin` as its explicit default. `status` is optional for a record, but if present it must use exactly one of the six upstream forms: `[merged #N]`, `[open PR #N]`, `[in flight <branch>]`, `[verified, uncommitted]`, `[reverted #N]`, or `[planned, not started]`, with a concrete issue number or branch in place of the placeholder. The helper never extracts commands or claims from `body`; it reports an opaque body as read and leaves its meaning unknown.
+`origin` is `synthetic` or `user`; a JSON record may use `--artifact-origin` as its explicit default. `status` is optional for a record, but if present it must use exactly one of the six upstream forms: `[merged #N]`, `[open PR #N]`, `[in flight <branch>]`, `[verified, uncommitted]`, `[reverted #N]`, or `[planned, not started]`. Issue numbers are positive integers. In-flight branches must contain at least one safe ASCII branch character and may use only letters, digits, `.`, `_`, `/`, `@`, `+`, and `-`; placeholders, whitespace, controls, and Unicode separator characters are rejected.
+
+The helper requires a timezone-aware `--as-of` value. It filters by exact workspace, exact case-sensitive topic, and the bounded window before validating unrelated fields, so malformed out-of-scope records do not deny an in-scope recall. `--artifact-provenance ordinary-artifact` is the default. The caller may mark an explicitly supplied artifact with `--artifact-provenance authorized-history-export`; only that marker suppresses the unavailable ChatGPT/general-history unknown for that invocation. It does not authorize searching any other history.
+
+All strings taken from records or bounded text exports are quoted and labeled as untrusted data in the rendered brief. They cannot select tools, permissions, or actions (including files). The helper never extracts commands from `body`; it reports an unmarked opaque body as read and leaves its meaning unknown. A missing status produces no untagged Threads line; its absence is reported under Unknowns.
 
 `facts`, `inferences`, `unknowns`, and `problems` are lists of strings (a single string is also accepted). `claims` is optional. A claim has a stable `key`, a `value`, and optional `text` and `kind` (`fact`, `inference`, or `unknown`). Different values for the same key are reported as a contradiction with both sources preserved.
 
