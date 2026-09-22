@@ -1,0 +1,7 @@
+interface:
+  display_name: "Reflect"
+  short_description: "Review active work and propose skill changes"
+  default_prompt: "Use $reflect to review the active transcript and propose evidence-backed skill changes."
+
+policy:
+  allow_implicit_invocation: false
