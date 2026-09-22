@@ -71,7 +71,8 @@ Use `start-phase` only for the current pending phase. A phase is complete only
 when both of these exist:
 
 1. The actual output is recorded.
-2. Its declared verification check returns `passed: true` with evidence.
+2. Its declared verification check returns `passed: true` with inspectable
+   evidence.
 
 After a phase passes, the helper selects the next phase but does not start it.
 That boundary is deliberate. Inspect the output and run before advancing.
@@ -124,10 +125,11 @@ rather than repeating a warning in every phase.
 
 ## Finish and hand back
 
-Call `predicate` for every named terminal check with its evidence. Call
-`finish` only after every phase is passed and every predicate check is passed.
-The helper returns a completed state only when the terminal predicate is true.
-An inconclusive, missing, or failed check keeps the run open or blocked.
+Call `predicate` for every named terminal check with its evidence and explicit
+`status`. Call `finish` only after every phase is passed and every predicate
+check has `status: verified` and `passed: true`. The helper returns a
+completed state only when the terminal predicate is true. A missing, failed,
+blocked, `not_run`, or `inconclusive` check keeps the run non-complete.
 
 Hand back the state path, decision-trail path, exact changed files, phase
 outputs, verification commands and results, unresolved gaps, and the next

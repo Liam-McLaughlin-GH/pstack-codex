@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import tempfile
+import unicodedata
 import uuid
 from copy import deepcopy
 from datetime import datetime, timezone
@@ -25,8 +26,34 @@ DEFAULT_LIMITS = {
     "max_replans": 3,
     "max_decisions": 128,
 }
-VALID_RESULTS = {"open", "verified", "failed", "reverted", "blocked"}
+VALID_RESULTS = {"open", "verified", "failed", "reverted", "blocked", "not_run", "inconclusive"}
+CHECK_STATUSES = {"verified", "failed", "blocked", "not_run", "inconclusive"}
+STRUCTURED_EVIDENCE_KINDS = {"artifact", "blocker", "command", "path", "reference", "test"}
+EVIDENCE_PLACEHOLDERS = {
+    "agent report",
+    "agent-report",
+    "agent_report",
+    "agent summary",
+    "agent-summary",
+    "agent_summary",
+    "checked",
+    "done",
+    "inconclusive",
+    "looks good",
+    "not run",
+    "not_run",
+    "passed",
+    "self report",
+    "self-report",
+    "self_report",
+    "success",
+    "verified",
+}
 SAFE_ACTION = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
+BOUNDED_REFERENCE = re.compile(
+    r"^[A-Za-z0-9_.-]+(?:(?:::|/|:)[A-Za-z0-9_.@#=+%~-]+)*$"
+)
 
 
 class WorkflowError(Exception):
@@ -64,11 +91,11 @@ def _now() -> str:
 def _text(value: Any, field: str, *, max_length: int = MAX_TEXT) -> str:
     if not isinstance(value, str) or not value.strip():
         raise PlanError(f"{field} must be a non-empty string")
+    if any(unicodedata.category(char) in {"Cc", "Cf"} for char in value):
+        raise PlanError(f"{field} contains a control or format character")
     value = value.strip()
     if len(value) > max_length:
         raise PlanError(f"{field} exceeds {max_length} characters")
-    if any(char in value for char in "\x00\r\n"):
-        raise PlanError(f"{field} contains a control character")
     return value
 
 
@@ -81,10 +108,69 @@ def _string_list(value: Any, field: str, *, allow_empty: bool = False) -> list[s
     return result
 
 
-def _evidence(value: Any, field: str = "evidence") -> list[str]:
-    if isinstance(value, str):
+def _is_bounded_reference(value: str) -> bool:
+    if value.startswith(("/", "~", "\\")) or re.match(r"^[A-Za-z]:", value):
+        return False
+    if "\\" in value:
+        return False
+    if ".." in PurePosixPath(value).parts or any(char.isspace() for char in value):
+        return False
+    return bool(BOUNDED_REFERENCE.fullmatch(value))
+
+
+def _structured_evidence(value: Mapping[str, Any], field: str, index: int) -> dict[str, Any]:
+    allowed_keys = {"kind", "ref", "line", "result", "command", "detail"}
+    unknown_keys = set(value) - allowed_keys
+    if unknown_keys:
+        raise PlanError(f"{field}[{index}] has unsupported fields: {sorted(unknown_keys)}")
+    kind = _text(value.get("kind"), f"{field}[{index}].kind", max_length=40)
+    if kind not in STRUCTURED_EVIDENCE_KINDS:
+        raise PlanError(f"{field}[{index}].kind is not a supported evidence kind")
+    reference = _text(value.get("ref"), f"{field}[{index}].ref", max_length=500)
+    if not _is_bounded_reference(reference):
+        raise PlanError(f"{field}[{index}].ref must be a bounded local reference")
+    normalized: dict[str, Any] = {"kind": kind, "ref": reference}
+    if "line" in value:
+        line = value["line"]
+        if isinstance(line, bool) or not isinstance(line, int) or not 1 <= line <= 1_000_000:
+            raise PlanError(f"{field}[{index}].line must be a positive line number")
+        normalized["line"] = line
+    if "result" in value:
+        result = _text(value["result"], f"{field}[{index}].result", max_length=40)
+        if result not in CHECK_STATUSES and result != "passed":
+            raise PlanError(f"{field}[{index}].result is not a check result")
+        normalized["result"] = result
+    if "command" in value:
+        normalized["command"] = _text(value["command"], f"{field}[{index}].command", max_length=1000)
+    if "detail" in value:
+        normalized["detail"] = _text(value["detail"], f"{field}[{index}].detail", max_length=1000)
+    if kind == "command" and "command" not in normalized:
+        raise PlanError(f"{field}[{index}].command is required for command evidence")
+    return normalized
+
+
+def _evidence(value: Any, field: str = "evidence") -> list[Any]:
+    if isinstance(value, (str, Mapping)):
         value = [value]
-    return _string_list(value, field)
+    if not isinstance(value, list) or not value:
+        raise PlanError(f"{field} must be a non-empty list")
+    if len(value) != len({json.dumps(item, sort_keys=True, default=str) for item in value}):
+        raise PlanError(f"{field} contains duplicates")
+    normalized: list[Any] = []
+    for index, item in enumerate(value):
+        if isinstance(item, str):
+            reference = _text(item, f"{field}[{index}]", max_length=500)
+            lowered = reference.casefold()
+            if lowered in EVIDENCE_PLACEHOLDERS or re.fullmatch(r"(?:agent|assistant|model)[ _-](?:claim|report|summary)", lowered):
+                raise PlanError(f"{field}[{index}] must identify inspectable evidence")
+            if not _is_bounded_reference(reference):
+                raise PlanError(f"{field}[{index}] must be a bounded local reference or structured evidence")
+            normalized.append(reference)
+        elif isinstance(item, Mapping):
+            normalized.append(_structured_evidence(item, field, index))
+        else:
+            raise PlanError(f"{field}[{index}] must be a bounded reference or structured evidence")
+    return normalized
 
 
 def _bounded_int(value: Any, field: str, *, minimum: int, maximum: int) -> int:
@@ -161,6 +247,13 @@ def validate_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     for path in allowed_paths:
         path = _relative_path(path, "scope.allowed_paths[]")
         normalized_paths.append(path.rstrip("/") + "/")
+    logical_actions = scope.get("logical_actions", [])
+    logical_actions = _string_list(logical_actions, "scope.logical_actions", allow_empty=True)
+    for action in logical_actions:
+        if not SAFE_ACTION.fullmatch(action):
+            raise PlanError(f"scope.logical_actions contains invalid action {action!r}")
+    if not set(logical_actions).issubset(allowed_actions):
+        raise PlanError("scope.logical_actions must be a subset of scope.allowed_actions")
     out_of_scope_actions = scope.get("out_of_scope_actions") or []
     out_of_scope_actions = _string_list(out_of_scope_actions, "scope.out_of_scope_actions", allow_empty=True)
     for action in out_of_scope_actions:
@@ -206,6 +299,7 @@ def validate_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
             "excluded": excluded,
             "allowed_actions": allowed_actions,
             "allowed_paths": normalized_paths,
+            "logical_actions": logical_actions,
             "out_of_scope_actions": out_of_scope_actions,
         },
         "constraints": constraints,
@@ -354,7 +448,14 @@ class Workflow:
         limits = self.state["plan"]["limits"]
         if len(self.state["checkpoints"]) > limits["max_checkpoints"]:
             raise StateError("checkpoint limit exceeded")
-        if len(self.state["decisions"]) > limits["max_decisions"]:
+        decision_limit = limits["max_decisions"]
+        decision_overflow = (
+            len(self.state["decisions"]) == decision_limit + 1
+            and self.state.get("status") == "blocked"
+            and self.state["decisions"][-1].get("result") == "blocked"
+            and self.state["decisions"][-1].get("status") == "blocked"
+        )
+        if len(self.state["decisions"]) > decision_limit and not decision_overflow:
             raise StateError("decision limit exceeded")
         if len(self.state["replans"]) > limits["max_replans"]:
             raise StateError("replan limit exceeded")
@@ -375,6 +476,65 @@ class Workflow:
             raise StateError(f"phase {phase['id']} is {phase['status']}; expected {status}")
         return phase
 
+    @staticmethod
+    def _decision_record(
+        phase: str,
+        decision: str,
+        why: str,
+        evidence: list[Any],
+        result: str,
+        *,
+        status: str | None = None,
+        reason: str | None = None,
+        next_action: str | None = None,
+    ) -> dict[str, Any]:
+        record: dict[str, Any] = {
+            "at": _now(),
+            "phase": phase,
+            "decision": decision,
+            "why": why,
+            "evidence": deepcopy(evidence),
+            "result": result,
+        }
+        if status is not None:
+            record["status"] = status
+        if reason is not None:
+            record["reason"] = reason
+        if next_action is not None:
+            record["next_action"] = next_action
+        return record
+
+    def _append_decision_record(self, record: dict[str, Any], *, allow_limit_overflow: bool = False) -> None:
+        limit = self.state["plan"]["limits"]["max_decisions"]
+        if len(self.state["decisions"]) >= limit and not allow_limit_overflow:
+            raise StateError("decision limit reached")
+        if len(self.state["decisions"]) > limit or (
+            len(self.state["decisions"]) == limit and not allow_limit_overflow
+        ):
+            raise StateError("decision limit reached")
+        self.state["decisions"].append(record)
+
+    def _block_and_persist(self, reason: str, evidence: Sequence[Any] | str, next_action: str) -> None:
+        reason = _text(reason, "blocker.reason", max_length=1000)
+        evidence_values = _evidence(evidence, "blocker.evidence")
+        next_action = _text(next_action, "blocker.next_action", max_length=1000)
+        self._set_blocked(reason, evidence_values, next_action)
+        phase = self.state.get("current_phase") or "run"
+        self._append_decision_record(
+            self._decision_record(
+                phase,
+                f"blocked: {reason}",
+                "the run cannot proceed within its current constraints",
+                evidence_values,
+                "blocked",
+                status="blocked",
+                reason=reason,
+                next_action=next_action,
+            ),
+            allow_limit_overflow=True,
+        )
+        self._persist()
+
     def start_phase(self) -> dict[str, Any]:
         if self.state["status"] == "failed":
             raise ReplanRequired(f"phase {self.state['current_phase']} failed; replan before retry")
@@ -387,12 +547,11 @@ class Workflow:
         phase = self._require_current("pending")
         limit = self.state["plan"]["limits"]["max_attempts_per_phase"]
         if phase["attempt"] >= limit:
-            self._set_blocked(
+            self._block_and_persist(
                 "phase attempt limit reached",
                 [f"phase:{phase['id']}:attempts={phase['attempt']}"],
                 f"replan phase {phase['id']} with an explicit new approach",
             )
-            self._persist()
             raise StateError("phase attempt limit reached; run is blocked")
         phase["attempt"] += 1
         phase["status"] = "in_progress"
@@ -403,19 +562,18 @@ class Workflow:
         self._persist()
         return deepcopy(self.state)
 
-    def checkpoint(self, label: str, evidence: Sequence[str] | str, next_action: str) -> dict[str, Any]:
+    def checkpoint(self, label: str, evidence: Sequence[Any] | str, next_action: str) -> dict[str, Any]:
         phase = self._require_current("in_progress")
         label = _text(label, "checkpoint.label", max_length=200)
         evidence_values = _evidence(evidence, "checkpoint.evidence")
         next_action = _text(next_action, "checkpoint.next_action", max_length=1000)
         limit = self.state["plan"]["limits"]["max_checkpoints"]
         if len(self.state["checkpoints"]) >= limit:
-            self._set_blocked(
+            self._block_and_persist(
                 "checkpoint limit reached",
                 evidence_values,
                 "replan with a justified checkpoint budget or finish the current phase",
             )
-            self._persist()
             raise StateError("checkpoint limit reached; run is blocked")
         checkpoint = {
             "id": f"cp-{len(self.state['checkpoints']) + 1}",
@@ -480,7 +638,7 @@ class Workflow:
                 return phase
         return None
 
-    def fail_phase(self, reason: str, evidence: Sequence[str] | str, next_action: str) -> dict[str, Any]:
+    def fail_phase(self, reason: str, evidence: Sequence[Any] | str, next_action: str) -> dict[str, Any]:
         phase = self._require_current("in_progress")
         reason = _text(reason, "failure.reason", max_length=1000)
         evidence_values = _evidence(evidence, "failure.evidence")
@@ -504,7 +662,7 @@ class Workflow:
     def replan(
         self,
         reason: str,
-        evidence: Sequence[str] | str,
+        evidence: Sequence[Any] | str,
         next_action: str,
         replacement: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -515,8 +673,7 @@ class Workflow:
         next_action = _text(next_action, "replan.next_action", max_length=1000)
         limit = self.state["plan"]["limits"]["max_replans"]
         if len(self.state["replans"]) >= limit:
-            self._set_blocked("replan limit reached", evidence_values, "request a new bounded plan from the owner")
-            self._persist()
+            self._block_and_persist("replan limit reached", evidence_values, "request a new bounded plan from the owner")
             raise StateError("replan limit reached; run is blocked")
         phase = self._phase()
         if phase["status"] != "failed":
@@ -526,7 +683,16 @@ class Workflow:
             replacement_spec = _phase_spec(replacement, 0)
             if replacement_spec["id"] != phase["id"]:
                 raise PlanError("replacement phase must keep the failed phase id")
-            phase.update(replacement_spec)
+        candidate_phases = deepcopy(self.state["plan"]["phases"])
+        failed_phase_index = next(index for index, item in enumerate(candidate_phases) if item["id"] == phase["id"])
+        if replacement_spec is not None:
+            candidate_phases[failed_phase_index] = replacement_spec
+        candidate_plan = deepcopy(self.state["plan"])
+        candidate_plan["phases"] = candidate_phases
+        validated_plan = validate_plan(candidate_plan)
+        self.state["plan"]["phases"] = validated_plan["phases"]
+        if replacement_spec is not None:
+            phase.update(validated_plan["phases"][failed_phase_index])
         phase["status"] = "pending"
         phase["failure"] = None
         phase["output_value"] = None
@@ -578,7 +744,7 @@ class Workflow:
         self._persist()
         return deepcopy(self.state)
 
-    def _set_blocked(self, reason: str, evidence: Sequence[str] | str, next_action: str) -> None:
+    def _set_blocked(self, reason: str, evidence: Sequence[Any] | str, next_action: str) -> None:
         reason = _text(reason, "blocker.reason", max_length=1000)
         evidence_values = _evidence(evidence, "blocker.evidence")
         next_action = _text(next_action, "blocker.next_action", max_length=1000)
@@ -592,19 +758,10 @@ class Workflow:
         self.state["next_action"] = next_action
         self._event("blocked", phase=current_id, reason=reason)
 
-    def block(self, reason: str, evidence: Sequence[str] | str, next_action: str) -> dict[str, Any]:
+    def block(self, reason: str, evidence: Sequence[Any] | str, next_action: str) -> dict[str, Any]:
         if self.state["status"] == "completed":
             raise StateError("completed workflow cannot be blocked")
-        self._set_blocked(reason, evidence, next_action)
-        self.record_decision(
-            self.state.get("current_phase") or "run",
-            f"blocked: {reason}",
-            "the run cannot proceed within its current constraints",
-            self.state["blocker"]["evidence"],
-            "blocked",
-            persist=False,
-        )
-        self._persist()
+        self._block_and_persist(reason, evidence, next_action)
         return deepcopy(self.state)
 
     def record_decision(
@@ -612,10 +769,14 @@ class Workflow:
         phase: str,
         decision: str,
         why: str,
-        evidence: Sequence[str] | str,
+        evidence: Sequence[Any] | str,
         result: str,
         *,
+        status: str | None = None,
+        reason: str | None = None,
+        next_action: str | None = None,
         persist: bool = True,
+        _allow_limit_overflow: bool = False,
     ) -> dict[str, Any]:
         phase = _text(phase, "decision.phase", max_length=100)
         decision = _text(decision, "decision.decision", max_length=1000)
@@ -624,11 +785,34 @@ class Workflow:
         result = _text(result, "decision.result", max_length=40)
         if result not in VALID_RESULTS:
             raise StateError(f"decision.result must be one of {sorted(VALID_RESULTS)}")
+        status_value = None
+        if status is not None:
+            status_value = _text(status, "decision.status", max_length=40)
+            if status_value not in {"blocked", "refused"}:
+                raise StateError("decision.status must be blocked or refused")
+        if (reason is None) != (next_action is None):
+            raise StateError("decision.reason and decision.next_action must be provided together")
+        reason_value = _text(reason, "decision.reason", max_length=1000) if reason is not None else None
+        next_action_value = _text(next_action, "decision.next_action", max_length=1000) if next_action is not None else None
         limit = self.state["plan"]["limits"]["max_decisions"]
-        if len(self.state["decisions"]) >= limit:
-            raise StateError("decision limit reached")
-        record = {"at": _now(), "phase": phase, "decision": decision, "why": why, "evidence": evidence_values, "result": result}
-        self.state["decisions"].append(record)
+        if len(self.state["decisions"]) >= limit and not _allow_limit_overflow:
+            self._block_and_persist(
+                "decision limit reached",
+                [{"kind": "reference", "ref": f"decisions:{len(self.state['decisions'])}"}],
+                "request a new bounded plan from the owner",
+            )
+            raise StateError("decision limit reached; run is blocked")
+        record = self._decision_record(
+            phase,
+            decision,
+            why,
+            evidence_values,
+            result,
+            status=status_value,
+            reason=reason_value,
+            next_action=next_action_value,
+        )
+        self._append_decision_record(record, allow_limit_overflow=_allow_limit_overflow)
         if persist:
             self._persist()
         return deepcopy(record)
@@ -637,8 +821,9 @@ class Workflow:
         self,
         check_id: str,
         passed: bool,
-        evidence: Sequence[str] | str,
+        evidence: Sequence[Any] | str,
         observed: str = "",
+        status: str | None = None,
     ) -> dict[str, Any]:
         check_id = _text(check_id, "predicate.check_id", max_length=100)
         if not isinstance(passed, bool):
@@ -647,11 +832,27 @@ class Workflow:
         if check_id not in checks:
             raise PredicateError(f"unknown terminal check: {check_id}")
         evidence_values = _evidence(evidence, "predicate.evidence")
+        observed_value = _text(observed or ("passed" if passed else "failed"), "predicate.observed", max_length=1000)
+        status_value = status
+        if status_value is None:
+            observed_lower = re.sub(r"[\s-]+", "_", observed_value.casefold())
+            if not passed and "not_run" in observed_lower:
+                status_value = "not_run"
+            elif not passed and "inconclusive" in observed_lower:
+                status_value = "inconclusive"
+            else:
+                status_value = "verified" if passed else "failed"
+        status_value = _text(status_value, "predicate.status", max_length=40)
+        if status_value not in CHECK_STATUSES:
+            raise PredicateError(f"predicate.status must be one of {sorted(CHECK_STATUSES)}")
+        if (status_value == "verified") != passed:
+            raise PredicateError("only a verified predicate may have passed=true")
         result = {
             "check_id": check_id,
             "passed": bool(passed),
+            "status": status_value,
             "evidence": evidence_values,
-            "observed": _text(observed or ("passed" if passed else "failed"), "predicate.observed", max_length=1000),
+            "observed": observed_value,
             "at": _now(),
         }
         self.state["predicate_results"][check_id] = result
@@ -662,7 +863,7 @@ class Workflow:
             f"terminal check {check_id}",
             "the terminal predicate check was recorded",
             evidence_values,
-            "verified" if passed else "failed",
+            status_value,
             persist=False,
         )
         self._persist()
@@ -678,7 +879,9 @@ class Workflow:
         missing_checks = [
             check_id
             for check_id in self.state["plan"]["terminal_predicate"]["checks"]
-            if not results.get(check_id) or results[check_id].get("passed") is not True
+            if not results.get(check_id)
+            or results[check_id].get("passed") is not True
+            or results[check_id].get("status") != "verified"
         ]
         if missing_checks:
             raise PredicateError("terminal predicate is not satisfied: " + ", ".join(missing_checks))
@@ -694,66 +897,140 @@ class Workflow:
         self._persist()
         return deepcopy(self.state)
 
+    def _refuse_action(self, action: str, target: str | None, reason: str) -> None:
+        next_action = "choose a declared local action or replan with owner approval"
+        refusal = {
+            "at": _now(),
+            "status": "refused",
+            "action": action,
+            "target": target,
+            "reason": reason,
+            "next_action": next_action,
+        }
+        self.state["events"].append({"event": "action_refused", **refusal})
+        action_reference = action if SAFE_ACTION.fullmatch(action) else "invalid-action"
+        evidence = [
+            {"kind": "reference", "ref": f"scope:{action_reference}"},
+            {"kind": "reference", "ref": "target:provided" if target is not None else "target:none"},
+        ]
+        self.record_decision(
+            self.state.get("current_phase") or "run",
+            f"refused action {action_reference}",
+            reason,
+            evidence,
+            "blocked",
+            status="refused",
+            reason=reason,
+            next_action=next_action,
+            persist=False,
+        )
+        self._persist()
+        raise ScopeRefusal(reason, refusal)
+
     def guard_action(self, action: str, target: str | None = None) -> dict[str, Any]:
-        try:
-            action = _text(action, "action", max_length=100)
-        except PlanError as exc:
-            raise ScopeRefusal("action name is invalid and was refused") from exc
-        if not SAFE_ACTION.fullmatch(action):
-            raise ScopeRefusal("action name is invalid and was refused")
+        action_value = (
+            action
+            if isinstance(action, str)
+            and len(action) <= 100
+            and not any(unicodedata.category(char) in {"Cc", "Cf"} for char in action)
+            else "<invalid-action>"
+        )
+        action_invalid_reason: str | None = None
+        if not isinstance(action, str):
+            action_invalid_reason = "action name is not a string"
+        elif not action:
+            action_invalid_reason = "action name is empty"
+        elif len(action) > 100:
+            action_invalid_reason = "action name exceeds 100 characters"
+        elif any(unicodedata.category(char) in {"Cc", "Cf"} for char in action):
+            action_invalid_reason = "action name contains a control or format character"
+        elif action != action.strip():
+            action_invalid_reason = "action name contains surrounding whitespace"
+        elif not SAFE_ACTION.fullmatch(action):
+            action_invalid_reason = "action name is not a declared safe action"
+        if action_invalid_reason:
+            self._refuse_action(action_value, None, action_invalid_reason)
+        assert isinstance(action, str)
         if self.state["status"] == "completed":
             raise StateError("completed workflow cannot authorize another action")
-        target_invalid = target is not None and not isinstance(target, str)
-        if not target_invalid:
-            target_invalid = bool(target) and (len(target) > 500 or any(char in target for char in "\x00\r\n"))
-        target_value = "" if target is None else target if isinstance(target, str) else "<invalid-target>"
-        if target_invalid:
-            target_value = "<invalid-target>"
+
+        target_provided = target is not None
+        target_invalid_reason: str | None = None
+        target_display: str | None = target if isinstance(target, str) else None
+        if target_provided and not isinstance(target, str):
+            target_invalid_reason = "target is not a string"
+            target_display = "<invalid-target>"
+        elif target_provided and isinstance(target, str):
+            if not target:
+                target_invalid_reason = "target is empty; omit it only for a logical action"
+                target_display = "<invalid-target>"
+            elif len(target) > 500:
+                target_invalid_reason = "target exceeds 500 characters"
+                target_display = "<invalid-target>"
+            elif any(unicodedata.category(char) in {"Cc", "Cf"} for char in target):
+                target_invalid_reason = "target contains a control or format character"
+                target_display = "<invalid-target>"
+            elif target != target.strip():
+                target_invalid_reason = "target contains surrounding whitespace"
+                target_display = "<invalid-target>"
+            elif "\\" in target:
+                target_invalid_reason = "target contains a backslash escape"
+                target_display = "<invalid-target>"
+            elif target.startswith(("/", "~", "//")) or re.match(r"^[A-Za-z]:", target):
+                target_invalid_reason = "target is absolute, a drive path, or a UNC path"
+                target_display = "<invalid-target>"
+            elif URI_SCHEME.match(target):
+                target_invalid_reason = "target contains a URL or URI scheme"
+                target_display = "<invalid-target>"
+            elif "@" in target:
+                target_invalid_reason = "target looks like a credential or external host"
+                target_display = "<invalid-target>"
+            elif ".." in PurePosixPath(target).parts:
+                target_invalid_reason = "target escapes the declared scope"
+                target_display = "<invalid-target>"
+
         scope = self.state["plan"]["scope"]
-        reason: str | None = None
-        if target_invalid:
-            reason = "target is invalid or contains a control character"
-        elif action in scope["out_of_scope_actions"]:
+        reason: str | None = target_invalid_reason
+        if reason is None and action in scope["out_of_scope_actions"]:
             reason = f"action {action!r} is explicitly out of scope"
-        elif action not in scope["allowed_actions"]:
+        elif reason is None and action not in scope["allowed_actions"]:
             reason = f"action {action!r} is not declared in allowed_actions"
-        elif target_value and (
-            target_value.startswith(("/", "~", "http:", "https:", "ssh:", "git@"))
-            or re.match(r"^[A-Za-z]:[/\\]", target_value)
-            or ".." in PurePosixPath(target_value.replace("\\", "/")).parts
-        ):
-            reason = "target is absolute, external, or escapes the declared scope"
-        elif scope["allowed_paths"] and target_value:
-            normalized = str(PurePosixPath(target_value.replace("\\", "/")))
-            if not any(normalized == prefix[:-1] or normalized.startswith(prefix) for prefix in scope["allowed_paths"]):
+        elif reason is None and target_provided and target_display is not None:
+            normalized = str(PurePosixPath(target_display))
+            if scope["allowed_paths"] and not any(
+                normalized == prefix[:-1] or normalized.startswith(prefix) for prefix in scope["allowed_paths"]
+            ):
                 reason = "target is outside scope.allowed_paths"
-        elif scope["allowed_paths"] and not target_value:
-            reason = "an action target is required when allowed_paths is constrained"
+        elif reason is None and scope["allowed_paths"] and not target_provided:
+            if action not in scope.get("logical_actions", []):
+                reason = "a target is required for this action in a path-constrained scope"
         if reason:
-            refusal = {
-                "at": _now(),
-                "status": "refused",
-                "action": action,
-                "target": target_value or None,
-                "reason": reason,
-                "next_action": "choose a declared local action or replan with owner approval",
-            }
-            self.state["events"].append(refusal)
-            self.record_decision(
-                self.state.get("current_phase") or "run",
-                f"refused action {action}",
-                reason,
-                [f"scope:{action}", f"target:{target_value or '<none>'}"],
-                "blocked",
-            )
-            raise ScopeRefusal(reason, refusal)
-        allowed = {"at": _now(), "status": "allowed", "action": action, "target": target_value or None}
-        self._event("action_allowed", action=action, target=target_value or None)
+            self._refuse_action(action, target_display, reason)
+
+        allowed = {"at": _now(), "status": "allowed", "action": action, "target": target_display}
+        self._event("action_allowed", action=action, target=target_display)
         self._persist()
         return allowed
 
     def export_audit(self, audit_path: str | os.PathLike[str]) -> Path:
         path, _ = _state_path(audit_path, self.workspace_root)
+        state_path = self.state_path.resolve(strict=False)
+        audit_resolved = path.resolve(strict=False)
+        same_file = False
+        if path.exists() and self.state_path.exists():
+            try:
+                same_file = os.path.samefile(path, self.state_path)
+            except OSError:
+                same_file = False
+        if audit_resolved == state_path or same_file:
+            raise ScopeRefusal(
+                "audit output must not overwrite the workflow state",
+                {
+                    "status": "refused",
+                    "reason": "audit output path resolves to the persisted state path",
+                    "next_action": "choose a separate local TSV audit path",
+                },
+            )
         rows = [["ts", "phase", "decision", "why", "evidence", "result"]]
         for item in self.state["decisions"]:
             rows.append([
@@ -761,7 +1038,10 @@ class Workflow:
                 item["phase"],
                 item["decision"],
                 item["why"],
-                "; ".join(item["evidence"]),
+                "; ".join(
+                    value if isinstance(value, str) else json.dumps(value, sort_keys=True, separators=(",", ":"))
+                    for value in item["evidence"]
+                ),
                 item["result"],
             ])
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -852,6 +1132,7 @@ def _parser() -> argparse.ArgumentParser:
     predicate.add_argument("--workspace-root")
     predicate.add_argument("--check-id", required=True)
     predicate.add_argument("--passed", action="store_true")
+    predicate.add_argument("--status", choices=sorted(CHECK_STATUSES))
     predicate.add_argument("--evidence", action="append", required=True)
     predicate.add_argument("--observed")
 
@@ -909,7 +1190,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "block":
             result = workflow.block(args.reason, args.evidence, args.next_action)
         elif args.command == "predicate":
-            result = workflow.record_predicate(args.check_id, args.passed, args.evidence, args.observed or "")
+            result = workflow.record_predicate(args.check_id, args.passed, args.evidence, args.observed or "", args.status)
         elif args.command == "guard-action":
             result = workflow.guard_action(args.action, args.target)
         elif args.command == "decision":

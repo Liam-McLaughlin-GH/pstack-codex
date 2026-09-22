@@ -17,6 +17,7 @@ The input to `init` is one JSON object with these fields.
     "excluded": ["deployment", "unrelated refactors"],
     "allowed_actions": ["read", "write", "run-tests"],
     "allowed_paths": ["src/", "tests/"],
+    "logical_actions": ["run-tests"],
     "out_of_scope_actions": ["deploy", "push", "send-message"]
   },
   "constraints": ["Keep the standard library only"],
@@ -51,10 +52,12 @@ contract, and a distinct verification check. The helper requires a positive
 verification result and at least one evidence item before marking a phase
 passed.
 
-`allowed_paths` are relative prefixes. An empty list permits logical actions
-that have no path target. When paths are listed, a targeted action must name a
-path below one of those prefixes. Absolute paths, parent traversal, URLs,
-credential targets, and undeclared actions are refused.
+`allowed_paths` are relative prefixes. `logical_actions` explicitly names
+allowed actions that may omit a target when paths are constrained. An action
+not in that list must name a path below one of the prefixes. With no path
+prefixes, an allowed action may omit a target. Absolute paths, parent
+traversal, URL schemes, credential targets, backslash escapes, control or
+format characters, and undeclared actions are refused.
 
 ## State and transitions
 
@@ -82,16 +85,26 @@ only the interrupted phase.
 ## Decision trail
 
 Each decision stores `phase`, `decision`, `why`, `evidence`, and one of
-`open`, `verified`, `failed`, `reverted`, or `blocked`. `audit` exports the
-current records with this header:
+`open`, `verified`, `failed`, `reverted`, `blocked`, `not_run`, or
+`inconclusive`. Refusal and automatic-block decisions also store `status`,
+`reason`, and `next_action`. `audit` exports the current records with this
+header:
 
 ```text
 ts\tphase\tdecision\twhy\tevidence\tresult
 ```
 
-Evidence is concrete. Use a test name and result, a file path and line, a
-command output artifact, or a blocker reference. Do not replace evidence with
-"checked" or an agent report.
+Evidence is concrete. A string evidence item is a bounded local reference such
+as `tests/test_workflow.py:42`, `artifacts/focused-tests.txt`, or
+`check:terminal-predicate`. Structured evidence uses a bounded `ref` and may
+include `kind`, `line`, `result`, `command`, or `detail`, for example
+`{"kind":"command","ref":"artifacts/focused-tests.txt","command":"python3 -m unittest","result":"passed"}`.
+Do not replace evidence with `checked`, `not run`, or an agent report.
+
+Terminal predicate results carry an explicit `status` of `verified`, `failed`,
+`blocked`, `not_run`, or `inconclusive`. Only `status: verified` with
+`passed: true` can satisfy `finish`; unavailable or inconclusive checks are
+non-passing.
 
 ## Safe boundaries
 

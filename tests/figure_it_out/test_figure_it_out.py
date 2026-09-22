@@ -21,7 +21,7 @@ sys.modules[spec.name] = figure_it_out
 spec.loader.exec_module(figure_it_out)
 
 
-def make_plan(*, phase_count: int = 2, max_checkpoints: int = 8) -> dict:
+def make_plan(*, phase_count: int = 2, max_checkpoints: int = 8, max_decisions: int = 32) -> dict:
     phases = []
     for index in range(phase_count):
         phase_id = f"phase-{index + 1}"
@@ -44,6 +44,7 @@ def make_plan(*, phase_count: int = 2, max_checkpoints: int = 8) -> dict:
             "excluded": ["deployment", "unrelated files"],
             "allowed_actions": ["read", "write", "run-tests"],
             "allowed_paths": ["src/", "tests/"],
+            "logical_actions": ["run-tests"],
             "out_of_scope_actions": ["deploy", "push", "send-message"],
         },
         "constraints": ["Use local evidence", "Do not broaden the task"],
@@ -55,17 +56,28 @@ def make_plan(*, phase_count: int = 2, max_checkpoints: int = 8) -> dict:
             "max_attempts_per_phase": 2,
             "max_checkpoints": max_checkpoints,
             "max_replans": 2,
-            "max_decisions": 32,
+            "max_decisions": max_decisions,
         },
         "phases": phases,
     }
 
 
 class WorkflowBehaviorTests(unittest.TestCase):
-    def workflow(self, root: Path, *, phase_count: int = 2, max_checkpoints: int = 8):
+    def workflow(
+        self,
+        root: Path,
+        *,
+        phase_count: int = 2,
+        max_checkpoints: int = 8,
+        max_decisions: int = 32,
+    ):
         return figure_it_out.Workflow.create(
             root / "run.json",
-            make_plan(phase_count=phase_count, max_checkpoints=max_checkpoints),
+            make_plan(
+                phase_count=phase_count,
+                max_checkpoints=max_checkpoints,
+                max_decisions=max_decisions,
+            ),
             workspace_root=root,
         )
 
@@ -195,6 +207,9 @@ class WorkflowBehaviorTests(unittest.TestCase):
             self.assertEqual(workflow.state["status"], "blocked")
             self.assertIn("checkpoint limit", workflow.state["blocker"]["reason"])
             self.assertTrue(workflow.state["blocker"]["next_action"])
+            self.assertEqual(workflow.state["decisions"][-1]["status"], "blocked")
+            audit = workflow.export_audit(root / "checkpoint-audit.tsv").read_text(encoding="utf-8")
+            self.assertIn("checkpoint limit reached", audit)
 
     def test_out_of_scope_action_is_refused_and_recorded(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -212,6 +227,150 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 workflow.guard_action("write", r"src\..\outside.py")
             with self.assertRaises(figure_it_out.ScopeRefusal):
                 workflow.guard_action("write", "src/ok.py\nforged")
+            self.assertEqual(workflow.state["decisions"][-1]["status"], "refused")
+            self.assertIn("reason", workflow.state["decisions"][-1])
+            self.assertIn("next_action", workflow.state["decisions"][-1])
+
+            with self.assertRaises(figure_it_out.ScopeRefusal) as invalid_action:
+                workflow.guard_action("bad action", "src/file.py")
+            self.assertEqual(invalid_action.exception.refusal["status"], "refused")
+            self.assertTrue(invalid_action.exception.refusal["reason"])
+            self.assertTrue(invalid_action.exception.refusal["next_action"])
+            self.assertEqual(workflow.state["decisions"][-1]["status"], "refused")
+
+            unsafe_targets = [
+                "ftp://host/repo",
+                "file:///tmp/out",
+                "mailto:user@example.com",
+                "git+ssh://host/repo",
+                "foo:bar",
+                r"\\server\share",
+                r"src\..\outside.py",
+                "src/ok.py\tforged",
+                "src/ok.py\vforged",
+                "src/ok.py\u200bforged",
+                "C:relative.txt",
+                "C:/absolute.txt",
+                "//server/share",
+                "token@host",
+            ]
+            for target in unsafe_targets:
+                with self.assertRaises(figure_it_out.ScopeRefusal, msg=target) as refusal_context:
+                    workflow.guard_action("write", target)
+                self.assertEqual(refusal_context.exception.refusal["status"], "refused")
+                self.assertTrue(refusal_context.exception.refusal["reason"])
+                self.assertTrue(refusal_context.exception.refusal["next_action"])
+
+    def test_targetless_logical_actions_are_explicit_in_path_scopes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            self.assertEqual(workflow.guard_action("run-tests")["status"], "allowed")
+            with self.assertRaises(figure_it_out.ScopeRefusal):
+                workflow.guard_action("write")
+
+    def test_evidence_rejects_placeholders_and_terminal_nonpassing_states(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            workflow.start_phase()
+            with self.assertRaises(figure_it_out.PlanError):
+                workflow.complete_phase(
+                    "output",
+                    {"check_id": "check-1", "passed": True, "evidence": ["checked"]},
+                )
+            with self.assertRaises(figure_it_out.PlanError):
+                workflow.complete_phase(
+                    "output",
+                    {"check_id": "check-1", "passed": True, "evidence": ["agent report"]},
+                )
+            workflow.complete_phase(
+                "output",
+                {
+                    "check_id": "check-1",
+                    "passed": True,
+                    "evidence": [{"kind": "test", "ref": "tests/phase-1.txt", "line": 1, "result": "passed"}],
+                },
+            )
+            workflow.record_predicate(
+                "focused-tests",
+                False,
+                ["tests/not-run.txt"],
+                observed="NOT RUN: test command was unavailable",
+                status="not_run",
+            )
+            workflow.record_predicate(
+                "artifact-inspection",
+                False,
+                ["artifacts/inconclusive.txt"],
+                observed="INCONCLUSIVE: artifact was incomplete",
+                status="inconclusive",
+            )
+            self.assertEqual(workflow.state["predicate_results"]["focused-tests"]["status"], "not_run")
+            self.assertEqual(workflow.state["predicate_results"]["artifact-inspection"]["status"], "inconclusive")
+            with self.assertRaises(figure_it_out.PredicateError):
+                workflow.finish()
+            with self.assertRaises(figure_it_out.PredicateError):
+                workflow.record_predicate(
+                    "focused-tests",
+                    True,
+                    ["tests/focused.txt"],
+                    status="not_run",
+                )
+
+    def test_decision_limit_blocks_and_persists_auditable_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1, max_decisions=1)
+            workflow.record_decision("phase-1", "first decision", "bounded test", ["tests/decision.txt"], "open")
+            with self.assertRaises(figure_it_out.StateError):
+                workflow.record_decision("phase-1", "second decision", "budget check", ["tests/decision-2.txt"], "open")
+            persisted = figure_it_out.Workflow.load(root / "run.json", workspace_root=root)
+            self.assertEqual(persisted.state["status"], "blocked")
+            self.assertIn("decision limit", persisted.state["blocker"]["reason"])
+            self.assertEqual(persisted.state["decisions"][-1]["status"], "blocked")
+            audit = persisted.export_audit(root / "decision-audit.tsv").read_text(encoding="utf-8")
+            self.assertIn("decision limit reached", audit)
+
+    def test_replan_revalidates_all_phase_verification_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root)
+            workflow.start_phase()
+            workflow.fail_phase("phase-1 failed", ["tests/phase-1-fail.txt"], "replace phase-1")
+            with self.assertRaises(figure_it_out.PlanError):
+                workflow.replan(
+                    "reuse would collide",
+                    ["tests/replan.txt"],
+                    "start phase-1",
+                    {
+                        "id": "phase-1",
+                        "name": "Replacement",
+                        "hypothesis": "The replacement is bounded",
+                        "output": "Replacement output",
+                        "verification": {"id": "check-2", "method": "Reuse phase-2 check"},
+                    },
+                )
+            self.assertEqual(workflow.state["status"], "failed")
+            self.assertEqual(
+                len({phase["verification"]["id"] for phase in workflow.state["plan"]["phases"]}),
+                2,
+            )
+
+    def test_audit_refuses_state_path_without_overwriting_resume_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            before = (root / "run.json").read_bytes()
+            with self.assertRaises(figure_it_out.ScopeRefusal) as refusal:
+                workflow.export_audit(root / "run.json")
+            self.assertEqual(refusal.exception.refusal["status"], "refused")
+            self.assertTrue(refusal.exception.refusal["next_action"])
+            self.assertEqual((root / "run.json").read_bytes(), before)
+            self.assertEqual(
+                figure_it_out.Workflow.load(root / "run.json", workspace_root=root).state["status"],
+                "planned",
+            )
 
     def test_validation_rejects_unbounded_or_incomplete_plans(self):
         plan = make_plan()
