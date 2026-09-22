@@ -27,6 +27,14 @@ SOURCE_LIKE_RE = re.compile(r"(?:web-app|web-k8s|showpass-frontend)@[0-9a-f]+:[^
 MARKER_RE = re.compile(r"\bSP-[A-Z0-9-]+\b")
 SAFE_COMMAND_STATUS = "VERIFIED / NOT RUN"
 UNSAFE_COMMAND_STATUS_RE = re.compile(r"^UNSAFE: \S(?:[^/\n]*\S)? / NOT RUN$")
+FRONTEND_BOUNDARY_SUPPORTED = (
+    "Start with the `showpass-frontend` repository guidance for its web, mobile, "
+    "and desktop apps built with React, Next.js, and React Native."
+)
+FRONTEND_BOUNDARY_UNSUPPORTED = (
+    "owns React, Next.js, and React Native surfaces",
+    "Do not apply Django or deployment rules",
+)
 FAB_LIST_RE = re.compile(r"\bfab\s+--list(?:\s|$)")
 FAB_ROLLING_UPDATE_RE = re.compile(
     r"\bfab\s+(?:demo|beta|live|prod|production)\s+web\.rolling_update(?:\s|$)"
@@ -202,6 +210,31 @@ def _validate_command_status(command: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _validate_frontend_boundary(skill_text: str) -> List[str]:
+    """Keep the frontend citation limited to the claims in AGENTS.md#L3-L7."""
+
+    errors: List[str] = []
+    boundary_lines = [
+        line for line in skill_text.splitlines() if "[SP-FRONTEND-BOUNDARY]" in line
+    ]
+    if len(boundary_lines) != 1:
+        errors.append("SP-FRONTEND-BOUNDARY must have exactly one routing-table row")
+        return errors
+
+    boundary_line = boundary_lines[0]
+    if FRONTEND_BOUNDARY_SUPPORTED not in boundary_line:
+        errors.append(
+            "SP-FRONTEND-BOUNDARY must use the claim supported by showpass-frontend/AGENTS.md#L3-L7"
+        )
+    for unsupported in FRONTEND_BOUNDARY_UNSUPPORTED:
+        if unsupported in boundary_line:
+            errors.append(
+                "SP-FRONTEND-BOUNDARY overclaims beyond showpass-frontend/AGENTS.md#L3-L7: %s"
+                % unsupported
+            )
+    return errors
+
+
 def check_documents(skill_text: str, ledger: Dict[str, Any]) -> List[str]:
     errors: List[str] = []
 
@@ -221,6 +254,7 @@ def check_documents(skill_text: str, ledger: Dict[str, Any]) -> List[str]:
 
     rule_ids = {rule.get("id") for rule in ledger.get("rules", [])}
     _registered_citations(ledger, skill_text, errors)
+    errors.extend(_validate_frontend_boundary(skill_text))
 
     for marker in set(MARKER_RE.findall(skill_text)):
         if marker not in rule_ids:
@@ -281,6 +315,18 @@ def check_negative_cases(skill_text: str, ledger: Dict[str, Any]) -> List[str]:
     mismatched["rules"][0]["citations"][0]["path"] = "invented.md"
     if not check_documents(skill_text, mismatched):
         errors.append("negative case was accepted: mismatched-source-path")
+
+    overclaimed = skill_text.replace(
+        FRONTEND_BOUNDARY_SUPPORTED,
+        (
+            "`showpass-frontend` owns React, Next.js, and React Native surfaces. "
+            "Do not apply Django or deployment rules to its UI code."
+        ),
+    )
+    if overclaimed == skill_text:
+        errors.append("frontend-boundary negative fixture did not replace the supported claim")
+    elif not check_documents(overclaimed, ledger):
+        errors.append("negative case was accepted: overclaimed-frontend-boundary")
     return errors
 
 
@@ -307,7 +353,7 @@ def main() -> int:
     rule_count = len(ledger.get("rules", []))
     command_count = len(ledger.get("commands", []))
     if args.scenario == "negative":
-        case_count = len(NEGATIVE_STATUS_CASES) + 2
+        case_count = len(NEGATIVE_STATUS_CASES) + 3
     else:
         case_count = len(ledger.get("routing_cases", [])) if scenario is None else sum(
             case.get("safety") == scenario for case in ledger.get("routing_cases", [])
