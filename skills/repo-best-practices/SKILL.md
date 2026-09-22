@@ -12,22 +12,25 @@ Use this skill to choose the owning repository, trace a change across its bounda
 Start with the current root `AGENTS.md` in each repository that may be involved. For a quick, deterministic hint, run:
 
 ```sh
-python3 skills/repo-best-practices/scripts/route_task.py "<request>"
+CODEX_SKILL_DIR="${CODEX_SKILL_DIR:-${CODEX_HOME:-$HOME/.codex}/skills/repo-best-practices}"
+python3 "$CODEX_SKILL_DIR/scripts/route_task.py" "<request>"
 ```
 
-The helper is a keyword hint. Exact source paths, symbols, and current repository guidance take precedence. An `unknown` or `mixed` result requires a source trace before editing.
+The command resolves the installed skill after activation, even when the target repository is elsewhere. Set `CODEX_SKILL_DIR` only when the installed skill lives outside the standard Codex skill directory. The helper is a keyword hint. Exact source paths, symbols, and current repository guidance take precedence. An `unknown` or `mixed` result requires a source trace before editing.
 
 | Request shape | Primary owner | Boundary |
 | --- | --- | --- |
 | Django, DRF, models, ViewSets, serializers, services, Celery, durable records, permissions, API contracts, ledger, or backend tests | `web-app` | Check the domain owner, not only the URL prefix. Postgres and backend contracts are authoritative for durable behavior. |
 | React, Next.js, mobile, desktop, shared client core, repositories, service hooks, or client tests with modern client context | `showpass-frontend` | Keep routes thin. Follow `API -> Repository -> Service Hook -> use-case/composition hook -> UI`; inspect the backend contract first. |
 | AngularJS, Django templates, `apps/main/static`, Gulp, redirects, embedded pages, or legacy bridge code | `web-app` | This is a legacy frontend surface in the backend repository, not a reason to move the change to the modern frontend monorepo. |
-| Fabric, Kubernetes, Jinja, `gcloud`, `kubectl`, ingress, rollout, monitoring, HPA, KEDA, or environment configuration | `web-k8s` | Select the environment first. Treat deployment commands as operational actions requiring explicit authorization. |
+| Fabric/Fabric3, source-shaped `fab demo|beta|live <task>` commands, Kubernetes, Jinja, `gcloud`, `kubectl`, ingress, rollout, monitoring, HPA, KEDA, or environment configuration | `web-k8s` | Select the environment first. Treat deployment commands as operational actions requiring explicit authorization. |
 | A backend contract plus a modern client plus deployment or ingress changes | Split by owner | Trace backend contract first, then the client adapter, then deployment configuration. Include only repositories whose source actually changes. |
 
 Do not infer ownership from a ticket label, API prefix, package name, or a neighboring repository. Read the current root guidance and the smallest relevant architecture/domain document when the helper is insufficient.
 
 Explicit legacy terms take precedence over generic `frontend` or `client` wording. Generic `frontend` and `client` terms are not modern-owner evidence by themselves: modern routing requires a distinct React, Next.js, mobile, desktop, or named modern-frontend signal. A request that names AngularJS, a Django template, the legacy bridge, Gulp, or `apps/main/static` stays in `web-app`; it becomes `mixed` only when it also names a distinct modern signal. Generic `page`, `route`, `template`, and `repository` terms need the surrounding Django or modern-client context before they select an owner.
+
+Deployment routing is bounded. A source-shaped `fab demo|beta|live <task>` command, Fabric3, an environment-selection phrase, or a deployment verb paired with a documented environment or target selects `web-k8s`. Bare `demo`, `beta`, `live`, `production`, and `deploy` remain unknown until their context establishes the deployment boundary.
 
 ## Trace the request flow
 
@@ -90,11 +93,13 @@ Use the least expensive command that proves the changed boundary. The build is r
 
 `web-k8s` offline checks:
 
+Activate the repository's Python 3.9.x virtual environment first. Use its `python` for every Python command:
+
 ```sh
-python3.9 --version
+python --version
 ruff check .
-python3.9 -m compileall -q deploy tests fabfile.py settings.py
-python3.9 -m tests
+python -m compileall -q deploy tests fabfile.py settings.py
+python -m tests
 fab --list
 git diff --check
 ```

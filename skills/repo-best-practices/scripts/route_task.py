@@ -56,7 +56,6 @@ FRONTEND_CONTEXT_SIGNALS = (
 
 LEGACY_FRONTEND_SIGNALS = (
     "angularjs",
-    "angular",
     "django template",
     "legacy frontend",
     "legacy template",
@@ -72,6 +71,7 @@ INFRA_SIGNALS = (
     "kubernetes",
     "k8s",
     "fabric",
+    "fabric3",
     "jinja",
     "kubectl",
     "gcloud",
@@ -89,6 +89,41 @@ INFRA_SIGNALS = (
     "environment configuration",
     "environment config",
     "environment selection",
+)
+
+DEPLOYMENT_ENVIRONMENTS = r"(?:demo|beta|live|production)"
+DEPLOYMENT_WORDS = r"(?:deploy|deploying|deployed|deployment|deployments)"
+FAB_COMMAND_RE = re.compile(r"\bfab\s+(?:demo|beta|live)\b")
+FABRIC3_RE = re.compile(r"\bfabric\s*3\b")
+ENVIRONMENT_CONTEXT_RE = re.compile(
+    rf"\b{DEPLOYMENT_ENVIRONMENTS}\s+environment\b"
+    rf"|\benvironment\s+{DEPLOYMENT_ENVIRONMENTS}\b"
+)
+DEPLOYMENT_ENVIRONMENT_RE = re.compile(
+    rf"""
+    \b{DEPLOYMENT_WORDS}\b
+    (?:
+        \s+(?:the\s+)?{DEPLOYMENT_ENVIRONMENTS}\b
+        | [^.!?\n]*?\b(?:to|against|on|in|for)\s+(?:the\s+)?{DEPLOYMENT_ENVIRONMENTS}\b
+        | [^.!?\n]*?--env(?:=|\s+){DEPLOYMENT_ENVIRONMENTS}\b
+    )
+    |
+    \b{DEPLOYMENT_ENVIRONMENTS}\s+{DEPLOYMENT_WORDS}\b
+    """,
+    re.VERBOSE,
+)
+DEPLOYMENT_VERB_RE = re.compile(r"\b(?:deploy|deploying|deployed|deployment|deployments)\b")
+DEPLOYMENT_TARGET_RE = re.compile(
+    r"\b(?:next\.?js|django|angularjs)\b"
+    r"|\blegacy frontend\b"
+    r"|\b(?:web\.(?:rolling_update|quick_rolling_update|"
+    r"frontend\.deploy_nextjs(?:_workload)?|tasks\.rolling_update)|"
+    r"ingress\.rolling_update|monitoring\.rolling_update)\b"
+)
+DEPLOYMENT_TASK_RE = re.compile(
+    r"\b(?:web\.(?:rolling_update|quick_rolling_update|"
+    r"frontend\.deploy_nextjs(?:_workload)?|tasks\.rolling_update)|"
+    r"ingress\.rolling_update|monitoring\.rolling_update)\b"
 )
 
 
@@ -110,6 +145,21 @@ def _matched(text: str, signals: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(signal for signal in signals if _contains_signal(text, signal))
 
 
+def _special_infrastructure_signals(text: str) -> tuple[str, ...]:
+    signals: list[str] = []
+    if FAB_COMMAND_RE.search(text):
+        signals.append("fab environment command")
+    if FABRIC3_RE.search(text):
+        signals.append("fabric3")
+    if ENVIRONMENT_CONTEXT_RE.search(text):
+        signals.append("explicit environment")
+    if DEPLOYMENT_ENVIRONMENT_RE.search(text) or (
+        DEPLOYMENT_VERB_RE.search(text) and DEPLOYMENT_TARGET_RE.search(text)
+    ) or DEPLOYMENT_TASK_RE.search(text):
+        signals.append("deployment context")
+    return tuple(signals)
+
+
 def route_request(request: str) -> RouteDecision:
     normalized = " ".join(request.lower().split())
     if not normalized:
@@ -124,7 +174,12 @@ def route_request(request: str) -> RouteDecision:
         else ()
     )
     modern_frontend = explicit_modern_frontend + frontend_context
-    infrastructure = _matched(normalized, INFRA_SIGNALS)
+    infrastructure = tuple(
+        dict.fromkeys(
+            _matched(normalized, INFRA_SIGNALS)
+            + _special_infrastructure_signals(normalized)
+        )
+    )
 
     repositories: list[str] = []
     signals: list[str] = []

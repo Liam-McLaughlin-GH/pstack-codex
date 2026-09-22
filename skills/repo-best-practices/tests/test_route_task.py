@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -42,6 +44,54 @@ class RouteTaskTests(unittest.TestCase):
         decision = run_route("Change the Kubernetes ingress and HPA rollout in web-k8s")
         self.assertEqual(decision["category"], "infrastructure")
         self.assertEqual(decision["repositories"], ["web-k8s"])
+
+
+    def test_documented_fabric_forms_route_to_web_k8s(self) -> None:
+        for request in (
+            "fab beta",
+            "fab demo",
+            "fab live",
+            "fab beta web.rolling_update",
+            "fab demo web.frontend.deploy_nextjs",
+            "fab live web.rolling_update",
+            "Run Fabric3 against beta",
+            "Run Fabric 3 against beta",
+        ):
+            with self.subTest(request=request):
+                decision = run_route(request)
+                self.assertEqual(decision["category"], "infrastructure")
+                self.assertEqual(decision["repositories"], ["web-k8s"])
+
+
+    def test_deployment_context_routes_to_web_k8s(self) -> None:
+        for request in (
+            "Deploy to production",
+            "Production deploy",
+            "Deploying to live",
+            "Production deployment",
+            "Review production environment",
+            "Switch to beta environment",
+            "deployed test against beta",
+            "python -m tests deployed --env live",
+            "Run web.frontend.deploy_nextjs",
+        ):
+            with self.subTest(request=request):
+                decision = run_route(request)
+                self.assertEqual(decision["category"], "infrastructure")
+                self.assertEqual(decision["repositories"], ["web-k8s"])
+
+
+    def test_application_deployments_keep_application_and_infrastructure_owners(self) -> None:
+        expected = {
+            "Deploy the Next.js app to beta": ["showpass-frontend", "web-k8s"],
+            "Deploy the AngularJS bridge to beta": ["web-app", "web-k8s"],
+            "Deploy the Django service to beta": ["web-app", "web-k8s"],
+        }
+        for request, repositories in expected.items():
+            with self.subTest(request=request):
+                decision = run_route(request)
+                self.assertEqual(decision["category"], "mixed")
+                self.assertEqual(decision["repositories"], repositories)
 
 
     def test_mixed_request_preserves_flow_order(self) -> None:
@@ -96,6 +146,22 @@ class RouteTaskTests(unittest.TestCase):
                 decision = run_route(request)
                 self.assertEqual(decision["category"], category)
                 self.assertEqual(decision["repositories"], repositories)
+
+
+    def test_generic_angular_and_deployment_terms_fail_closed(self) -> None:
+        for request in (
+            "Fix angular momentum calculations",
+            "beta",
+            "demo",
+            "live",
+            "production",
+            "deploy",
+            "Deploy the app",
+        ):
+            with self.subTest(request=request):
+                decision = run_route(request)
+                self.assertEqual(decision["category"], "unknown")
+                self.assertEqual(decision["repositories"], [])
 
 
     def test_weak_terms_need_modern_context(self) -> None:
@@ -156,3 +222,38 @@ class RouteTaskTests(unittest.TestCase):
         self.assertGreaterEqual(len(local_links), 2)
         for link in local_links:
             self.assertTrue((SKILL_DIR / link).is_file(), link)
+
+    def test_installed_helper_runs_from_another_repository(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            code_home = temp_root / "codex-home"
+            installed_skill = code_home / "skills" / "repo-best-practices"
+            installed_skill.parent.mkdir(parents=True)
+            installed_skill.symlink_to(SKILL_DIR, target_is_directory=True)
+            target_repository = temp_root / "target-repository"
+            target_repository.mkdir()
+
+            environment = os.environ.copy()
+            environment["CODEX_HOME"] = str(code_home)
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(
+                        Path(environment["CODEX_HOME"])
+                        / "skills"
+                        / "repo-best-practices"
+                        / "scripts"
+                        / "route_task.py"
+                    ),
+                    "Add a Django serializer",
+                ],
+                check=True,
+                capture_output=True,
+                cwd=target_repository,
+                env=environment,
+                text=True,
+            )
+
+            decision = json.loads(result.stdout)
+            self.assertEqual(decision["category"], "backend")
+            self.assertEqual(decision["repositories"], ["web-app"])
