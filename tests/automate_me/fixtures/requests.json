@@ -5,7 +5,7 @@
     "artifact": "skill",
     "category": "personal-mode",
     "operation": "create",
-    "target": "skills/alex-mode/SKILL.md",
+    "target": "skills/alex-mode",
     "confirmation_required": false
   },
   {
@@ -14,7 +14,7 @@
     "artifact": "skill",
     "category": "personal-mode",
     "operation": "update",
-    "target": "skills/alex-mode/SKILL.md",
+    "target": "skills/alex-mode",
     "confirmation_required": false
   },
   {
@@ -23,7 +23,7 @@
     "artifact": "skill",
     "category": "project-skill",
     "operation": "create",
-    "target": "skills/checkout-verification/SKILL.md",
+    "target": "skills/checkout-verification",
     "confirmation_required": false
   },
   {
