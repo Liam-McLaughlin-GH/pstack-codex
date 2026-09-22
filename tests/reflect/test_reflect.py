@@ -713,9 +713,97 @@ class ReflectBehaviorTests(unittest.TestCase):
                 "arena",
             )
             self.assertEqual(arena.returncode, 0, arena.stderr)
+            self.assertIn('status="inconclusive"; comparison_owner="arena"', arena.stdout)
             self.assertIn('comparison_owner="arena"', arena.stdout)
             self.assertIn('comparison_route="skills/arena/SKILL.md"', arena.stdout)
             self.assertIn('selected_decision="none (arena result unavailable)"', arena.stdout)
+            self.assertIn(
+                'decision_reason="arena result was not supplied; candidate comparison is delegated to skills/arena/SKILL.md"',
+                arena.stdout,
+            )
+            accepted = arena.stdout.split("## Accepted", 1)[1].split("## Rejected", 1)[0]
+            self.assertEqual(accepted.strip(), "- None.")
+
+    def test_equal_declared_scores_do_not_use_metadata_tie_breakers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "fixture-workspace"
+            workspace.mkdir()
+            transcript = self.write_jsonl(
+                workspace,
+                "decision.jsonl",
+                [
+                    {
+                        "id": "decision-1",
+                        "timestamp": "2026-01-15T10:00:00Z",
+                        "workspace": workspace.name,
+                        "topic": "payments",
+                        "state": "in_progress",
+                        "claim": "Still working.",
+                    },
+                    {
+                        "id": "decision-2",
+                        "timestamp": "2026-01-15T10:01:00Z",
+                        "workspace": workspace.name,
+                        "topic": "payments",
+                        "state": "in_progress",
+                        "claim": "Still working with a second source.",
+                    },
+                ],
+            )
+
+            def finding(finding_id: str, proposal: str, evidence: list[str]) -> dict[str, object]:
+                return {
+                    "id": finding_id,
+                    "problem": "Choose one bounded implementation.",
+                    "proposal": proposal,
+                    "routing": "skills/why/SKILL.md",
+                    "evidence": evidence,
+                    "enforcement": "judgment",
+                    "criteria": {name: 1 for name in ("durability", "specificity", "decision_changing", "evidence", "routing")},
+                }
+
+            candidate_a_evidence = ["decision-1", "decision-2"]
+            candidate_b_evidence = ["decision-1"]
+            judgment = self.write_packet(
+                workspace,
+                "judgment",
+                [finding(f"a-{index}", "Use candidate A.", candidate_a_evidence) for index in range(1, 4)],
+                agent_id="agent-a",
+                model="gpt-5.6",
+            )
+            tooling = self.write_packet(
+                workspace,
+                "tooling",
+                [finding(f"b-{index}", "Use candidate B.", candidate_b_evidence) for index in range(1, 4)],
+                agent_id="agent-b",
+                model="gpt-5.6",
+            )
+            divergent = self.write_packet(
+                workspace,
+                "divergent",
+                [finding(f"a-{index}", "Use candidate A.", candidate_a_evidence) for index in range(4, 7)],
+                agent_id="agent-c",
+                model="gpt-5.6",
+            )
+
+            result = run_helper(
+                workspace,
+                *self.command_args(workspace, transcript, [judgment, tooling, divergent]),
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('status="inconclusive"', result.stdout)
+            self.assertIn('selected_decision="none (inconclusive)"', result.stdout)
+            self.assertIn(
+                '"a-1":{"durability":1,"specificity":1,"decision_changing":1,"evidence":1,"routing":1,"rank":5}',
+                result.stdout,
+            )
+            self.assertIn(
+                '"b-1":{"durability":1,"specificity":1,"decision_changing":1,"evidence":1,"routing":1,"rank":5}',
+                result.stdout,
+            )
+            accepted = result.stdout.split("## Accepted", 1)[1].split("## Rejected", 1)[0]
+            self.assertEqual(accepted.strip(), "- None.")
 
     def test_structural_enforcement_survives_deduplication(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -960,15 +960,13 @@ def merge_criteria(current: dict[str, int | None], incoming: dict[str, int | Non
     return merged
 
 
-def score_candidate(item: dict[str, Any]) -> tuple[dict[str, int | None], tuple[int, int, int, int]]:
+def score_candidate(item: dict[str, Any]) -> tuple[dict[str, int | None], int]:
     criteria = dict(item["criteria"])
     if criteria["evidence"] is None:
         criteria["evidence"] = 2 if item["evidence"] else 0
     if criteria["routing"] is None:
         criteria["routing"] = 2
-    known = sum(value is not None for value in criteria.values())
-    total = sum(value or 0 for value in criteria.values())
-    rank = (total, known, len(item["evidence"]), len(item["lenses"]))
+    rank = sum(criteria[name] or 0 for name in SHARED_CRITERIA)
     return criteria, rank
 
 
@@ -1175,8 +1173,14 @@ def synthesize(
         return empty
 
     if comparison_owner == "arena":
+        synthesis_status = "inconclusive"
+        empty["status"] = synthesis_status
+        base_trail["status"] = synthesis_status
         base_trail["selected_decision"] = "none (arena result unavailable)"
-        base_trail["reason"] = "candidate comparison is delegated to the allowlisted arena route"
+        base_trail["reason"] = (
+            "arena result was not supplied; candidate comparison is delegated to "
+            "skills/arena/SKILL.md"
+        )
         return empty
 
     record_ids = {decision.record_id for decision in decisions}
