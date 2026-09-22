@@ -27,7 +27,7 @@ The helper is a keyword hint. Exact source paths, symbols, and current repositor
 
 Do not infer ownership from a ticket label, API prefix, package name, or a neighboring repository. Read the current root guidance and the smallest relevant architecture/domain document when the helper is insufficient.
 
-Explicit legacy terms take precedence over generic `frontend` or `client` wording. A request that names AngularJS, a Django template, the legacy bridge, Gulp, or `apps/main/static` stays in `web-app`; it becomes `mixed` only when it also names a distinct modern signal such as React or Next.js. Generic `page`, `route`, `template`, and `repository` terms need the surrounding Django or modern-client context before they select an owner.
+Explicit legacy terms take precedence over generic `frontend` or `client` wording. Generic `frontend` and `client` terms are not modern-owner evidence by themselves: modern routing requires a distinct React, Next.js, mobile, desktop, or named modern-frontend signal. A request that names AngularJS, a Django template, the legacy bridge, Gulp, or `apps/main/static` stays in `web-app`; it becomes `mixed` only when it also names a distinct modern signal. Generic `page`, `route`, `template`, and `repository` terms need the surrounding Django or modern-client context before they select an owner.
 
 ## Trace the request flow
 

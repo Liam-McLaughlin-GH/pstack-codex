@@ -83,6 +83,21 @@ class RouteTaskTests(unittest.TestCase):
                 self.assertEqual(decision["repositories"], ["web-app"])
 
 
+    def test_generic_frontend_and_client_terms_fail_closed(self) -> None:
+        expected = {
+            "Fix the client timeout": ("unknown", []),
+            "Update the frontend page": ("unknown", []),
+            "Update the frontend route": ("unknown", []),
+            "Fix a database client timeout": ("backend", ["web-app"]),
+            "Fix a client permission check": ("backend", ["web-app"]),
+        }
+        for request, (category, repositories) in expected.items():
+            with self.subTest(request=request):
+                decision = run_route(request)
+                self.assertEqual(decision["category"], category)
+                self.assertEqual(decision["repositories"], repositories)
+
+
     def test_weak_terms_need_modern_context(self) -> None:
         for request in ("Review repository setup", "Update a page", "Update a route", "Edit a template"):
             with self.subTest(request=request):

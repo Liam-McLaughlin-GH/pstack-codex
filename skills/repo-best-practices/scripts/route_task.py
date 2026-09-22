@@ -45,11 +45,6 @@ MODERN_FRONTEND_SIGNALS = (
     "showpass-frontend",
 )
 
-GENERIC_FRONTEND_SIGNALS = (
-    "frontend",
-    "client",
-)
-
 FRONTEND_CONTEXT_SIGNALS = (
     "repository",
     "service hook",
@@ -123,15 +118,12 @@ def route_request(request: str) -> RouteDecision:
     backend = _matched(normalized, BACKEND_SIGNALS)
     legacy_frontend = _matched(normalized, LEGACY_FRONTEND_SIGNALS)
     explicit_modern_frontend = _matched(normalized, MODERN_FRONTEND_SIGNALS)
-    generic_modern_frontend = _matched(normalized, GENERIC_FRONTEND_SIGNALS)
-    if legacy_frontend and not explicit_modern_frontend:
-        generic_modern_frontend = ()
     frontend_context = (
         _matched(normalized, FRONTEND_CONTEXT_SIGNALS)
-        if explicit_modern_frontend or generic_modern_frontend
+        if explicit_modern_frontend
         else ()
     )
-    modern_frontend = explicit_modern_frontend + generic_modern_frontend + frontend_context
+    modern_frontend = explicit_modern_frontend + frontend_context
     infrastructure = _matched(normalized, INFRA_SIGNALS)
 
     repositories: list[str] = []
