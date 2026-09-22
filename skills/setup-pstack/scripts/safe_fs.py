@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import errno
+import ctypes
 import fcntl
 import os
 import secrets
 import stat
+import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -229,6 +231,60 @@ def unique_entry_name(parent_fd: int, prefix: str) -> str:
         except FileNotFoundError:
             return name
     raise SafeFilesystemError(f"could not allocate a temporary name in {parent_fd}")
+
+
+def _native_rename(old_dir_fd: int, old_name: str, new_dir_fd: int, new_name: str, flags: int) -> bool:
+    """Call the platform no-replace/exchange primitive when it exists."""
+
+    function_name: str
+    if sys.platform == "darwin":
+        function_name = "renameatx_np"
+    elif sys.platform.startswith("linux"):
+        function_name = "renameat2"
+    else:
+        return False
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        function = getattr(libc, function_name)
+    except AttributeError:
+        return False
+
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    result = function(
+        old_dir_fd,
+        os.fsencode(old_name),
+        new_dir_fd,
+        os.fsencode(new_name),
+        flags,
+    )
+    if result == 0:
+        return True
+    error_number = ctypes.get_errno()
+    if error_number in {errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EINVAL}:
+        return False
+    raise OSError(error_number, os.strerror(error_number), old_name, new_name)
+
+
+def atomic_exchange_at(directory_fd: int, first_name: str, second_name: str) -> None:
+    """Atomically exchange two sibling entries, or fail closed."""
+
+    # macOS renameatx_np uses RENAME_SWAP; Linux renameat2 uses
+    # RENAME_EXCHANGE. Both values are stable kernel ABI constants.
+    flags = 0x00000002
+    if not _native_rename(directory_fd, first_name, directory_fd, second_name, flags):
+        raise SafeFilesystemError("the platform has no atomic directory-exchange primitive")
+
+
+def atomic_rename_noreplace_at(directory_fd: int, source_name: str, target_name: str) -> None:
+    """Rename a sibling without replacing a target that appeared meanwhile."""
+
+    # macOS renameatx_np uses RENAME_EXCL; Linux renameat2 uses
+    # RENAME_NOREPLACE.
+    flags = 0x00000004 if sys.platform == "darwin" else 0x00000001
+    if not _native_rename(directory_fd, source_name, directory_fd, target_name, flags):
+        raise SafeFilesystemError("the platform has no atomic no-replace rename primitive")
 
 
 def ensure_relative_directory(root_fd: int, relative: str) -> int:

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -21,6 +22,8 @@ if str(SCRIPT_DIRECTORY) not in sys.path:
 
 from safe_fs import (  # noqa: E402
     SafeFilesystemError,
+    atomic_exchange_at,
+    atomic_rename_noreplace_at,
     TreeSnapshot,
     canonical_path,
     cleanup_created_directories,
@@ -41,6 +44,22 @@ from safe_fs import (  # noqa: E402
 
 EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4, "ultra": 5}
 BUDGET_TARGET = {"small": "medium", "medium": "high", "large": "xhigh", "unlimited": "max"}
+
+
+def _cleanup_retry_hint(residue: Path) -> str:
+    return shlex.join(
+        (
+            sys.executable,
+            str(SCRIPT_DIRECTORY / "configure.py"),
+            "cleanup",
+            "--residue",
+            str(residue),
+        )
+    )
+
+
+def _recovery_hint(root: Path, residue: Path) -> str:
+    return f"inspect {root} and {residue}, then rerun preview before cleanup"
 
 
 class ConfigurationError(RuntimeError):
@@ -70,6 +89,7 @@ class AgentPlan:
     model: str | None
     effort: str | None
     status: str
+    expected_content: bytes | None = None
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -80,6 +100,23 @@ class AgentPlan:
             "effort": self.effort,
             "status": self.status,
         }
+
+
+@dataclass(frozen=True)
+class TransactionOutcome:
+    """Describe the durable state after an apply or cleanup attempt."""
+
+    status: str
+    residue: Path | None = None
+    retry: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {"status": self.status}
+        if self.residue is not None:
+            result["residue"] = str(self.residue)
+        if self.retry is not None:
+            result["retry"] = self.retry
+        return result
 
 
 ROLE_SPECS = (
@@ -421,7 +458,7 @@ def build_plan(
             path = agents_root / f"{name}.toml"
             raw = contents.get(path.name)
             status = "create" if raw is None else "unchanged" if raw.decode("utf-8") == content else "update"
-            plan.append(AgentPlan(spec.role, name, path, content, selected_model, effort, status))
+            plan.append(AgentPlan(spec.role, name, path, content, selected_model, effort, status, raw))
     return plan
 
 
@@ -441,6 +478,10 @@ def _validate_plan_snapshot(plan: list[AgentPlan], agents_root: Path, snapshot: 
             raise ConfigurationError(f"agent appeared during configuration: {item.path}")
         if item.status == "update" and not exists:
             raise ConfigurationError(f"agent disappeared during configuration: {item.path}")
+        if item.expected_content is not None and snapshot.files.get(name) != item.expected_content:
+            raise ConfigurationError(
+                f"agent changed after preview; rebuild and review the plan before replacing: {item.path}"
+            )
 
 
 def _open_agents_root_at(parent_fd: int, name: str) -> tuple[int | None, TreeSnapshot, os.stat_result | None]:
@@ -462,51 +503,179 @@ def _open_agents_root_at(parent_fd: int, name: str) -> tuple[int | None, TreeSna
     return root_fd, snapshot, metadata
 
 
+def _same_entry(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _restore_backup_if_root_absent(parent_fd: int, root_name: str, backup_name: str) -> bool:
+    try:
+        lstat_at(parent_fd, root_name)
+    except FileNotFoundError:
+        os.rename(backup_name, root_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        return True
+    return False
+
+
+def _publish_generation_with_recovery(
+    parent_fd: int,
+    parent_path: Path,
+    root_name: str,
+    staging_name: str,
+    root_metadata: os.stat_result,
+) -> TransactionOutcome:
+    """Fallback for platforms without an atomic directory exchange primitive."""
+
+    backup_name = unique_entry_name(parent_fd, ".pstack-agents-old-")
+    root_moved = False
+    try:
+        current = lstat_at(parent_fd, root_name)
+        if not _same_entry(current, root_metadata):
+            raise ConfigurationError("agents root changed during configuration")
+        os.rename(root_name, backup_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        root_moved = True
+        moved = lstat_at(parent_fd, backup_name)
+        if not _same_entry(moved, root_metadata):
+            restored = _restore_backup_if_root_absent(parent_fd, root_name, backup_name)
+            root_moved = not restored
+            raise ConfigurationError(
+                f"agents root was replaced during publication; preserved replacement at "
+                f"{parent_path / backup_name}"
+            )
+
+        try:
+            atomic_rename_noreplace_at(parent_fd, staging_name, root_name)
+        except BaseException:
+            if not _restore_backup_if_root_absent(parent_fd, root_name, backup_name):
+                root_moved = True
+                raise ConfigurationError(
+                    f"agents root appeared during publication; preserved old generation at "
+                    f"{parent_path / backup_name}"
+                )
+            root_moved = False
+            raise
+        root_moved = False
+        try:
+            remove_tree_at(parent_fd, backup_name)
+        except (OSError, SafeFilesystemError) as exc:
+            residue = parent_path / backup_name
+            return TransactionOutcome("published_cleanup_pending", residue, _cleanup_retry_hint(residue))
+        return TransactionOutcome("published")
+    finally:
+        if root_moved:
+            try:
+                if _restore_backup_if_root_absent(parent_fd, root_name, backup_name):
+                    root_moved = False
+            except OSError:
+                # Keep the backup in place. The caller's error names it so a
+                # later explicit cleanup/recovery attempt cannot miss it.
+                pass
+
+
 def _publish_generation(
     parent_fd: int,
+    parent_path: Path,
     root_name: str,
     staging_name: str,
     root_metadata: os.stat_result | None,
-) -> None:
-    backup_name: str | None = None
-    root_moved = False
-    try:
-        if root_metadata is not None:
-            current = lstat_at(parent_fd, root_name)
-            if (current.st_dev, current.st_ino) != (root_metadata.st_dev, root_metadata.st_ino):
-                raise ConfigurationError("agents root changed during configuration")
-            backup_name = unique_entry_name(parent_fd, ".pstack-agents-old-")
-            os.rename(root_name, backup_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-            root_moved = True
-        else:
-            try:
-                lstat_at(parent_fd, root_name)
-            except FileNotFoundError:
-                pass
-            else:
-                raise ConfigurationError(f"agents root appeared during configuration: {root_name}")
+) -> TransactionOutcome:
+    if root_metadata is None:
         try:
-            os.rename(staging_name, root_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-        except BaseException:
-            if root_moved and backup_name is not None:
-                os.rename(backup_name, root_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
-                root_moved = False
+            atomic_rename_noreplace_at(parent_fd, staging_name, root_name)
+        except FileExistsError as exc:
+            raise ConfigurationError(f"agents root appeared during configuration: {root_name}") from exc
+        return TransactionOutcome("published")
+
+    residue = parent_path / staging_name
+    staged_metadata = lstat_at(parent_fd, staging_name)
+    try:
+        atomic_exchange_at(parent_fd, root_name, staging_name)
+    except (OSError, SafeFilesystemError) as exc:
+        try:
+            current_root = lstat_at(parent_fd, root_name)
+            current_staging = lstat_at(parent_fd, staging_name)
+        except OSError:
+            return TransactionOutcome(
+                "publication_recovery_pending",
+                residue,
+                _recovery_hint(parent_path / root_name, residue),
+            )
+        exchanged = _same_entry(current_root, staged_metadata) and _same_entry(current_staging, root_metadata)
+        unchanged = _same_entry(current_root, root_metadata) and _same_entry(current_staging, staged_metadata)
+        if exchanged:
+            pass
+        elif unchanged and isinstance(exc, SafeFilesystemError):
+            return _publish_generation_with_recovery(parent_fd, parent_path, root_name, staging_name, root_metadata)
+        elif unchanged:
             raise
-        staging_name = ""
-        if backup_name is not None:
+        else:
+            return TransactionOutcome(
+                "publication_recovery_pending",
+                residue,
+                _recovery_hint(parent_path / root_name, residue),
+            )
+    exchanged_old = lstat_at(parent_fd, staging_name)
+    if not _same_entry(exchanged_old, root_metadata):
+        # The root entry changed after the initial check. If the root still
+        # points at our staged generation, exchange back so the replacement
+        # remains the live root instead of becoming cleanup residue.
+        current_root = lstat_at(parent_fd, root_name)
+        if _same_entry(current_root, staged_metadata):
             try:
-                remove_tree_at(parent_fd, backup_name)
-            except OSError as exc:
-                raise ConfigurationError(f"configuration published but old generation cleanup failed: {exc}") from exc
-    finally:
-        if root_moved and backup_name is not None:
+                atomic_exchange_at(parent_fd, root_name, staging_name)
+            except (OSError, SafeFilesystemError) as exc:
+                raise ConfigurationError(
+                    f"agents root was replaced during publication; generated root remains at "
+                    f"{parent_path / root_name} and replacement residue is {parent_path / staging_name}"
+                ) from exc
+        raise ConfigurationError(
+            f"agents root was replaced during publication; preserved replacement at "
+            f"{parent_path / root_name}"
+        )
+
+    try:
+        current_root = lstat_at(parent_fd, root_name)
+    except FileNotFoundError:
+        return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue))
+    if not _same_entry(current_root, staged_metadata):
+        return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue))
+
+    try:
+        remove_tree_at(parent_fd, staging_name)
+    except (OSError, SafeFilesystemError):
+        return TransactionOutcome("published_cleanup_pending", residue, _cleanup_retry_hint(residue))
+    return TransactionOutcome("published")
+
+
+def _cleanup_residue(residue: Path) -> TransactionOutcome:
+    residue = canonical_path(residue)
+    if not residue.name.startswith(".pstack-agents-"):
+        raise ConfigurationError(f"refusing to clean an unrecognized transaction residue: {residue}")
+    try:
+        parent_handle = open_directory(residue.parent)
+    except (OSError, SafeFilesystemError) as exc:
+        raise ConfigurationError(f"could not open residue parent safely: {residue.parent}: {exc}") from exc
+    try:
+        with directory_lock(parent_handle.fd):
             try:
-                lstat_at(parent_fd, root_name)
+                metadata = lstat_at(parent_handle.fd, residue.name)
             except FileNotFoundError:
-                os.rename(backup_name, root_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                return TransactionOutcome("cleanup_already_complete")
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise ConfigurationError(f"transaction residue is not a real directory: {residue}")
+            try:
+                remove_tree_at(parent_handle.fd, residue.name)
+            except (OSError, SafeFilesystemError) as exc:
+                raise ConfigurationError(
+                    f"cleanup failed; residue is preserved at {residue}. Retry with {_cleanup_retry_hint(residue)}: {exc}"
+                ) from exc
+            sync_directory(parent_handle.fd)
+            return TransactionOutcome("cleanup_complete")
+    finally:
+        close_created_directories(parent_handle.created)
+        os.close(parent_handle.fd)
 
 
-def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool = False) -> None:
+def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool = False) -> TransactionOutcome:
     conflicts = [item.path for item in plan if item.status == "update"]
     if conflicts and not allow_replace:
         joined = ", ".join(str(path) for path in conflicts)
@@ -514,13 +683,15 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
     agents_root = canonical_path(agents_root)
     changed = [item for item in plan if item.status in {"create", "update"}]
     if not changed:
-        return
+        return TransactionOutcome("unchanged")
 
     parent_handle = open_directory(agents_root.parent, create=True)
     staging_name: str | None = None
     staging_fd: int | None = None
     root_fd: int | None = None
     completed = False
+    primary_error: BaseException | None = None
+    outcome: TransactionOutcome | None = None
     try:
         with directory_lock(parent_handle.fd):
             root_fd, current_snapshot, root_metadata = _open_agents_root_at(parent_handle.fd, agents_root.name)
@@ -539,34 +710,58 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
                 sync_directory(staging_fd)
                 os.close(staging_fd)
                 staging_fd = None
-                _publish_generation(parent_handle.fd, agents_root.name, staging_name, root_metadata)
+                outcome = _publish_generation(
+                    parent_handle.fd,
+                    parent_handle.path,
+                    agents_root.name,
+                    staging_name,
+                    root_metadata,
+                )
                 staging_name = None
                 sync_directory(parent_handle.fd)
                 completed = True
+                return outcome
             finally:
                 if root_fd is not None:
                     os.close(root_fd)
                     root_fd = None
-    except ConfigurationError:
+    except BaseException as exc:
+        primary_error = exc
+        if isinstance(exc, ConfigurationError):
+            raise
+        if isinstance(exc, (OSError, SafeFilesystemError)):
+            raise ConfigurationError(f"configuration failed and was rolled back: {exc}") from exc
         raise
-    except (OSError, SafeFilesystemError) as exc:
-        raise ConfigurationError(f"configuration failed and was rolled back: {exc}") from exc
     finally:
+        cleanup_errors: list[str] = []
         if staging_fd is not None:
             os.close(staging_fd)
         if staging_name is not None:
             try:
                 remove_tree_at(parent_handle.fd, staging_name)
-            except OSError:
-                pass
+            except (OSError, SafeFilesystemError) as exc:
+                cleanup_errors.append(f"staging residue {parent_handle.path / staging_name}: {exc}")
         if not completed:
             try:
                 cleanup_created_directories(parent_handle.created)
-            except OSError:
-                pass
+            except OSError as exc:
+                cleanup_errors.append(f"created parent cleanup: {exc}")
+                close_created_directories(parent_handle.created)
         else:
             close_created_directories(parent_handle.created)
         os.close(parent_handle.fd)
+        if cleanup_errors:
+            detail = "; ".join(cleanup_errors)
+            retry = next(
+                (part.split(":", 1)[0].removeprefix("staging residue ") for part in cleanup_errors if part.startswith("staging residue ")),
+                None,
+            )
+            message = f"configuration cleanup is incomplete: {detail}"
+            if retry:
+                message += f". Retry with {_cleanup_retry_hint(Path(retry))}"
+            if primary_error is not None:
+                raise ConfigurationError(f"{primary_error}; {message}") from primary_error
+            raise ConfigurationError(message)
 
 
 def _self_test() -> None:
@@ -626,6 +821,9 @@ def _parser() -> argparse.ArgumentParser:
         command_parser = subparsers.add_parser(command)
         _common(command_parser)
     subparsers.add_parser("self-test", help="exercise model selection and config writes in a temporary directory")
+    cleanup = subparsers.add_parser("cleanup", help="retry removal of a reported transaction residue")
+    cleanup.add_argument("--residue", type=Path, required=True, help="residue path reported by an apply")
+    cleanup.add_argument("--json", action="store_true")
     return parser
 
 
@@ -634,6 +832,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "self-test":
             _self_test()
+            return 0
+        if args.command == "cleanup":
+            outcome = _cleanup_residue(args.residue)
+            print(json.dumps(outcome.as_dict(), indent=2 if args.json else None, sort_keys=True))
             return 0
         if args.command == "discover":
             result = discover_models(args.codex, bundled=args.bundled, include_hidden=args.include_hidden)
@@ -647,11 +849,14 @@ def main(argv: list[str] | None = None) -> int:
             default_model=args.default_model,
             role_values=args.role,
         )
+        outcome = None
         if args.command == "apply":
-            apply_plan(plan, args.agents_root, allow_replace=args.replace)
+            outcome = apply_plan(plan, args.agents_root, allow_replace=args.replace)
         elif args.replace:
             raise ConfigurationError("--replace is only valid with apply")
         result = {"action": args.command, "agents": [item.as_dict() for item in plan]}
+        if outcome is not None:
+            result["transaction"] = outcome.as_dict()
         print(json.dumps(result, indent=2 if args.json else None, sort_keys=True))
         return 0
     except (ConfigurationError, OSError, SafeFilesystemError) as exc:

@@ -62,7 +62,7 @@ The upstream agent and runtime pieces are also not ported.
 
 - `agents/poteto-agent.md` is not converted to a Codex agent configuration.
 - `agents/comment-sicko.md` is not converted to a Codex agent configuration.
-- The 20 pstack scripts are not copied. This includes the PR watcher, worktree audit, plan checker, and orchestration helper.
+- The 21 pstack scripts are not copied. This includes the PR watcher, worktree audit, plan checker, and orchestration helper.
 - `automations/benny/` is not copied. It is a Cursor automation pack with Cursor UI adapters.
 - Cursor model names and model-specific routing are not preserved.
 - Cursor transcript paths under `~/.cursor/projects/.../agent-transcripts` are not preserved.
@@ -85,6 +85,8 @@ The port keeps user-facing workflow names stable where that helps muscle memory.
 
 This repo is the source tree. It is not linked into Codex automatically.
 
+Codex discovers project skills from `.agents/skills`. It discovers user skills from `${CODEX_HOME:-$HOME/.codex}/skills`; user custom agents use the matching `${CODEX_HOME:-$HOME/.codex}/agents` directory. Set `CODEX_HOME` before activation when you need an isolated user discovery root. Project custom agents remain in `.codex/agents`.
+
 Review the port first.
 
 ```sh
@@ -95,18 +97,20 @@ git status --short
 
 When you are ready to activate it, link the skill folders into your local Codex skill directory after checking for name collisions.
 
-The repository remains the source of truth. The entries under `~/.codex/skills` are only discoverability links for the local Codex runtime.
+The repository remains the source of truth. The entries under `${CODEX_HOME:-$HOME/.codex}/skills` are only discoverability links for the local Codex runtime.
 
 ```sh
 REPO=/Users/liammclaughlin/PycharmProjects/pstack-codex
-mkdir -p "$HOME/.codex/skills"
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+CODEX_SKILLS="$CODEX_HOME/skills"
+mkdir -p "$CODEX_SKILLS"
 for skill_dir in "$REPO"/skills/*; do
   skill_name=$(basename "$skill_dir")
-  [ -e "$HOME/.codex/skills/$skill_name" ] && {
+  [ -e "$CODEX_SKILLS/$skill_name" ] || [ -L "$CODEX_SKILLS/$skill_name" ] && {
     printf 'Skipping existing skill %s\n' "$skill_name"
     continue
   }
-  ln -s "$skill_dir" "$HOME/.codex/skills/$skill_name"
+  ln -s "$skill_dir" "$CODEX_SKILLS/$skill_name"
 done
 ```
 

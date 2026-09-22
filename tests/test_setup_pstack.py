@@ -319,11 +319,11 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             module.apply_plan(initial, agents)
             replacement = module.build_plan(models, agents, budget="large")
             observed: list[tuple[str, int]] = []
-            original_rename = module.os.rename
+            original_exchange = module.atomic_exchange_at
 
-            def observe_publication(source: Path, target: Path, **kwargs: object) -> None:
-                original_rename(source, target, **kwargs)
-                if target == agents.name or str(target).startswith(".pstack-agents-old-"):
+            def observe_publication(parent_fd: int, first_name: str, second_name: str) -> None:
+                original_exchange(parent_fd, first_name, second_name)
+                if first_name == agents.name:
                     files = list(agents.glob("pstack-*.toml")) if agents.exists() else []
                     efforts = {
                         path.read_text(encoding="utf-8").count('model_reasoning_effort = "xhigh"')
@@ -331,15 +331,84 @@ class SetupPstackBehaviorTests(unittest.TestCase):
                     }
                     observed.append(("present" if files else "absent", len(files) if efforts else 0))
 
-            module.os.rename = observe_publication
+            module.atomic_exchange_at = observe_publication
             try:
                 module.apply_plan(replacement, agents, allow_replace=True)
             finally:
-                module.os.rename = original_rename
-            self.assertIn(("absent", 0), observed)
+                module.atomic_exchange_at = original_exchange
             self.assertIn(("present", 30), observed)
             self.assertNotIn(("present", 1), observed)
+            self.assertNotIn(("absent", 0), observed)
             self.assertEqual(list(agents.parent.glob(".pstack-agents-old-*")), [])
+
+            raced_agents = requested / ".codex" / "agents-race"
+            initial = module.build_plan(models, raced_agents, budget="medium", default_model="codex-test")
+            module.apply_plan(initial, raced_agents)
+            raced_replacement = module.build_plan(models, raced_agents, budget="large")
+            raced_replacement_root = root / "raced-replacement"
+            raced_replacement_root.mkdir()
+            (raced_replacement_root / "operator.txt").write_text("keep me\n", encoding="utf-8")
+            original_exchange = module.atomic_exchange_at
+            switched = False
+
+            def replace_root_before_exchange(parent_fd: int, first_name: str, second_name: str) -> None:
+                nonlocal switched
+                if not switched and first_name == raced_agents.name:
+                    switched = True
+                    os.rename(raced_agents, root / "raced-original")
+                    os.rename(raced_replacement_root, raced_agents)
+                original_exchange(parent_fd, first_name, second_name)
+
+            module.atomic_exchange_at = replace_root_before_exchange
+            try:
+                with self.assertRaises(module.ConfigurationError):
+                    module.apply_plan(raced_replacement, raced_agents, allow_replace=True)
+            finally:
+                module.atomic_exchange_at = original_exchange
+            self.assertEqual((raced_agents / "operator.txt").read_text(encoding="utf-8"), "keep me\n")
+            self.assertFalse((raced_agents / "pstack-feature.toml").exists())
+
+    def test_configuration_rejects_stale_preview_and_reports_cleanup_residue(self) -> None:
+        module = load_module(CONFIGURER, "configure_for_transaction_test")
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-config-transaction-test-") as temporary:
+            root = Path(temporary)
+            models = {"codex-test": module.Model("codex-test", ("low", "medium", "high", "xhigh"))}
+            agents = root / ".codex" / "agents"
+            initial = module.build_plan(models, agents, budget="medium", default_model="codex-test")
+            module.apply_plan(initial, agents)
+
+            stale = module.build_plan(models, agents, budget="large")
+            feature = agents / "pstack-feature.toml"
+            feature.write_bytes(feature.read_bytes() + b"# external edit\n")
+            with self.assertRaises(module.ConfigurationError):
+                module.apply_plan(stale, agents, allow_replace=True)
+            self.assertIn("# external edit\n", feature.read_text(encoding="utf-8"))
+
+            fresh = module.build_plan(models, agents, budget="large")
+            original_remove = module.remove_tree_at
+            failed = False
+
+            def fail_cleanup(parent_fd: int, name: str) -> None:
+                nonlocal failed
+                if not failed and name.startswith(".pstack-agents-"):
+                    failed = True
+                    raise OSError("injected old-generation cleanup failure")
+                original_remove(parent_fd, name)
+
+            module.remove_tree_at = fail_cleanup
+            try:
+                outcome = module.apply_plan(fresh, agents, allow_replace=True)
+            finally:
+                module.remove_tree_at = original_remove
+            self.assertEqual(outcome.status, "published_cleanup_pending")
+            self.assertIsNotNone(outcome.residue)
+            self.assertTrue(outcome.residue.is_dir())
+            self.assertIn('model_reasoning_effort = "xhigh"', (agents / "pstack-feature.toml").read_text(encoding="utf-8"))
+
+            cleanup = run_script(CONFIGURER, "cleanup", "--residue", str(outcome.residue), "--json")
+            self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
+            self.assertEqual(json.loads(cleanup.stdout)["status"], "cleanup_complete")
+            self.assertFalse(outcome.residue.exists())
 
     def test_configuration_updates_budget_and_default_without_losing_reviewed_choices(self) -> None:
         with tempfile.TemporaryDirectory(prefix="setup-pstack-config-cli-test-") as temporary:
@@ -375,6 +444,7 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             result = json.loads(applied.stdout)
             self.assertTrue(result["agents"])
             self.assertEqual({item["effort"] for item in result["agents"]}, {"high"})
+            self.assertEqual(result["transaction"]["status"], "published")
             self.assertIn('model = "codex-test"', (agents / "pstack-feature.toml").read_text(encoding="utf-8"))
             unrelated = agents / "operator-notes.txt"
             unrelated.parent.mkdir(parents=True, exist_ok=True)
@@ -592,23 +662,30 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             replacement = module.build_plan(models, agents, budget="large")
             self.assertTrue(all(item.status == "update" for item in replacement))
 
-            original_rename = module.os.rename
-            calls = 0
+            original_exchange = module.atomic_exchange_at
 
-            def fail_on_second_publish(source: Path, target: Path, **kwargs: object) -> None:
-                nonlocal calls
-                calls += 1
-                if calls == 2:
-                    raise OSError("injected publish failure")
-                original_rename(source, target, **kwargs)
+            def fail_publication(parent_fd: int, first_name: str, second_name: str) -> None:
+                raise OSError("injected publish failure")
 
-            module.os.rename = fail_on_second_publish
+            module.atomic_exchange_at = fail_publication
             try:
                 with self.assertRaises(module.ConfigurationError):
                     module.apply_plan(replacement, agents, allow_replace=True)
             finally:
-                module.os.rename = original_rename
+                module.atomic_exchange_at = original_exchange
             self.assertEqual({path.name: path.read_bytes() for path in agents.glob("pstack-*.toml")}, before)
+
+            def fail_after_exchange(parent_fd: int, first_name: str, second_name: str) -> None:
+                original_exchange(parent_fd, first_name, second_name)
+                raise OSError("injected post-exchange reporting failure")
+
+            module.atomic_exchange_at = fail_after_exchange
+            try:
+                outcome = module.apply_plan(replacement, agents, allow_replace=True)
+            finally:
+                module.atomic_exchange_at = original_exchange
+            self.assertEqual(outcome.status, "published")
+            self.assertIn('model_reasoning_effort = "xhigh"', (agents / "pstack-feature.toml").read_text(encoding="utf-8"))
 
     def test_verifier_allows_documented_unsupported_boundary_and_rejects_active_seam(self) -> None:
         with tempfile.TemporaryDirectory(prefix="setup-pstack-verifier-test-") as temporary:
@@ -655,6 +732,27 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertTrue(any("invalid frontmatter" in error for error in malformed_frontmatter_errors))
 
             skill_file.write_text(
+                "---\nname: fixture\ndescription: foo: bar\n---\n",
+                encoding="utf-8",
+            )
+            malformed_scalar_errors = module.verify_port(root, run_helpers=False)
+            self.assertTrue(any("mapping syntax" in error for error in malformed_scalar_errors))
+
+            skill_file.write_text(
+                "---\nname: fixture\ndescription: |\n---\n",
+                encoding="utf-8",
+            )
+            block_scalar_errors = module.verify_port(root, run_helpers=False)
+            self.assertTrue(any("not a supported scalar" in error for error in block_scalar_errors))
+
+            skill_file.write_text(
+                "---\nname: fixture\ndescription: true\n---\n",
+                encoding="utf-8",
+            )
+            typed_scalar_errors = module.verify_port(root, run_helpers=False)
+            self.assertTrue(any("not a string scalar" in error for error in typed_scalar_errors))
+
+            skill_file.write_text(
                 "---\nname: fixture\ndescription: fixture\n---\n\nWrite ~/.cursor/rules/pstack-models.mdc.\n",
                 encoding="utf-8",
             )
@@ -682,6 +780,20 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertTrue(any("empty destination" in error for error in empty_link_errors))
 
             skill_file.write_text(
+                "---\nname: fixture\ndescription: fixture\n---\n\n[bad](<reference.md>junk)\n",
+                encoding="utf-8",
+            )
+            malformed_angle_link_errors = module.verify_port(root, run_helpers=False)
+            self.assertTrue(any("malformed Markdown link destination" in error for error in malformed_angle_link_errors))
+
+            skill_file.write_text(
+                "---\nname: fixture\ndescription: fixture\n---\n\n[bad](reference.md\n",
+                encoding="utf-8",
+            )
+            unterminated_link_errors = module.verify_port(root, run_helpers=False)
+            self.assertTrue(any("unterminated Markdown link" in error for error in unterminated_link_errors))
+
+            skill_file.write_text(
                 "---\nname: fixture\ndescription: fixture\n---\n",
                 encoding="utf-8",
             )
@@ -699,6 +811,17 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             extensionless_helper.write_text("run_in_background = true # UNSUPPORTED-SEAM: background-agent setting\n", encoding="utf-8")
             self.assertEqual(module.verify_port(root, run_helpers=False), [])
 
+            helper.write_text("result = Task(prompt, model=\"grok\")\n", encoding="utf-8")
+            mjs_helper.write_text("from cursor_tools import Task\nTask(prompt)\n", encoding="utf-8")
+            extensionless_helper.write_text("from cursor_tools import Task\n", encoding="utf-8")
+            task_errors = module.verify_port(root, run_helpers=False)
+            self.assertGreaterEqual(len([error for error in task_errors if "Cursor Task call" in error]), 3)
+
+            helper.write_text("result = Task(prompt, model=\"grok\")  # UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")
+            mjs_helper.write_text("from cursor_tools import Task  // UNSUPPORTED-SEAM: Cursor Task\nTask(prompt)  // UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")
+            extensionless_helper.write_text("from cursor_tools import Task  # UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")
+            self.assertEqual(module.verify_port(root, run_helpers=False), [])
+
     @unittest.skipUnless(shutil.which("codex"), "Codex CLI is not installed")
     def test_installed_skill_is_visible_to_isolated_codex_prompt_input(self) -> None:
         with tempfile.TemporaryDirectory(prefix="codex-discovery-probe-") as temporary:
@@ -708,6 +831,7 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             codex_home = root / "codex-home"
             codex_home.mkdir()
             expected_skill = (destination / "setup-pstack" / "SKILL.md").resolve()
+            expected_user_skill = (codex_home / "skills" / "setup-pstack" / "SKILL.md").resolve()
 
             negative = subprocess.run(
                 ["codex", "debug", "prompt-input"],
@@ -719,6 +843,7 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             )
             self.assertEqual(negative.returncode, 0, negative.stderr)
             self.assertNotIn(str(expected_skill), negative.stdout)
+            self.assertNotIn(str(expected_user_skill), negative.stdout)
 
             installed = run_script(
                 INSTALLER,
@@ -729,6 +854,15 @@ class SetupPstackBehaviorTests(unittest.TestCase):
                 "--apply",
             )
             self.assertEqual(installed.returncode, 0, installed.stderr)
+            installed_self_test = run_script(
+                destination / "setup-pstack" / "scripts" / "install.py",
+                "--self-test",
+                cwd=root,
+            )
+            self.assertEqual(installed_self_test.returncode, 0, installed_self_test.stderr)
+            installed_configure = destination / "setup-pstack" / "scripts" / "configure.py"
+            installed_self_test = run_script(installed_configure, "self-test", cwd=root)
+            self.assertEqual(installed_self_test.returncode, 0, installed_self_test.stderr)
             discovered = subprocess.run(
                 ["codex", "debug", "prompt-input"],
                 cwd=root,
@@ -740,6 +874,26 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertEqual(discovered.returncode, 0, discovered.stderr)
             self.assertIn(f"(file: {expected_skill})", discovered.stdout)
             self.assertIn("- setup-pstack: Discover models from the active Codex runtime", discovered.stdout)
+
+            user_installed = run_script(
+                INSTALLER,
+                "--source",
+                str(source),
+                "--destination",
+                str(codex_home / "skills"),
+                "--apply",
+            )
+            self.assertEqual(user_installed.returncode, 0, user_installed.stderr)
+            user_discovered = subprocess.run(
+                ["codex", "debug", "prompt-input"],
+                cwd=root,
+                env={**os.environ, "CODEX_HOME": str(codex_home)},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(user_discovered.returncode, 0, user_discovered.stderr)
+            self.assertIn(f"(file: {expected_user_skill})", user_discovered.stdout)
 
 
 if __name__ == "__main__":

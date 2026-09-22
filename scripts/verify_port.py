@@ -18,7 +18,14 @@ ACTIVE_SEAMS = (
     ("Cursor path", re.compile(r"(?:~/?\.cursor(?:/|$)|\.cursor/)", re.IGNORECASE)),
     (
         "Cursor Task call",
-        re.compile(r"(?:\b(?:call|use|invoke)\s+(?:the\s+)?Cursor\s+Task\b|\bCursor\s+Task\s+(?:tool|call)\b)", re.IGNORECASE),
+        re.compile(
+            r"(?:\b(?:call|use|invoke)\s+(?:the\s+)?Cursor\s+Task\b"
+            r"|\bCursor\s+Task\s+(?:tool|call)\b"
+            r"|\bTask\s*\("
+            r"|\bfrom\s+cursor_tools\s+import[^\n]*\bTask\b"
+            r"|\bimport\s+cursor_tools[^\n]*\bTask\b)",
+            re.IGNORECASE,
+        ),
     ),
     ("subagent_type", re.compile(r"\bsubagent_type\s*[:=]", re.IGNORECASE)),
     ("background-agent setting", re.compile(r"\brun_in_background\s*[:=]", re.IGNORECASE)),
@@ -33,7 +40,7 @@ ACTIVE_SEAMS = (
 BOUNDARY_ANNOTATION = re.compile(r"\bUNSUPPORTED[-_ ]SEAM\s*:\s*(?P<detail>[^\n]+)", re.IGNORECASE)
 SEAM_ANNOTATION_ALIASES = {
     "Cursor path": ("cursor path", "cursor rules", "cursor target"),
-    "Cursor Task call": ("cursor task",),
+    "Cursor Task call": ("cursor task", "task call", "task(", "cursor_tools"),
     "subagent_type": ("subagent_type",),
     "background-agent setting": ("background-agent", "run_in_background"),
     "transcript path": ("transcript path", "agent-transcripts"),
@@ -42,9 +49,9 @@ SEAM_ANNOTATION_ALIASES = {
     "create-skill call": ("create-skill",),
 }
 TOP_LEVEL_FIELD = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]*(?P<value>.*))?$")
-INLINE_LINK = re.compile(r"(?<!!)\[[^\]\n]*\]\((?P<body>[^)\n]*)\)")
+INLINE_LINK_START = re.compile(r"(?<!!)\[[^\]\n]*\]\(")
 REFERENCE_DEFINITION = re.compile(
-    r"^[ \t]{0,3}\[(?P<label>[^\]]+)\]:[ \t]*(?:<(?P<bracket>[^>]+)>|(?P<plain>\S+))(?:[ \t]+.*)?$"
+    r"^[ \t]{0,3}\[(?P<label>[^\]]+)\]:[ \t]*(?:<(?P<bracket>[^>\n]+)>|(?P<plain>\S+))[ \t]*$"
 )
 REFERENCE_DEFINITION_PREFIX = re.compile(r"^[ \t]{0,3}\[(?P<label>[^\]]+)\]:")
 REFERENCE_USE = re.compile(r"(?<!!)\[(?P<text>[^\]]+)\]\[(?P<label>[^\]]*)\]")
@@ -66,15 +73,30 @@ def _scalar(value: str, field: str) -> str:
     value = value.strip()
     if not value:
         raise ValidationError(f"frontmatter field {field!r} is empty")
-    if value[0] in {"'", '"'}:
-        quote = value[0]
-        if len(value) < 2 or value[-1] != quote:
-            raise ValidationError(f"frontmatter field {field!r} has an unterminated quote")
-        if quote == "'":
-            return value[1:-1].replace("''", "'")
-        escaped = value[1:-1]
+    if value[0] == "'":
         decoded: list[str] = []
-        index = 0
+        index = 1
+        while index < len(value):
+            character = value[index]
+            if character != "'":
+                decoded.append(character)
+                index += 1
+                continue
+            if index + 1 < len(value) and value[index + 1] == "'":
+                decoded.append("'")
+                index += 2
+                continue
+            if index != len(value) - 1:
+                raise ValidationError(f"frontmatter field {field!r} has trailing text after its quote")
+            result = "".join(decoded)
+            if not result:
+                raise ValidationError(f"frontmatter field {field!r} is empty")
+            return result
+        raise ValidationError(f"frontmatter field {field!r} has an unterminated quote")
+
+    if value[0] == '"':
+        decoded = []
+        index = 1
         simple_escapes = {
             "0": "\0",
             "a": "\a",
@@ -94,15 +116,22 @@ def _scalar(value: str, field: str) -> str:
             "L": "\u2028",
             "P": "\u2029",
         }
-        while index < len(escaped):
-            character = escaped[index]
+        while index < len(value):
+            character = value[index]
+            if character == '"':
+                if index != len(value) - 1:
+                    raise ValidationError(f"frontmatter field {field!r} has trailing text after its quote")
+                result = "".join(decoded)
+                if not result:
+                    raise ValidationError(f"frontmatter field {field!r} is empty")
+                return result
             if character != "\\":
                 decoded.append(character)
                 index += 1
                 continue
-            if index + 1 >= len(escaped):
+            if index + 1 >= len(value):
                 raise ValidationError(f"frontmatter field {field!r} has a dangling YAML escape")
-            escape = escaped[index + 1]
+            escape = value[index + 1]
             if escape in simple_escapes:
                 decoded.append(simple_escapes[escape])
                 index += 2
@@ -110,7 +139,7 @@ def _scalar(value: str, field: str) -> str:
             width = {"x": 2, "u": 4, "U": 8}.get(escape)
             if width is None:
                 raise ValidationError(f"frontmatter field {field!r} has invalid YAML escape: \\{escape}")
-            digits = escaped[index + 2 : index + 2 + width]
+            digits = value[index + 2 : index + 2 + width]
             if len(digits) != width or not re.fullmatch(rf"[0-9A-Fa-f]{{{width}}}", digits):
                 raise ValidationError(f"frontmatter field {field!r} has invalid YAML escape: \\{escape}{digits}")
             try:
@@ -118,9 +147,20 @@ def _scalar(value: str, field: str) -> str:
             except ValueError as exc:
                 raise ValidationError(f"frontmatter field {field!r} has invalid YAML code point") from exc
             index += 2 + width
-        return "".join(decoded)
-    if value.startswith(("[", "{", "&", "*", "!")):
-        raise ValidationError(f"frontmatter field {field!r} is not a scalar")
+        raise ValidationError(f"frontmatter field {field!r} has an unterminated quote")
+
+    if value.startswith(("[", "{", "&", "*", "!", "|", ">", "%", "@", "`", "#")):
+        raise ValidationError(f"frontmatter field {field!r} is not a supported scalar")
+    if re.search(r":(?:[ \t]|$)", value):
+        raise ValidationError(f"frontmatter field {field!r} has unsupported mapping syntax")
+    if value.casefold() in {"null", "~", "true", "false", "yes", "no", "on", "off"}:
+        raise ValidationError(f"frontmatter field {field!r} is not a string scalar")
+    if re.fullmatch(r"[-+]?(?:0|[1-9][0-9_]*)(?:\.[0-9_]+)?(?:[eE][-+]?[0-9]+)?", value):
+        raise ValidationError(f"frontmatter field {field!r} is not a string scalar")
+    if re.fullmatch(r"[-+]?0x[0-9A-Fa-f_]+|[-+]?0o[0-7_]+|[-+]?0b[01_]+", value):
+        raise ValidationError(f"frontmatter field {field!r} is not a string scalar")
+    if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value):
+        raise ValidationError(f"frontmatter field {field!r} is not a string scalar")
     return value
 
 
@@ -200,19 +240,27 @@ def _check_links(root: Path, path: Path, text: str, errors: list[str]) -> None:
             _check_link_target(root, path, line_number, target, errors)
 
     for line_number, line in lines:
-        for match in INLINE_LINK.finditer(line):
-            body = match.group("body").strip()
+        for match in INLINE_LINK_START.finditer(line):
+            body_start = match.end()
+            close = line.find(")", body_start)
+            if close == -1:
+                errors.append(f"{path.relative_to(root)}:{line_number} has an unterminated Markdown link")
+                continue
+            body = line[body_start:close].strip()
             if not body:
                 errors.append(f"{path.relative_to(root)}:{line_number} has a malformed Markdown link with an empty destination")
                 continue
             if body.startswith("<"):
-                end = body.find(">")
-                if end <= 1:
+                bracketed = re.fullmatch(r"<([^>\n]+)>", body)
+                if bracketed is None:
                     errors.append(f"{path.relative_to(root)}:{line_number} has a malformed Markdown link destination")
                     continue
-                target = body[1:end]
+                target = bracketed.group(1)
             else:
-                target = body.split(None, 1)[0]
+                if re.search(r"\s|[()]", body):
+                    errors.append(f"{path.relative_to(root)}:{line_number} has trailing or malformed Markdown link data")
+                    continue
+                target = body
             _check_link_target(root, path, line_number, target, errors)
         for match in REFERENCE_USE.finditer(line):
             label = _reference_label(match.group("label") or match.group("text"))
