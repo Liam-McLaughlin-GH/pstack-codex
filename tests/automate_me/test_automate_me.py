@@ -27,6 +27,7 @@ from automate_me import (  # noqa: E402
     PreferenceInteraction,
     PreferenceQuestion,
     PreferenceResponse,
+    PublicationRecoveryError,
     RoutingError,
     ScopeError,
     SkillDraft,
@@ -681,6 +682,41 @@ Read [provenance](references/provenance.md).
                 errors = validate_skill_tree(skill, require_provenance=False)
                 self.assertTrue(any("link" in error for error in errors), link)
 
+    def test_markdown_link_validation_skips_backtick_and_tilde_fences(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-fenced-links-") as temp_dir:
+            skill = Path(temp_dir) / "safe-skill"
+            (skill / "references").mkdir(parents=True)
+            (skill / "references" / "real.md").write_text(
+                "# Real reference\n", encoding="utf-8"
+            )
+            body = """Read [real](references/real.md) and [named][real-reference].
+
+[real-reference]: references/real.md
+
+```markdown
+[missing-inline](references/missing-inline.md)
+[missing-reference]: references/missing-reference.md
+```
+
+~~~text
+[missing-tilde](references/missing-tilde.md)
+~~~
+"""
+            (skill / "SKILL.md").write_text(
+                '---\nname: safe-skill\ndescription: "Safe"\n---\n\n' + body,
+                encoding="utf-8",
+            )
+            self.assertEqual(validate_skill_tree(skill, require_provenance=False), ())
+
+            (skill / "SKILL.md").write_text(
+                '---\nname: safe-skill\ndescription: "Safe"\n---\n\n'
+                + body
+                + "\nRead [outside-missing](references/outside-missing.md).\n",
+                encoding="utf-8",
+            )
+            errors = validate_skill_tree(skill, require_provenance=False)
+            self.assertTrue(any("outside-missing" in error for error in errors))
+
     def test_frontmatter_fallback_rejects_non_strings_and_unterminated_quotes(self) -> None:
         cases = (
             "description: true",
@@ -1078,6 +1114,72 @@ Read [style](references/style.md) and [provenance](references/provenance.md).
             workspace = Path(temp_dir) / "project"
             evidence = self._write_evidence(workspace)
             target = workspace / "skills" / "alex-mode"
+            initial_draft = SkillDraft(
+                name="alex-mode",
+                description="Apply approved Alex conventions.",
+                rules=("Keep the original approval visible.",),
+                evidence=evidence,
+            )
+            write_generated_skill(
+                target,
+                initial_draft,
+                workspace_root=workspace,
+                operation="create",
+                approval=self._approval("create"),
+            )
+            approved_skill = (target / "SKILL.md").read_text(encoding="utf-8")
+            updated_draft = SkillDraft(
+                name="alex-mode",
+                description="Apply the replacement Alex conventions.",
+                rules=("Keep the replacement approval visible.",),
+                evidence=evidence,
+            )
+
+            def create_competitor(point: str) -> None:
+                if point == "after_backup":
+                    target.mkdir()
+                    (target / "concurrent.txt").write_text("keep me", encoding="utf-8")
+                    raise OSError("stop after external target appears")
+
+            with self.assertRaises(PublicationRecoveryError) as raised:
+                write_generated_skill(
+                    target,
+                    updated_draft,
+                    workspace_root=workspace,
+                    operation="update",
+                    approval=self._approval("update"),
+                    failure_injector=create_competitor,
+                )
+            recovery_error = raised.exception
+            self.assertTrue(recovery_error.competitor_preserved)
+            self.assertEqual(recovery_error.recovery_status, "approved_tree_recovered")
+            self.assertEqual(recovery_error.cleanup_status, "hidden_backup_removed")
+            self.assertEqual(
+                (target / "concurrent.txt").read_text(encoding="utf-8"),
+                "keep me",
+            )
+            recovery = Path(recovery_error.recovery_path)
+            self.assertEqual(
+                recovery,
+                workspace / "skills" / ".automate-me-recovery" / "alex-mode",
+            )
+            self.assertEqual(
+                (recovery / "SKILL.md").read_text(encoding="utf-8"),
+                approved_skill,
+            )
+            self.assertEqual(validate_skill_tree(recovery), ())
+            self.assertFalse(
+                any(
+                    path.name.startswith(".alex-mode.backup-")
+                    for path in target.parent.iterdir()
+                )
+            )
+
+    def test_update_rejects_same_directory_content_mutation_after_preflight(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-content-race-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            evidence = self._write_evidence(workspace)
+            target = workspace / "skills" / "alex-mode"
             draft = SkillDraft(
                 name="alex-mode",
                 description="Apply approved Alex conventions.",
@@ -1091,26 +1193,36 @@ Read [style](references/style.md) and [provenance](references/provenance.md).
                 operation="create",
                 approval=self._approval("create"),
             )
+            notes = target / "notes.md"
+            notes.write_text("approved before the update\n", encoding="utf-8")
 
-            def create_competitor(point: str) -> None:
-                if point == "after_backup":
-                    target.mkdir()
-                    (target / "concurrent.txt").write_text("keep me", encoding="utf-8")
-                    raise OSError("stop after external target appears")
+            def mutate_content(point: str) -> None:
+                if point == "before_install":
+                    notes.write_text(
+                        "concurrent edit after preflight\n", encoding="utf-8"
+                    )
 
-            with self.assertRaises(OSError):
+            with self.assertRaises(ScopeError) as raised:
                 write_generated_skill(
                     target,
                     draft,
                     workspace_root=workspace,
                     operation="update",
                     approval=self._approval("update"),
-                    failure_injector=create_competitor,
+                    failure_injector=mutate_content,
                 )
+            self.assertIn("content changed after preflight", str(raised.exception))
             self.assertEqual(
-                (target / "concurrent.txt").read_text(encoding="utf-8"),
-                "keep me",
+                notes.read_text(encoding="utf-8"),
+                "concurrent edit after preflight\n",
             )
+            self.assertFalse(
+                any(
+                    path.name.startswith(".alex-mode.backup-")
+                    for path in target.parent.iterdir()
+                )
+            )
+            self.assertFalse((target.parent / ".automate-me-recovery").exists())
 
     def test_update_bounds_preserved_regular_file_copies(self) -> None:
         for mode in ("per-file", "aggregate"):

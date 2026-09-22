@@ -29,6 +29,7 @@ MAX_ARTIFACT_BYTES = 1_000_000
 MAX_HISTORY_RECORDS = 8
 MAX_TOTAL_ARTIFACT_BYTES = 2_000_000
 MAX_SLICE_ID_LENGTH = 128
+RECOVERY_DIRECTORY_NAME = ".automate-me-recovery"
 ARTIFACT_KINDS = frozenset({"skill", "script", "reference", "none"})
 OPERATIONS = frozenset({"create", "update", "confirm", "none"})
 SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -111,6 +112,30 @@ class CollisionError(AutomateMeError):
 
 class ValidationError(AutomateMeError):
     """A skill does not satisfy the local authoring contract."""
+
+
+class PublicationRecoveryError(OSError):
+    """Publication stopped while preserving both a competitor and recovery copy."""
+
+    def __init__(
+        self,
+        *,
+        target: Path,
+        recovery_path: Path,
+        cause: BaseException,
+    ) -> None:
+        self.target = target
+        self.recovery_path = recovery_path
+        self.recovery_status = "approved_tree_recovered"
+        self.cleanup_status = "hidden_backup_removed"
+        self.competitor_preserved = True
+        self.cause = cause
+        super().__init__(
+            "update publication stopped; competitor preserved at "
+            f"{target}; approved tree recovered at {recovery_path}; "
+            "recovery_status=approved_tree_recovered "
+            "cleanup_status=hidden_backup_removed"
+        )
 
 
 @dataclass(frozen=True)
@@ -800,6 +825,17 @@ def _same_file_state(left: os.stat_result, right: os.stat_result) -> bool:
     )
 
 
+def _file_state(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        info.st_dev,
+        info.st_ino,
+        stat.S_IFMT(info.st_mode),
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
 def _remove_directory_contents(directory_fd: int) -> None:
     """Best-effort cleanup through descriptors without following aliases."""
 
@@ -875,6 +911,26 @@ def _remove_owned_directory(
         or not _same_file_identity(current_info, expected_info)
     ):
         return current_info is None
+    try:
+        os.rmdir(name, dir_fd=parent_fd)
+    except OSError:
+        return False
+    return True
+
+
+def _remove_empty_owned_directory(
+    parent_fd: int, name: str, expected_info: os.stat_result
+) -> bool:
+    """Remove only an unchanged empty directory owned by this operation."""
+
+    current_info = _stat_at(parent_fd, name)
+    if (
+        current_info is None
+        or stat.S_ISLNK(current_info.st_mode)
+        or not stat.S_ISDIR(current_info.st_mode)
+        or not _same_file_identity(current_info, expected_info)
+    ):
+        return False
     try:
         os.rmdir(name, dir_fd=parent_fd)
     except OSError:
@@ -1345,7 +1401,43 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
     return fields
 
 
+def _blank_markdown_line(line: str) -> str:
+    return "".join(
+        "\n" if character == "\n" else "\r" if character == "\r" else " "
+        for character in line
+    )
+
+
+def _markdown_without_fenced_code(text: str) -> str:
+    """Mask fenced code while retaining line boundaries for Markdown scanning."""
+
+    masked: list[str] = []
+    fence_character: str | None = None
+    fence_length = 0
+    for line in text.splitlines(keepends=True):
+        fence = MARKDOWN_FENCE_RE.match(line)
+        if fence_character is not None:
+            if (
+                fence is not None
+                and fence.group(1)[0] == fence_character
+                and len(fence.group(1)) >= fence_length
+                and not line[fence.end() :].strip()
+            ):
+                fence_character = None
+                fence_length = 0
+            masked.append(_blank_markdown_line(line))
+            continue
+        if fence is not None:
+            fence_character = fence.group(1)[0]
+            fence_length = len(fence.group(1))
+            masked.append(_blank_markdown_line(line))
+            continue
+        masked.append(line)
+    return "".join(masked)
+
+
 def _markdown_link_targets(text: str) -> Iterator[str]:
+    text = _markdown_without_fenced_code(text)
     for match in MARKDOWN_LINK_RE.finditer(text):
         target = match.group(1).strip()
         if target.startswith("<") and ">" in target:
@@ -1440,6 +1532,42 @@ def _scan_tree_entries(
             os.close(directory_fd)
         raise
     return directories, files, errors
+
+
+def _capture_tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
+    """Capture bounded structure, metadata, and content for an existing tree."""
+
+    source_info = root.lstat()
+    if stat.S_ISLNK(source_info.st_mode) or not stat.S_ISDIR(source_info.st_mode):
+        raise ScopeError(f"skill output must be a real directory: {root}")
+    directories, files, errors = _scan_tree_entries(root)
+    if errors:
+        raise ScopeError("; ".join(errors))
+
+    entries: list[tuple[object, ...]] = [
+        (relative, "directory", ()) for relative in directories if relative
+    ]
+    total_bytes = 0
+    source_root = _resolved_root(root)
+    for relative in files:
+        data, info = _read_relative_bytes(
+            source_root,
+            relative,
+            max_bytes=MAX_ARTIFACT_BYTES,
+            label="existing skill output",
+        )
+        total_bytes += len(data)
+        if total_bytes > MAX_TOTAL_ARTIFACT_BYTES:
+            raise ScopeError("aggregate preserved skill size exceeds the bounded limit")
+        entries.append(
+            (
+                relative,
+                "file",
+                _file_state(info),
+                hashlib.sha256(data).hexdigest(),
+            )
+        )
+    return tuple(sorted(entries, key=lambda entry: (entry[0], entry[1])))
 
 
 def validate_skill_tree(
@@ -1767,7 +1895,9 @@ def _ensure_relative_directory(root: Path, relative_parts: Sequence[str]) -> Non
         os.close(root_fd)
 
 
-def _copy_tree_without_symlinks(source: Path, destination: Path) -> None:
+def _copy_tree_without_symlinks(
+    source: Path, destination: Path
+) -> tuple[tuple[object, ...], ...]:
     source_info = source.lstat()
     if stat.S_ISLNK(source_info.st_mode) or not stat.S_ISDIR(source_info.st_mode):
         raise ScopeError(f"skill output must be a real directory: {source}")
@@ -1780,6 +1910,7 @@ def _copy_tree_without_symlinks(source: Path, destination: Path) -> None:
         or not stat.S_ISDIR(destination_info.st_mode)
     ):
         raise ScopeError(f"skill output must be a real directory: {destination}")
+    snapshot = _capture_tree_snapshot(source)
     destination.mkdir(parents=True, exist_ok=True)
     source_root = _resolved_root(source)
     destination_root = _resolved_root(destination)
@@ -1802,6 +1933,9 @@ def _copy_tree_without_symlinks(source: Path, destination: Path) -> None:
         if total_bytes > MAX_TOTAL_ARTIFACT_BYTES:
             raise ScopeError("aggregate preserved skill size exceeds the bounded limit")
         _write_relative_bytes(destination_root, relative, data)
+    if _capture_tree_snapshot(source) != snapshot:
+        raise ScopeError(f"existing skill output changed while it was copied: {source}")
+    return snapshot
 
 
 def _write_relative_files(root: Path, files: dict[str, str]) -> None:
@@ -2004,6 +2138,71 @@ def _remove_tree_or_file(path: Path) -> None:
         path.unlink()
 
 
+def _prepare_recovery_copy(
+    target: Path,
+    target_parent_fd: int,
+    expected_snapshot: tuple[tuple[object, ...], ...],
+) -> tuple[int, os.stat_result, bool, os.stat_result, Path]:
+    """Keep a deterministic copy available before an update can be displaced."""
+
+    recovery_parent_fd: int | None = None
+    recovery_parent_info: os.stat_result | None = None
+    recovery_parent_created = False
+    recovery_info: os.stat_result | None = None
+    try:
+        try:
+            os.mkdir(RECOVERY_DIRECTORY_NAME, 0o755, dir_fd=target_parent_fd)
+            recovery_parent_created = True
+        except FileExistsError:
+            pass
+        recovery_parent_fd = _open_directory_at(
+            target_parent_fd,
+            RECOVERY_DIRECTORY_NAME,
+            label="recovery directory",
+        )
+        recovery_parent_info = os.fstat(recovery_parent_fd)
+        if _stat_at(recovery_parent_fd, target.name) is not None:
+            raise CollisionError(
+                "update has an unresolved prior recovery: "
+                f"{target.parent / RECOVERY_DIRECTORY_NAME / target.name}"
+            )
+        os.mkdir(target.name, 0o755, dir_fd=recovery_parent_fd)
+        recovery_info = _stat_at(recovery_parent_fd, target.name)
+        if (
+            recovery_info is None
+            or stat.S_ISLNK(recovery_info.st_mode)
+            or not stat.S_ISDIR(recovery_info.st_mode)
+        ):
+            raise ScopeError("recovery output is not a real directory")
+        recovery_path = target.parent / RECOVERY_DIRECTORY_NAME / target.name
+        copied_snapshot = _copy_tree_without_symlinks(target, recovery_path)
+        if copied_snapshot != expected_snapshot:
+            raise ScopeError(
+                f"update target changed while its recovery copy was prepared: {target}"
+            )
+        return (
+            recovery_parent_fd,
+            recovery_parent_info,
+            recovery_parent_created,
+            recovery_info,
+            recovery_path,
+        )
+    except BaseException:
+        if recovery_parent_fd is not None:
+            if recovery_info is not None:
+                _remove_owned_directory(
+                    recovery_parent_fd, target.name, recovery_info
+                )
+            os.close(recovery_parent_fd)
+        if recovery_parent_created and recovery_parent_info is not None:
+            _remove_empty_owned_directory(
+                target_parent_fd,
+                RECOVERY_DIRECTORY_NAME,
+                recovery_parent_info,
+            )
+        raise
+
+
 def _install_staged_tree(
     stage_root: Path,
     target: Path,
@@ -2011,6 +2210,7 @@ def _install_staged_tree(
     failure_injector: Callable[[str], None] | None,
     target_parent_fd: int,
     expected_target_info: os.stat_result | None,
+    expected_target_snapshot: tuple[tuple[object, ...], ...] | None,
     validate_installed: Callable[[], None],
 ) -> None:
     if failure_injector:
@@ -2060,21 +2260,42 @@ def _install_staged_tree(
             os.close(stage_parent_fd)
         return
 
-    if expected_target_info is None:
-        raise ScopeError("update publication is missing the expected target identity")
+    if expected_target_info is None or expected_target_snapshot is None:
+        raise ScopeError("update publication is missing the expected target snapshot")
     backup_name = f".{target.name}.backup-{uuid.uuid4().hex}"
     stage_fd: int | None = None
     backup_info: os.stat_result | None = None
     installed_target_info: os.stat_result | None = None
+    recovery_parent_fd: int | None = None
+    recovery_parent_info: os.stat_result | None = None
+    recovery_parent_created = False
+    recovery_info: os.stat_result | None = None
+    recovery_path: Path | None = None
+    preserve_recovery = False
     try:
         current_info = _stat_at(target_parent_fd, target.name)
         if (
             current_info is None
             or stat.S_ISLNK(current_info.st_mode)
             or not stat.S_ISDIR(current_info.st_mode)
-            or not _same_file_identity(current_info, expected_target_info)
+            or not _same_file_state(current_info, expected_target_info)
         ):
             raise ScopeError(f"update target changed before publication: {target}")
+        if _capture_tree_snapshot(target) != expected_target_snapshot:
+            raise ScopeError(f"update target content changed after preflight: {target}")
+        (
+            recovery_parent_fd,
+            recovery_parent_info,
+            recovery_parent_created,
+            recovery_info,
+            recovery_path,
+        ) = _prepare_recovery_copy(
+            target,
+            target_parent_fd,
+            expected_target_snapshot,
+        )
+        if _capture_tree_snapshot(target) != expected_target_snapshot:
+            raise ScopeError(f"update target content changed before publication: {target}")
         os.rename(
             target.name,
             backup_name,
@@ -2089,6 +2310,11 @@ def _install_staged_tree(
             or not _same_file_identity(backup_info, expected_target_info)
         ):
             raise ScopeError(f"update target changed while it was moved: {target}")
+        if (
+            _capture_tree_snapshot(target.with_name(backup_name))
+            != expected_target_snapshot
+        ):
+            raise ScopeError(f"update target content changed while it was moved: {target}")
         if failure_injector:
             failure_injector("after_backup")
         if _stat_at(target_parent_fd, target.name) is not None:
@@ -2107,24 +2333,30 @@ def _install_staged_tree(
             src_dir_fd=stage_fd,
             dst_dir_fd=target_parent_fd,
         )
-        installed_target_info = _stat_at(target_parent_fd, target.name)
+        installed_info = _stat_at(target_parent_fd, target.name)
         if (
-            installed_target_info is None
-            or stat.S_ISLNK(installed_target_info.st_mode)
-            or not stat.S_ISDIR(installed_target_info.st_mode)
-            or not _same_file_identity(installed_target_info, staged_info)
+            installed_info is None
+            or stat.S_ISLNK(installed_info.st_mode)
+            or not stat.S_ISDIR(installed_info.st_mode)
+            or not _same_file_identity(installed_info, staged_info)
         ):
             raise ScopeError(f"installed target changed during publication: {target}")
+        installed_target_info = installed_info
         validate_installed()
         if failure_injector:
             failure_injector("after_install")
-    except BaseException:
-        if installed_target_info is not None:
+    except BaseException as exc:
+        current_info = _stat_at(target_parent_fd, target.name)
+        if (
+            installed_target_info is not None
+            and current_info is not None
+            and _same_file_identity(current_info, installed_target_info)
+        ):
             _remove_owned_directory(
                 target_parent_fd, target.name, installed_target_info
             )
-        if backup_info is not None:
             current_info = _stat_at(target_parent_fd, target.name)
+        if backup_info is not None:
             if current_info is None:
                 try:
                     os.rename(
@@ -2135,25 +2367,42 @@ def _install_staged_tree(
                     )
                 except FileExistsError:
                     pass
-            elif (
-                installed_target_info is not None
-                and _same_file_identity(current_info, installed_target_info)
-                and _remove_owned_directory(
-                    target_parent_fd, target.name, installed_target_info
-                )
-                and _stat_at(target_parent_fd, target.name) is None
-            ):
-                os.rename(
-                    backup_name,
-                    target.name,
-                    src_dir_fd=target_parent_fd,
-                    dst_dir_fd=target_parent_fd,
-                )
+                else:
+                    backup_info = None
+            else:
+                if recovery_info is not None and recovery_path is not None:
+                    if _remove_owned_directory(
+                        target_parent_fd, backup_name, backup_info
+                    ):
+                        backup_info = None
+                        preserve_recovery = True
+                        raise PublicationRecoveryError(
+                            target=target,
+                            recovery_path=recovery_path,
+                            cause=exc,
+                        ) from exc
         raise
     else:
         if backup_info is not None:
             _remove_owned_directory(target_parent_fd, backup_name, backup_info)
+            backup_info = None
     finally:
+        if recovery_parent_fd is not None:
+            if not preserve_recovery and recovery_info is not None:
+                _remove_owned_directory(
+                    recovery_parent_fd, target.name, recovery_info
+                )
+            os.close(recovery_parent_fd)
+        if (
+            not preserve_recovery
+            and recovery_parent_created
+            and recovery_parent_info is not None
+        ):
+            _remove_empty_owned_directory(
+                target_parent_fd,
+                RECOVERY_DIRECTORY_NAME,
+                recovery_parent_info,
+            )
         if stage_fd is not None:
             os.close(stage_fd)
         os.close(stage_parent_fd)
@@ -2217,6 +2466,7 @@ def write_generated_skill(
         stage_parent: Path | None = None
         stage_root: Path | None = None
         expected_target_info: os.stat_result | None = None
+        expected_target_snapshot: tuple[tuple[object, ...], ...] | None = None
         try:
             parent_fd = _open_directory_chain(
                 root_fd, canonical_target.relative_parts[:-1], create=True
@@ -2260,7 +2510,9 @@ def write_generated_skill(
 
             stage_parent, stage_root = _new_stage(target)
             if operation == "update":
-                _copy_tree_without_symlinks(target, stage_root)
+                expected_target_snapshot = _copy_tree_without_symlinks(
+                    target, stage_root
+                )
                 _prepare_update_tree(stage_root, files, draft)
             else:
                 _write_relative_files(stage_root, files)
@@ -2283,6 +2535,7 @@ def write_generated_skill(
                 failure_injector,
                 parent_fd,
                 expected_target_info,
+                expected_target_snapshot,
                 validate_installed,
             )
         finally:
