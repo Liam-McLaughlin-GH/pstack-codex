@@ -41,14 +41,25 @@ export MAKE_BOT_UI_TRIGGER_TOKEN='set-a-separate-local-token'
 python3 skills/make-bot-ui/scripts/serve.py --port 8765
 ```
 
-`MAKE_BOT_UI_TRIGGER_TOKEN` protects `/send`. The page receives it only as an
-HttpOnly, same-origin cookie, and direct callers must send
-`Authorization: Bearer <trigger-token>`. Missing or incorrect authorization is
-rejected before the payload is read or relayed. Keep this token separate from
-the webhook sender key.
+`MAKE_BOT_UI_TRIGGER_TOKEN` protects `/send`. On the default loopback server,
+the page receives it as an HttpOnly, same-origin cookie. Direct callers must
+send `Authorization: Bearer <trigger-token>`. Missing or incorrect
+authorization is rejected before the payload is read or relayed. Keep this
+token separate from the webhook sender key.
 
-The server binds to `0.0.0.0` by default so an already-connected tailnet peer
-can reach it. Its outbound request uses:
+The server binds to `127.0.0.1` by default. A non-loopback bind is an explicit
+remote mode and requires a separate bootstrap token:
+
+```sh
+export MAKE_BOT_UI_REMOTE_AUTH_TOKEN='set-a-separate-remote-token'
+python3 skills/make-bot-ui/scripts/serve.py \
+  --host 0.0.0.0 --allow-remote --port 8765
+```
+
+Remote `GET /` requires `Authorization: Bearer <remote-auth-token>` before it
+returns the page or issues the trigger cookie. Add `--secure-cookies` when
+HTTPS terminates before this server. Leave it off for an HTTP-only local or
+tailnet endpoint. Its outbound request uses:
 
 - `POST` and `Content-Type: application/json`;
 - `Authorization: Bearer <key>` and `X-Automation-Key: <key>`;
@@ -58,10 +69,13 @@ can reach it. Its outbound request uses:
 Webhook URLs must use HTTPS. For a loopback fixture only, pass
 `--allow-local-http`; non-loopback HTTP remains rejected even with that flag.
 
-HTTP 200 is the successful wake response. If the request fails, append the
-same JSON payload to the configured local failure log. The log is for a
-receiving routine or operator to drain later; it must not contain credentials
-or response bodies. Do not send media bytes through this webhook.
+HTTP 200 means that the webhook accepted the payload. It does not prove that
+an external bot woke or completed work. If the request fails, the relay
+returns a generic local 502 and includes the upstream numeric status when one
+was received, such as 302, 401, or 500. It never returns the upstream body.
+Append the same JSON payload to the configured local failure log. The log is
+for a receiving routine or operator to drain later; it must not contain
+credentials or response bodies. Do not send media bytes through this webhook.
 
 Before calling the UI live, send one harmless payload that the receiving
 workflow ignores. Report the observed HTTP status. Do not claim that a bot was
@@ -86,12 +100,15 @@ For browser proof, exercise a harmless button and capture:
 
 ## Tailnet exposure
 
-Check `tailscale status` and `tailscale ip -4` after the local fixture works.
-If an online node is already present, use its reported hostname and IPv4
-address and give the user HTTP URLs for both. Do not invent a hostname or IP.
-If the client is missing or logged out, report tailnet exposure as
-`UNSUPPORTED` or `NOT RUN` and leave installation, login, and credential entry
-to the user. The local browser URL remains the only verified URL.
+After an explicitly remote server is running, execute
+`python3 skills/make-bot-ui/scripts/capabilities.py --tailscale-port 8765`.
+The helper checks that Tailscale is logged in and has an IPv4 address before it
+requests `/healthz` at that address. `PASS` proves health-page reachability;
+it does not prove an external webhook or bot wake. If Tailscale is missing,
+logged out, or has no address, it reports `NOT RUN` with `blocked: true` and
+does not make the network request. A failed health request is reported as
+`FAIL`. Do not invent a hostname or IP, and do not claim external wake from a
+local or health-page check.
 
 ## Boundaries
 

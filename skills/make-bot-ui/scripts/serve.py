@@ -25,7 +25,9 @@ MAX_BODY_BYTES = 16 * 1024
 WEBHOOK_URL_ENV = "MAKE_BOT_UI_WEBHOOK_URL"
 WEBHOOK_KEY_ENV = "MAKE_BOT_UI_WEBHOOK_KEY"
 TRIGGER_TOKEN_ENV = "MAKE_BOT_UI_TRIGGER_TOKEN"
+REMOTE_AUTH_TOKEN_ENV = "MAKE_BOT_UI_REMOTE_AUTH_TOKEN"
 TRIGGER_COOKIE_NAME = "make_bot_ui_trigger"
+DEFAULT_HOST = "127.0.0.1"
 TOKEN_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~+/=")
 
 
@@ -37,6 +39,9 @@ class RelayConfig:
     timeout: float = 8.0
     trigger_token: str = ""
     allow_local_http: bool = False
+    remote_auth_token: str = ""
+    allow_remote: bool = False
+    secure_cookie: bool = False
 
 
 @dataclass(frozen=True)
@@ -130,6 +135,15 @@ def validate_trigger_token(value: Any) -> str:
     return value
 
 
+def _safe_request_path(request_target: str) -> str | None:
+    """Return a request path without letting malformed targets escape the handler."""
+
+    try:
+        return urlsplit(request_target).path
+    except (TypeError, UnicodeError, ValueError):
+        return None
+
+
 def append_failure(failure_log: Path, payload: dict[str, str]) -> None:
     failure_log.parent.mkdir(parents=True, exist_ok=True)
     with failure_log.open("a", encoding="utf-8") as stream:
@@ -169,8 +183,9 @@ def post_webhook(
             status = response.getcode()
             response.read()
     except HTTPError as error:
+        status = error.code if isinstance(error.code, int) else None
         error.close()
-        return _failed_relay(config, payload)
+        return _failed_relay(config, payload, status)
     except InvalidURL:
         return _failed_relay(config, payload)
     except (HTTPException, OSError, URLError, TypeError, ValueError):
@@ -228,7 +243,10 @@ PAGE = """<!doctype html>
           body: JSON.stringify({ action, message })
         });
         const result = await response.json();
-        if (!response.ok || !result.ok) throw new Error(result.error || "Webhook request failed");
+        const status = Number.isInteger(result.status) ? ` (${result.status})` : "";
+        if (!response.ok || !result.ok) {
+          throw new Error(`${result.error || "Webhook request failed"}${status}`);
+        }
         statusNode.textContent = `Webhook accepted (${result.status})`;
       } catch (error) {
         statusNode.textContent = error instanceof Error ? error.message : "Webhook request failed";
@@ -246,23 +264,41 @@ PAGE = """<!doctype html>
 """
 
 
-def make_handler(config: RelayConfig) -> type[BaseHTTPRequestHandler]:
+def make_handler(config: RelayConfig, *, remote_mode: bool | None = None) -> type[BaseHTTPRequestHandler]:
     validate_trigger_token(config.trigger_token)
+    if config.remote_auth_token:
+        validate_trigger_token(config.remote_auth_token)
+    if remote_mode is None:
+        remote_mode = config.allow_remote
+    if remote_mode and (not config.allow_remote or not config.remote_auth_token):
+        raise ValueError("remote binding requires explicit protected configuration")
 
     class RelayHandler(BaseHTTPRequestHandler):
         server_version = "make-bot-ui/1"
 
         def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
-            path = urlsplit(self.path).path
+            path = _safe_request_path(self.path)
+            if path is None:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request target"})
+                return
             if path == "/":
+                if remote_mode and not self._authorized_remote():
+                    self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
+                    return
+                cookie_attributes = [
+                    f"{TRIGGER_COOKIE_NAME}={config.trigger_token}",
+                    "Path=/",
+                    "HttpOnly",
+                    "SameSite=Strict",
+                ]
+                if config.secure_cookie:
+                    cookie_attributes.append("Secure")
                 self._send_bytes(
                     PAGE.encode("utf-8"),
                     "text/html; charset=utf-8",
                     headers={
-                        "Set-Cookie": (
-                            f"{TRIGGER_COOKIE_NAME}={config.trigger_token}; "
-                            "Path=/; HttpOnly; SameSite=Strict"
-                        )
+                        "Cache-Control": "no-store",
+                        "Set-Cookie": "; ".join(cookie_attributes),
                     },
                 )
             elif path == "/healthz":
@@ -271,7 +307,11 @@ def make_handler(config: RelayConfig) -> type[BaseHTTPRequestHandler]:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
-            if urlsplit(self.path).path != "/send":
+            path = _safe_request_path(self.path)
+            if path is None:
+                self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid request target"})
+                return
+            if path != "/send":
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
                 return
             if not self._authorized_trigger():
@@ -296,7 +336,14 @@ def make_handler(config: RelayConfig) -> type[BaseHTTPRequestHandler]:
             if result.ok:
                 self._send_json(HTTPStatus.OK, {"ok": True, "status": result.status})
             else:
-                self._send_json(HTTPStatus.BAD_GATEWAY, {"error": "webhook request failed"})
+                response = {"error": "webhook request failed"}
+                if result.status is not None:
+                    response["status"] = result.status
+                self._send_json(HTTPStatus.BAD_GATEWAY, response)
+
+        def _authorized_remote(self) -> bool:
+            expected = f"Bearer {config.remote_auth_token}"
+            return secrets.compare_digest(self.headers.get("Authorization", ""), expected)
 
         def _authorized_trigger(self) -> bool:
             expected = f"Bearer {config.trigger_token}"
@@ -350,12 +397,15 @@ def make_handler(config: RelayConfig) -> type[BaseHTTPRequestHandler]:
 
 
 def create_server(host: str, port: int, config: RelayConfig) -> ThreadingHTTPServer:
-    return ThreadingHTTPServer((host, port), make_handler(config))
+    remote_mode = not _is_loopback_host(host)
+    if remote_mode and (not config.allow_remote or not config.remote_auth_token):
+        raise ValueError("remote binding requires explicit protected configuration")
+    return ThreadingHTTPServer((host, port), make_handler(config, remote_mode=remote_mode))
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--webhook-url", default=os.environ.get(WEBHOOK_URL_ENV))
     parser.add_argument("--failure-log", type=Path, default=Path(".make-bot-ui-failures.jsonl"))
@@ -364,18 +414,40 @@ def main() -> int:
         action="store_true",
         help="allow an HTTP webhook only when its host is loopback; for local tests",
     )
+    parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help=f"allow a non-loopback bind only with {REMOTE_AUTH_TOKEN_ENV} set",
+    )
+    parser.add_argument(
+        "--secure-cookies",
+        action="store_true",
+        help="mark the trigger cookie Secure when HTTPS terminates before this server",
+    )
     args = parser.parse_args()
     webhook_key = os.environ.get(WEBHOOK_KEY_ENV)
     trigger_token = os.environ.get(TRIGGER_TOKEN_ENV)
+    remote_auth_token = os.environ.get(REMOTE_AUTH_TOKEN_ENV, "")
     if not args.webhook_url or not webhook_key or not trigger_token:
         parser.error(
             f"set {WEBHOOK_URL_ENV}, {WEBHOOK_KEY_ENV}, and {TRIGGER_TOKEN_ENV}; "
             "credentials are read from the environment only"
         )
+    is_loopback_bind = _is_loopback_host(args.host)
+    if not is_loopback_bind and not args.allow_remote:
+        parser.error("non-loopback binding requires --allow-remote")
+    if args.allow_remote and is_loopback_bind:
+        parser.error("--allow-remote requires a non-loopback --host")
+    if args.allow_remote and not remote_auth_token:
+        parser.error(f"set {REMOTE_AUTH_TOKEN_ENV} before enabling remote mode")
     try:
         validate_trigger_token(trigger_token)
+        if remote_auth_token:
+            validate_trigger_token(remote_auth_token)
     except ValueError:
-        parser.error(f"{TRIGGER_TOKEN_ENV} must contain only HTTP token characters")
+        parser.error(
+            f"{TRIGGER_TOKEN_ENV} and {REMOTE_AUTH_TOKEN_ENV} must contain only HTTP token characters"
+        )
 
     server = create_server(
         args.host,
@@ -386,6 +458,9 @@ def main() -> int:
             args.failure_log,
             trigger_token=trigger_token,
             allow_local_http=args.allow_local_http,
+            remote_auth_token=remote_auth_token if args.allow_remote else "",
+            allow_remote=args.allow_remote,
+            secure_cookie=args.secure_cookies,
         ),
     )
     print(f"make-bot-ui listening on {args.host}:{server.server_port}", flush=True)

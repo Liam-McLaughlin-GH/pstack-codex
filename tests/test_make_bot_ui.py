@@ -4,6 +4,7 @@ from contextlib import redirect_stderr
 import importlib.util
 import io
 import json
+import socket
 import sys
 import tempfile
 import threading
@@ -12,8 +13,9 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,8 +36,9 @@ capabilities = load_script("make_bot_ui_capabilities", "capabilities.py")
 
 
 class CaptureState:
-    def __init__(self, status: int = HTTPStatus.OK) -> None:
+    def __init__(self, status: int = HTTPStatus.OK, response_body: bytes = b"") -> None:
         self.status = status
+        self.response_body = response_body
         self.requests: list[tuple[dict[str, str], bytes]] = []
         self.lock = threading.Lock()
 
@@ -48,8 +51,9 @@ def capture_handler(state: CaptureState) -> type[BaseHTTPRequestHandler]:
             with state.lock:
                 state.requests.append(({key.lower(): value for key, value in self.headers.items()}, body))
             self.send_response(state.status)
-            self.send_header("Content-Length", "0")
+            self.send_header("Content-Length", str(len(state.response_body)))
             self.end_headers()
+            self.wfile.write(state.response_body)
 
         def log_message(self, format: str, *args: object) -> None:
             return
@@ -96,6 +100,18 @@ def request_json(
             error.close()
 
 
+def raw_request(url: str, request_line: bytes) -> bytes:
+    parsed = urlsplit(url)
+    with socket.create_connection((parsed.hostname, parsed.port), timeout=2) as connection:
+        connection.sendall(request_line + b"\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        chunks: list[bytes] = []
+        while True:
+            chunk = connection.recv(4096)
+            if not chunk:
+                return b"".join(chunks)
+            chunks.append(chunk)
+
+
 class MakeBotUIServerTests(unittest.TestCase):
     @staticmethod
     def authorization_headers() -> dict[str, str]:
@@ -130,12 +146,15 @@ class MakeBotUIServerTests(unittest.TestCase):
                     with urlopen(Request(local + "/", method="GET"), timeout=2) as response:
                         status = response.status
                         page = response.read().decode("utf-8")
-                        cookie = response.headers["Set-Cookie"].split(";", 1)[0]
+                        set_cookie = response.headers["Set-Cookie"]
+                        cookie = set_cookie.split(";", 1)[0]
                     self.assertEqual(status, HTTPStatus.OK)
                     self.assertIn("Send status check", page)
                     self.assertNotIn(target, page)
                     self.assertNotIn("test-secret", page)
                     self.assertNotIn("trigger-secret", page)
+                    self.assertNotIn("Secure", set_cookie)
+                    self.assertIn("no-store", response.headers["Cache-Control"])
 
                     request = Request(local + "/send", method="POST", data=json.dumps({
                         "action": "status",
@@ -157,7 +176,7 @@ class MakeBotUIServerTests(unittest.TestCase):
                 self.assertFalse(failure_log.exists())
 
     def test_failed_webhook_is_not_retried_and_logs_only_payload(self) -> None:
-        capture = CaptureState(status=HTTPStatus.BAD_GATEWAY)
+        capture = CaptureState(status=HTTPStatus.BAD_GATEWAY, response_body=b"webhook-secret-response")
         with RunningServer(ThreadingHTTPServer(("127.0.0.1", 0), capture_handler(capture))) as target:
             with tempfile.TemporaryDirectory(prefix="make-bot-ui-failure-test-") as temporary:
                 failure_log = Path(temporary) / "nested" / "failures.jsonl"
@@ -169,7 +188,10 @@ class MakeBotUIServerTests(unittest.TestCase):
                         headers=self.authorization_headers(),
                     )
                     self.assertEqual(status, HTTPStatus.BAD_GATEWAY)
-                    self.assertEqual(body, {"error": "webhook request failed"})
+                    self.assertEqual(
+                        body,
+                        {"error": "webhook request failed", "status": HTTPStatus.BAD_GATEWAY},
+                    )
 
                 self.assertEqual(len(capture.requests), 1)
                 self.assertEqual(
@@ -214,6 +236,116 @@ class MakeBotUIServerTests(unittest.TestCase):
                     self.assertEqual(body, {"error": "unauthorized"})
         self.assertEqual(capture.requests, [])
         self.assertFalse(failure_log.exists())
+
+    def test_non_success_webhook_status_is_preserved_without_response_body(self) -> None:
+        for upstream_status in (HTTPStatus.FOUND, HTTPStatus.UNAUTHORIZED, HTTPStatus.INTERNAL_SERVER_ERROR):
+            with self.subTest(upstream_status=upstream_status):
+                capture = CaptureState(
+                    status=upstream_status,
+                    response_body=b"upstream-secret-body",
+                )
+                with RunningServer(ThreadingHTTPServer(("127.0.0.1", 0), capture_handler(capture))) as target:
+                    with tempfile.TemporaryDirectory(prefix="make-bot-ui-status-test-") as temporary:
+                        failure_log = Path(temporary) / "failures.jsonl"
+                        with self.start_relay(target, failure_log) as local:
+                            status, body = request_json(
+                                local + "/send",
+                                method="POST",
+                                payload={"action": "status", "message": "status detail"},
+                                headers=self.authorization_headers(),
+                            )
+                        self.assertEqual(status, HTTPStatus.BAD_GATEWAY)
+                        self.assertEqual(
+                            body,
+                            {"error": "webhook request failed", "status": upstream_status},
+                        )
+                        self.assertNotIn("upstream-secret-body", json.dumps(body))
+                        self.assertNotIn(
+                            "test-secret",
+                            failure_log.read_text(encoding="utf-8"),
+                        )
+                        self.assertIn("Number.isInteger(result.status)", serve.PAGE)
+
+                self.assertEqual(len(capture.requests), 1)
+
+    def test_default_bind_is_loopback_and_remote_bind_requires_bootstrap_auth(self) -> None:
+        self.assertEqual(serve.DEFAULT_HOST, "127.0.0.1")
+        with tempfile.TemporaryDirectory(prefix="make-bot-ui-bind-test-") as temporary:
+            config = serve.RelayConfig(
+                "https://example.invalid/webhook",
+                "test-secret",
+                Path(temporary) / "failures.jsonl",
+                trigger_token="trigger-secret",
+            )
+            with self.assertRaisesRegex(ValueError, "protected configuration"):
+                serve.create_server("0.0.0.0", 0, config)
+
+    def test_remote_page_requires_auth_before_issuing_secure_trigger_cookie(self) -> None:
+        capture = CaptureState()
+        with RunningServer(ThreadingHTTPServer(("127.0.0.1", 0), capture_handler(capture))) as target:
+            with tempfile.TemporaryDirectory(prefix="make-bot-ui-remote-auth-test-") as temporary:
+                config = serve.RelayConfig(
+                    target,
+                    "test-secret",
+                    Path(temporary) / "failures.jsonl",
+                    timeout=1,
+                    trigger_token="trigger-secret",
+                    allow_local_http=True,
+                    remote_auth_token="remote-bootstrap",
+                    allow_remote=True,
+                    secure_cookie=True,
+                )
+                server = ThreadingHTTPServer(
+                    ("127.0.0.1", 0),
+                    serve.make_handler(config, remote_mode=True),
+                )
+                with RunningServer(server) as local:
+                    unauthenticated = Request(local + "/", method="GET")
+                    try:
+                        urlopen(unauthenticated, timeout=2)
+                    except HTTPError as error:
+                        self.assertEqual(error.code, HTTPStatus.UNAUTHORIZED)
+                        self.assertIsNone(error.headers.get("Set-Cookie"))
+                        try:
+                            self.assertEqual(json.loads(error.read()), {"error": "unauthorized"})
+                        finally:
+                            error.close()
+                    else:
+                        self.fail("remote page should require bootstrap authorization")
+
+                    authenticated = Request(
+                        local + "/",
+                        method="GET",
+                        headers={"Authorization": "Bearer remote-bootstrap"},
+                    )
+                    with urlopen(authenticated, timeout=2) as response:
+                        cookie = response.headers["Set-Cookie"]
+                        self.assertIn("Secure", cookie)
+                        self.assertNotIn("remote-bootstrap", response.read().decode("utf-8"))
+
+                self.assertEqual(capture.requests, [])
+
+    def test_malformed_request_targets_return_sanitized_400_without_traceback(self) -> None:
+        for method in ("GET", "POST"):
+            with self.subTest(method=method):
+                with tempfile.TemporaryDirectory(prefix="make-bot-ui-target-test-") as temporary:
+                    stderr = io.StringIO()
+                    config = serve.RelayConfig(
+                        "https://example.invalid/webhook",
+                        "test-secret",
+                        Path(temporary) / "failures.jsonl",
+                        trigger_token="trigger-secret",
+                    )
+                    server = ThreadingHTTPServer(("127.0.0.1", 0), serve.make_handler(config))
+                    with redirect_stderr(stderr), RunningServer(server) as local:
+                        response = raw_request(
+                            local,
+                            f"{method} http://[::1 HTTP/1.0".encode("ascii"),
+                        )
+                    self.assertIn(b"400 Bad Request", response)
+                    self.assertIn(b'{"error":"invalid request target"}', response)
+                    self.assertNotIn(b"trigger-secret", response)
+                    self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_malformed_webhook_endpoints_return_generic_502_and_log_payload(self) -> None:
         endpoints = (
@@ -362,6 +494,80 @@ class MakeBotUICapabilityTests(unittest.TestCase):
         self.assertEqual(result["adapter"], "manual-browser")
         self.assertEqual(result["status"], "fallback")
         self.assertIn("unavailable", result["reason"])
+
+    def test_tailscale_probe_does_not_run_when_node_is_logged_out(self) -> None:
+        runner = Mock(
+            return_value=capabilities.subprocess.CompletedProcess(
+                ["tailscale", "status", "--json"],
+                0,
+                stdout='{"BackendState":"NeedsLogin"}',
+                stderr="",
+            )
+        )
+        opener = Mock()
+        with patch.object(capabilities.shutil, "which", return_value="/usr/bin/tailscale"):
+            result = capabilities.probe_tailscale_reachability(8765, runner=runner, opener=opener)
+        self.assertEqual(result["status"], "NOT RUN")
+        self.assertTrue(result["blocked"])
+        runner.assert_called_once()
+        opener.assert_not_called()
+
+    def test_tailscale_probe_does_not_run_without_an_address(self) -> None:
+        runner = Mock(
+            side_effect=[
+                capabilities.subprocess.CompletedProcess(
+                    ["tailscale", "status", "--json"],
+                    0,
+                    stdout='{"BackendState":"Running"}',
+                    stderr="",
+                ),
+                capabilities.subprocess.CompletedProcess(
+                    ["tailscale", "ip", "-4"],
+                    0,
+                    stdout="",
+                    stderr="",
+                ),
+            ]
+        )
+        opener = Mock()
+        with patch.object(capabilities.shutil, "which", return_value="/usr/bin/tailscale"):
+            result = capabilities.probe_tailscale_reachability(8765, runner=runner, opener=opener)
+        self.assertEqual(result["status"], "NOT RUN")
+        self.assertTrue(result["blocked"])
+        self.assertEqual(runner.call_count, 2)
+        opener.assert_not_called()
+
+    def test_tailscale_probe_checks_health_only_after_login_and_address(self) -> None:
+        runner = Mock(
+            side_effect=[
+                capabilities.subprocess.CompletedProcess(
+                    ["tailscale", "status", "--json"],
+                    0,
+                    stdout='{"BackendState":"Running"}',
+                    stderr="",
+                ),
+                capabilities.subprocess.CompletedProcess(
+                    ["tailscale", "ip", "-4"],
+                    0,
+                    stdout="100.64.0.7\n",
+                    stderr="",
+                ),
+            ]
+        )
+        response = Mock()
+        response.getcode.return_value = HTTPStatus.OK
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=None)
+        response.read.return_value = b"health-secret-body"
+        opener = Mock(return_value=response)
+        with patch.object(capabilities.shutil, "which", return_value="/usr/bin/tailscale"):
+            result = capabilities.probe_tailscale_reachability(8765, runner=runner, opener=opener)
+        self.assertEqual(result["status"], "PASS")
+        self.assertEqual(result["address"], "100.64.0.7")
+        self.assertEqual(result["http_status"], HTTPStatus.OK)
+        request = opener.call_args.args[0]
+        self.assertEqual(request.full_url, "http://100.64.0.7:8765/healthz")
+        self.assertNotIn("/send", request.full_url)
 
 
 if __name__ == "__main__":
