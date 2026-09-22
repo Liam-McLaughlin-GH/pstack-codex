@@ -95,14 +95,25 @@ source citations, authoritative map values, Doctor receipt, live coverage, and
 retained evidence. It returns exit code `0` for `clean` or
 `changed`, and `1` for `blocked`; malformed input or unsafe paths return `2`.
 
-`apply` emits a versioned correction receipt and writes a durable provenance
-record beside the patch plan. Keep the helper output as the change log and
-retain the provenance record for the final audit. A `changed` result requires the
-helper-produced record, its plan identity and before-state, the receipt's
-apply/run/session IDs to match a post-apply live report, and every affected
-feature to carry the documented `post_apply` object with a matching re-drive
-receipt. A copied baseline live report or hand-written receipt cannot prove
-`changed`.
+`apply` emits a versioned correction receipt, writes durable provenance beside
+the patch plan, and creates a helper-issued apply record under the target's
+`.maintain-verification-state/apply-records/` directory. The record contains
+the plan identity, before-state, after-state, and a marker checked with a
+per-target key stored with mode `0600`. Keep the helper output as the change
+log and retain the provenance and state record for the final audit. The state
+directory is local helper state, not a verification feature, and must not be
+copied or committed.
+
+`audit` derives the apply-record path from the target and helper-issued
+`apply_id`; it does not trust a receipt-supplied record path or marker. A
+`changed` result requires that record, its valid marker, its plan identity and
+before-state, the receipt's apply/run/session IDs to match a post-apply live
+report, and every affected feature to carry the documented `post_apply` object
+with a matching re-drive receipt. A copied baseline live report or a
+hand-written receipt/provenance bundle cannot prove `changed`. This is a local
+integrity boundary: a caller using the supported receipt interface cannot issue
+an apply record, while a user who can replace the helper's private state can
+defeat any same-user local marker. Missing or invalid state blocks the audit.
 
 Use these classifications:
 

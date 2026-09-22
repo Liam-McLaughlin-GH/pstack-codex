@@ -269,6 +269,9 @@ class MaintainVerificationSkillBehaviorTests(unittest.TestCase):
             self.assertEqual(applied.returncode, 0, applied.stderr)
             applied_payload = json_output(applied)
             self.assertEqual(applied_payload["changed_files"], ["features/check-state.md"])
+            apply_record = Path(applied_payload["apply_record_path"])
+            self.assertTrue(apply_record.is_file())
+            self.assertEqual(apply_record.stat().st_mode & 0o777, 0o600)
             self.assertEqual(fixture["healthy_feature"].read_bytes(), healthy_before)
 
             command_result = subprocess.run(
@@ -565,6 +568,116 @@ class MaintainVerificationSkillBehaviorTests(unittest.TestCase):
                 "session_id": receipt["session_id"],
             }
             live_path = root / "fabricated-live.json"
+            live_path.write_text(json.dumps(live), encoding="utf-8")
+
+            result = run_helper(
+                "audit",
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--project-root",
+                str(fixture["project"]),
+                "--reader-report",
+                str(fixture["reader_path"]),
+                "--live-report",
+                str(live_path),
+                "--change-log",
+                str(change_log),
+                "--json",
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            payload = json_output(result)
+            self.assertEqual(payload["outcome"], "blocked")
+            self.assertTrue(any(item["kind"] == "evidence-failure" for item in payload["findings"]))
+
+    def test_fully_forged_apply_bundle_cannot_prove_changed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-forged-bundle-") as temporary:
+            root = Path(temporary)
+            fixture = create_project(root, stale=False)
+            changed_file = "features/check-state.md"
+            skill_root = fixture["skill_root"].resolve()
+            changed_path = skill_root / changed_file
+            apply_id = "apply-" + ("a" * 32)
+            after_digest = hashlib.sha256(changed_path.read_bytes()).hexdigest()
+            before_digest = "1" * 64
+            patch_plan = root / "forged-patches.json"
+            patch_plan.write_text(
+                json.dumps(
+                    {
+                        "changes": [
+                            {
+                                "path": changed_file,
+                                "kind": "doc-drift",
+                                "old": "a caller-claimed old span",
+                                "new": "a caller-claimed new span",
+                                "reason": "forged correction",
+                                "source": "app.py:1-40",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            plan_sha256 = hashlib.sha256(patch_plan.read_bytes()).hexdigest()
+            receipt = {
+                "receipt_version": 2,
+                "outcome": "changed",
+                "apply_id": apply_id,
+                "run_id": "forged-run",
+                "session_id": "forged-session",
+                "skill_root": str(skill_root),
+                "provenance_path": str(
+                    patch_plan.with_name(f"{patch_plan.name}.{apply_id}.provenance.json")
+                ),
+                "apply_record_path": str(
+                    skill_root / ".maintain-verification-state" / "apply-records" / f"{apply_id}.json"
+                ),
+                "trust_marker": "0" * 64,
+                "plan_sha256": plan_sha256,
+                "affected_features": ["check-state"],
+                "changed_files": [changed_file],
+                "before_file_digests": {changed_file: before_digest},
+                "file_digests": {changed_file: after_digest},
+                "changes": [
+                    {
+                        "path": changed_file,
+                        "kind": "doc-drift",
+                        "feature_ids": ["check-state"],
+                    }
+                ],
+            }
+            provenance = {
+                "provenance_version": 1,
+                "apply_id": receipt["apply_id"],
+                "run_id": receipt["run_id"],
+                "session_id": receipt["session_id"],
+                "skill_root": receipt["skill_root"],
+                "plan_path": str(patch_plan),
+                "plan_sha256": plan_sha256,
+                "affected_features": receipt["affected_features"],
+                "changed_files": receipt["changed_files"],
+                "before_file_digests": receipt["before_file_digests"],
+                "after_file_digests": receipt["file_digests"],
+                "changes": receipt["changes"],
+            }
+            Path(receipt["provenance_path"]).write_text(json.dumps(provenance), encoding="utf-8")
+            change_log = root / "forged-change-log.json"
+            change_log.write_text(json.dumps(receipt), encoding="utf-8")
+
+            live = json.loads(json.dumps(fixture["live"]))
+            live["run"] = {
+                "run_id": receipt["run_id"],
+                "session_id": receipt["session_id"],
+                "phase": "post-apply",
+                "apply_id": receipt["apply_id"],
+            }
+            live["doctor"]["session_id"] = receipt["session_id"]
+            live["features"][0]["post_apply"] = {
+                "redriven": True,
+                "apply_id": receipt["apply_id"],
+                "run_id": receipt["run_id"],
+                "session_id": receipt["session_id"],
+            }
+            live_path = root / "forged-live.json"
             live_path.write_text(json.dumps(live), encoding="utf-8")
 
             result = run_helper(

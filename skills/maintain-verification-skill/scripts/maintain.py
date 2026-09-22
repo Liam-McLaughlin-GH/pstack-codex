@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import shutil
+import stat
 import sys
 import tempfile
 import uuid
@@ -47,6 +50,11 @@ LIVE_STATUSES = {"pass", "fail", "verified-unreachable", "harness-gap", "not-run
 PATCH_KINDS = {"doc-drift", "harness-gap"}
 RECEIPT_VERSION = 2
 PROVENANCE_VERSION = 1
+APPLY_RECORD_VERSION = 1
+TRUST_STATE_DIR = ".maintain-verification-state"
+TRUST_KEY_FILE = "apply-signing-key"
+TRUST_RECORDS_DIR = "apply-records"
+APPLY_ID_PATTERN = re.compile(r"^apply-[0-9a-f]{32}$")
 DOCTOR_METADATA_FIELDS = ("target", "build", "endpoint", "auth", "disposable")
 POST_APPLY_FIELDS = ("redriven", "apply_id", "run_id", "session_id")
 SKILL_NAME_PATTERN = re.compile(r"^verify-[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -160,6 +168,58 @@ def _sha256(path: Path) -> str:
 
 def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex}"
+
+
+def _canonical_json(value: dict[str, Any]) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _trust_state_paths(skill_root: Path, *, create: bool) -> tuple[Path, Path]:
+    state_root = skill_root / TRUST_STATE_DIR
+    records_root = state_root / TRUST_RECORDS_DIR
+    paths = ((state_root, "apply trust state"), (records_root, "apply trust records"))
+    for path, label in paths:
+        if path.is_symlink():
+            raise MaintainError(f"{label} must not be a symlink: {path}")
+        if create:
+            if path.exists() and not path.is_dir():
+                raise MaintainError(f"{label} must be a directory: {path}")
+            path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(path, 0o700)
+        elif not path.is_dir():
+            raise MaintainError(f"{label} is missing: {path}")
+    return state_root / TRUST_KEY_FILE, records_root
+
+
+def _trust_key(skill_root: Path, *, create: bool) -> bytes:
+    key_path, _ = _trust_state_paths(skill_root, create=create)
+    if key_path.is_symlink():
+        raise MaintainError(f"apply trust key must not be a symlink: {key_path}")
+    if not key_path.exists():
+        if not create:
+            raise MaintainError(f"apply trust key is missing: {key_path}")
+        _atomic_create(key_path, secrets.token_hex(32))
+    if not key_path.is_file():
+        raise MaintainError(f"apply trust key must be a regular file: {key_path}")
+    if stat.S_IMODE(key_path.stat().st_mode) & 0o077:
+        raise MaintainError(f"apply trust key is too permissive: {key_path}")
+    try:
+        raw_key = key_path.read_text(encoding="ascii").strip()
+        if not re.fullmatch(r"[0-9a-f]{64}", raw_key):
+            raise ValueError("invalid key length or encoding")
+        return bytes.fromhex(raw_key)
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise MaintainError(f"could not read apply trust key {key_path}: {exc}") from exc
+
+
+def _apply_record_path(skill_root: Path, apply_id: str) -> Path:
+    if not APPLY_ID_PATTERN.fullmatch(apply_id):
+        raise MaintainError("apply_id is not a helper-issued apply identity")
+    return skill_root / TRUST_STATE_DIR / TRUST_RECORDS_DIR / f"{apply_id}.json"
+
+
+def _trust_marker(key: bytes, record: dict[str, Any]) -> str:
+    return hmac.new(key, _canonical_json(record), hashlib.sha256).hexdigest()
 
 
 def _metadata_present(value: Any) -> bool:
@@ -951,6 +1011,78 @@ def _digest_map(
     return normalized
 
 
+def _validate_apply_record(
+    receipt: dict[str, Any],
+    skill_root: Path,
+    provenance_path: Path | None,
+    plan_path: Path | None,
+    plan_sha256: Any,
+    changed_files: list[str],
+    affected_features: list[str],
+    normalized_changes: list[dict[str, Any]],
+    before_digests: dict[str, str],
+    after_digests: dict[str, str],
+    findings: list[dict[str, Any]],
+) -> None:
+    """Require an independently stored, helper-issued apply record."""
+
+    apply_id = receipt.get("apply_id")
+    if not isinstance(apply_id, str) or not APPLY_ID_PATTERN.fullmatch(apply_id):
+        findings.append(_finding("evidence-failure", "change receipt has no helper-issued apply identity"))
+        return
+
+    try:
+        record_path = _apply_record_path(skill_root, apply_id)
+    except MaintainError as exc:
+        findings.append(_finding("evidence-failure", str(exc)))
+        return
+    if receipt.get("apply_record_path") != str(record_path):
+        findings.append(_finding("evidence-failure", "change receipt names a different apply record"))
+
+    receipt_marker = receipt.get("trust_marker")
+    if not isinstance(receipt_marker, str) or not re.fullmatch(r"[0-9a-f]{64}", receipt_marker):
+        findings.append(_finding("evidence-failure", "change receipt has an invalid apply trust marker"))
+
+    try:
+        key = _trust_key(skill_root, create=False)
+        if record_path.is_symlink() or not record_path.is_file():
+            raise MaintainError(f"helper-issued apply record is missing: {record_path}")
+        record = _load_json(record_path)
+        stored_marker = record.get("trust_marker")
+        unsigned_record = dict(record)
+        unsigned_record.pop("trust_marker", None)
+        if not isinstance(stored_marker, str) or not hmac.compare_digest(
+            stored_marker, _trust_marker(key, unsigned_record)
+        ):
+            raise MaintainError("helper-issued apply record has an invalid trust marker")
+    except (MaintainError, OSError) as exc:
+        findings.append(_finding("evidence-failure", str(exc)))
+        return
+
+    expected_record = {
+        "record_version": APPLY_RECORD_VERSION,
+        "record_id": apply_id,
+        "issued_by": "maintain-verification-skill",
+        "apply_id": apply_id,
+        "run_id": receipt.get("run_id"),
+        "session_id": receipt.get("session_id"),
+        "skill_root": str(skill_root),
+        "plan_path": str(plan_path) if plan_path is not None else None,
+        "plan_sha256": plan_sha256,
+        "provenance_path": str(provenance_path) if provenance_path is not None else None,
+        "affected_features": affected_features,
+        "changed_files": changed_files,
+        "before_file_digests": before_digests,
+        "after_file_digests": after_digests,
+        "changes": normalized_changes,
+    }
+    for field, expected in expected_record.items():
+        if record.get(field) != expected:
+            findings.append(_finding("evidence-failure", f"helper-issued apply record does not match {field}"))
+    if record.get("trust_marker") != receipt_marker:
+        findings.append(_finding("evidence-failure", "change receipt does not match the apply trust marker"))
+
+
 def _validate_change_receipt(
     path: Path | None, skill_root: Path, feature_ids: list[str]
 ) -> tuple[dict[str, Any] | None, list[str], bool, list[dict[str, Any]]]:
@@ -1054,6 +1186,8 @@ def _validate_change_receipt(
         findings.append(_finding("evidence-failure", "change receipt has an invalid plan_sha256"))
 
     provenance: dict[str, Any] | None = None
+    provenance_path: Path | None = None
+    plan_path: Path | None = None
     try:
         provenance_path = _absolute_regular_file(
             receipt.get("provenance_path"), "change receipt provenance_path"
@@ -1099,6 +1233,19 @@ def _validate_change_receipt(
             if before_digests.get(relative) == after_digests.get(relative):
                 findings.append(_finding("evidence-failure", f"apply provenance has no content transition for {relative}"))
 
+    _validate_apply_record(
+        receipt,
+        skill_root,
+        provenance_path,
+        plan_path if provenance is not None else None,
+        plan_sha256,
+        changed_files,
+        affected_features,
+        normalized_changes,
+        before_digests,
+        after_digests,
+        findings,
+    )
     return receipt, changed_files, not findings, findings
 
 
@@ -1198,11 +1345,11 @@ def _atomic_write(path: Path, text: str) -> None:
                 pass
 
 
-def _atomic_create(path: Path, text: str) -> None:
-    """Create a new durable record without replacing an existing one."""
+def _atomic_create(path: Path, text: str, *, label: str = "durable record") -> None:
+    """Create a new durable file without replacing an existing one."""
 
     if os.path.lexists(path):
-        raise MaintainError(f"durable apply provenance already exists: {path}")
+        raise MaintainError(f"{label} already exists: {path}")
     temporary: str | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -1314,15 +1461,56 @@ def apply_patch_plan(
         "changes": metadata,
     }
 
+    trust_key = _trust_key(skill_root, create=True)
+    apply_record_path = _apply_record_path(skill_root, apply_id)
+    if os.path.lexists(apply_record_path):
+        raise MaintainError(f"helper-issued apply record already exists: {apply_record_path}")
+
     written: list[Path] = []
+    provenance_written = False
+    record_written = False
     try:
         for path, text in proposed.items():
             _atomic_write(path, text)
             written.append(path)
         after_file_digests = {relative: _sha256(skill_root / relative) for relative in changed_files}
         provenance["after_file_digests"] = after_file_digests
-        _atomic_create(provenance_path, json.dumps(provenance, indent=2, sort_keys=True))
+        _atomic_create(
+            provenance_path,
+            json.dumps(provenance, indent=2, sort_keys=True),
+            label="durable apply provenance",
+        )
+        provenance_written = True
+        apply_record = {
+            "record_version": APPLY_RECORD_VERSION,
+            "record_id": apply_id,
+            "issued_by": "maintain-verification-skill",
+            "apply_id": apply_id,
+            "run_id": run_id,
+            "session_id": session_id,
+            "skill_root": str(skill_root),
+            "plan_path": str(patch_plan_path),
+            "plan_sha256": plan_sha256,
+            "provenance_path": str(provenance_path),
+            "affected_features": affected_features,
+            "changed_files": changed_files,
+            "before_file_digests": before_file_digests,
+            "after_file_digests": after_file_digests,
+            "changes": metadata,
+        }
+        trust_marker = _trust_marker(trust_key, apply_record)
+        apply_record["trust_marker"] = trust_marker
+        _atomic_create(
+            apply_record_path,
+            json.dumps(apply_record, indent=2, sort_keys=True),
+            label="helper-issued apply record",
+        )
+        record_written = True
     except Exception:
+        if record_written:
+            apply_record_path.unlink(missing_ok=True)
+        if provenance_written:
+            provenance_path.unlink(missing_ok=True)
         for path in written:
             _atomic_write(path, originals[path])
         raise
@@ -1334,6 +1522,8 @@ def apply_patch_plan(
         "session_id": session_id,
         "skill_root": str(skill_root),
         "provenance_path": str(provenance_path),
+        "apply_record_path": str(apply_record_path),
+        "trust_marker": trust_marker,
         "plan_sha256": plan_sha256,
         "affected_features": affected_features,
         "changed_files": changed_files,

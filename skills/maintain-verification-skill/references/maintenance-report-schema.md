@@ -137,13 +137,19 @@ span must occur exactly once, every target must be an existing regular file,
 and all targets must remain inside the verification directory. Feature-file
 changes derive their affected feature from the path. Harness changes must set
 `feature_ids` on the change or `affected_features` on the plan. The helper
-preflights the complete plan before writing. It writes a separate durable
-provenance record beside the patch plan, then emits a version-2 receipt with
-`apply_id`, `run_id`, `session_id`, `provenance_path`, `plan_sha256`,
-`affected_features`, `before_file_digests`, and SHA-256 digests of the changed
-files. Save the helper output unchanged as the change log and retain the
-provenance record. A hand-written receipt without that helper-produced record
-cannot prove `changed`.
+preflights the complete plan before writing. It writes a separate
+durable provenance record beside the patch plan and creates a helper-issued
+apply record under the target's
+`.maintain-verification-state/apply-records/` directory. That record stores
+the plan identity, before-state, after-state, and a marker checked with a
+per-target key stored with mode `0600`. The helper then emits a version-2
+receipt with `apply_id`, `run_id`, `session_id`, `provenance_path`,
+`apply_record_path`, `trust_marker`, `plan_sha256`, `affected_features`,
+`before_file_digests`, and SHA-256 digests of the changed files. Save the
+helper output unchanged as the change log and retain the provenance and state
+record. The state directory is local helper state, not a feature artifact, and
+must not be copied or committed. A hand-written receipt/provenance bundle
+without that helper-issued record cannot prove `changed`.
 
 For a post-correction live report, set `run.phase` to `post-apply` and copy
 the apply receipt's `run_id`, `session_id`, and `apply_id` into the run object.
@@ -158,11 +164,15 @@ Every affected feature result also carries a `post_apply` object:
 }
 ```
 
-The final audit requires that object, compares those identities and the file
-digests, checks the patch-plan identity and before-state in the provenance
-record, and requires an actual before/after content transition before it can
-return `changed`. No result-level identity fields or alternate post-apply keys
-are accepted.
+The final audit derives the apply-record path from the target and `apply_id`
+and verifies the record's marker before comparing its contents. It requires
+that object, compares those identities and the file digests, checks the
+patch-plan identity and before-state in the helper-issued record, and requires
+an actual before/after content transition before it can return `changed`. No
+result-level identity fields or alternate post-apply keys are accepted. This
+local marker protects the supported receipt interface, not a same-user caller
+who can replace the private state directory or key; missing or invalid state
+is an evidence failure.
 
 ## Cleanup manifest
 
