@@ -56,8 +56,11 @@ Use structured command values throughout the JSON specification:
 Do not accept a shell command string. The helper renders argv with shell
 quoting for a reader, but does not execute it. Executables cannot contain shell
 syntax. Command arguments cannot use absolute paths or `..` to escape the
-project. Keep disposable paths below `disposable_root`, evidence paths below
-`evidence_root`, and keep those roots separate.
+project. An optional `cwd` is a relative project path rendered as a separate
+`Working directory` instruction beside the literal command. Cleanup may not
+use the evidence root or a path below it as its working directory. Keep
+disposable paths below `disposable_root`, evidence paths below `evidence_root`,
+and keep those roots separate.
 
 The app specification also records `setup`, `environment`, `seed_auth`,
 `isolation`, `ownership`, `evidence_scope`, and `failure_signals`. Every
@@ -110,6 +113,11 @@ Run the helper's validator on an existing generated skill without rewriting it:
 python3 scripts/scaffold.py validate \
   --skill-root /absolute/path/project/.agents/skills/verify-app
 ```
+
+The validator re-parses every emitted Launch, Doctor, Drive, Cleanup, and
+feature action command. It rejects free-form command text, unsafe executable or
+argv paths, and cleanup commands that address the evidence root through argv or
+`cwd`.
 
 The helper refuses an existing target, including a broken symlink. It rejects
 symlinks in the complete generated tree and in every parent component. It

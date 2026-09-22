@@ -110,6 +110,23 @@ def spec_for() -> dict[str, object]:
     }
 
 
+def spec_with_working_directory() -> dict[str, object]:
+    spec = spec_for()
+    app = spec["app"]  # type: ignore[assignment]
+    app["disposable_root"] = "runner/scratch"  # type: ignore[index]
+    app["disposable_paths"] = ["runner/scratch/state.txt"]  # type: ignore[index]
+    for command_value in (
+        app["launch"],  # type: ignore[index]
+        app["doctor"],  # type: ignore[index]
+        app["drive"],  # type: ignore[index]
+        app["cleanup"],  # type: ignore[index]
+    ):
+        command_value["cwd"] = "runner"  # type: ignore[index]
+    for action in spec["features"][0]["actions"]:  # type: ignore[index]
+        action["command"]["cwd"] = "runner"  # type: ignore[index]
+    return spec
+
+
 def copy_fixture(project: Path) -> None:
     (project / "tiny_app.py").write_text(FIXTURE.read_text(encoding="utf-8"), encoding="utf-8")
 
@@ -124,7 +141,7 @@ def run_helper(*args: str) -> subprocess.CompletedProcess[str]:
     )
 
 
-def generated_command(markdown: str, section: str, label: str = "Command") -> list[str]:
+def _generated_section_body(markdown: str, section: str) -> str:
     section_match = re.search(
         rf"^## {re.escape(section)}\n(?P<body>.*?)(?=^## |\Z)",
         markdown,
@@ -132,16 +149,41 @@ def generated_command(markdown: str, section: str, label: str = "Command") -> li
     )
     if section_match is None:
         raise AssertionError(f"missing generated section {section}")
-    line = next(
-        line for line in section_match.group("body").splitlines() if line.startswith(f"- {label}: ")
+
+    return section_match.group("body")
+
+
+def _generated_code_value(line: str, label: str) -> str:
+    match = re.fullmatch(
+        rf"- {re.escape(label)}: (?P<ticks>`+)(?P<value>.*?)(?P=ticks)\s*",
+        line.strip(),
     )
-    match = re.fullmatch(rf"- {re.escape(label)}: (`+)(.*)\1", line)
     if match is None:
         raise AssertionError(f"could not parse generated {label}: {line}")
-    return shlex.split(match.group(2))
+    return match.group("value").strip()
 
 
-def generated_action_command(skill_root: Path, action_name: str) -> list[str]:
+def generated_command_context(
+    markdown: str, section: str, label: str = "Command"
+) -> tuple[list[str], str | None]:
+    body = _generated_section_body(markdown, section)
+    lines = body.splitlines()
+    command_line = next(
+        (line for line in lines if line.strip().startswith(f"- {label}: ")),
+        None,
+    )
+    if command_line is None:
+        raise AssertionError(f"missing generated {label} in {section}")
+    command = shlex.split(_generated_code_value(command_line, label))
+    cwd_line = next(
+        (line for line in lines if line.strip().startswith("- Working directory: ")),
+        None,
+    )
+    cwd = _generated_code_value(cwd_line, "Working directory") if cwd_line else None
+    return command, cwd
+
+
+def _generated_action_block(skill_root: Path, action_name: str) -> str:
     text = (skill_root / "features" / "check-state.md").read_text(encoding="utf-8")
     match = re.search(
         rf"^- \*\*{re.escape(action_name)}\.\*\*$(.*?)(?=^- \*\*|^## |\Z)",
@@ -150,17 +192,53 @@ def generated_action_command(skill_root: Path, action_name: str) -> list[str]:
     )
     if match is None:
         raise AssertionError(f"missing generated action {action_name}")
-    line = next(line for line in match.group(1).splitlines() if "- Action: " in line)
-    command_match = re.search(r"- Action: (`+)(.*)\1", line)
-    if command_match is None:
-        raise AssertionError(f"could not parse generated action: {line}")
-    return shlex.split(command_match.group(2))
+    return match.group(1)
 
 
-def run_literal(argv: list[str], project: Path) -> dict[str, object]:
+def generated_action_context(skill_root: Path, action_name: str) -> tuple[list[str], str | None]:
+    block = _generated_action_block(skill_root, action_name)
+    lines = block.splitlines()
+    line = next((line for line in lines if line.strip().startswith("- Action: ")), None)
+    if line is None:
+        raise AssertionError(f"missing generated Action for {action_name}")
+    command = shlex.split(_generated_code_value(line, "Action"))
+    cwd_line = next(
+        (line for line in lines if line.strip().startswith("- Working directory: ")),
+        None,
+    )
+    cwd = _generated_code_value(cwd_line, "Working directory") if cwd_line else None
+    return command, cwd
+
+
+def generated_action_evidence_path(skill_root: Path, action_name: str) -> str:
+    block = _generated_action_block(skill_root, action_name)
+    line = next((line for line in block.splitlines() if line.strip().startswith("- Evidence: ")), None)
+    if line is None:
+        raise AssertionError(f"missing generated Evidence for {action_name}")
+    match = re.match(r"- Evidence: (`+)(.*?)\1(?:,|$)", line.strip())
+    if match is None:
+        raise AssertionError(f"could not parse generated evidence: {line}")
+    return match.group(2).strip()
+
+
+def generated_disposable_paths(skill_root: Path) -> list[str]:
+    text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+    line = next((line for line in text.splitlines() if line.startswith("- Disposable paths: ")), None)
+    if line is None:
+        raise AssertionError("missing generated disposable paths")
+    return re.findall(r"`([^`]+)`", line)
+
+
+def run_literal(
+    argv: list[str],
+    project: Path,
+    *,
+    cwd: str | None = None,
+) -> dict[str, object]:
+    working_directory = project if cwd is None else project / cwd
     completed = subprocess.run(
         argv,
-        cwd=project,
+        cwd=working_directory,
         capture_output=True,
         text=True,
         check=False,
@@ -175,13 +253,27 @@ def run_literal(argv: list[str], project: Path) -> dict[str, object]:
 
 
 class CreateVerificationSkillBehaviorTests(unittest.TestCase):
-    def create_skill(self, root: Path) -> tuple[Path, dict[str, object]]:
+    def seed_generated_disposable_state(self, project: Path, skill_root: Path) -> list[Path]:
+        targets = [project / path for path in generated_disposable_paths(skill_root)]
+        self.assertTrue(targets)
+        for target in targets:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text("ready\n", encoding="utf-8")
+        return targets
+
+    def create_skill(
+        self,
+        root: Path,
+        *,
+        spec: dict[str, object] | None = None,
+        fixture_subdir: str | None = None,
+    ) -> tuple[Path, dict[str, object]]:
         project = root / "project"
         project.mkdir()
-        copy_fixture(project)
-        (project / "scratch").mkdir()
-        (project / "scratch" / "state.txt").write_text("ready\n", encoding="utf-8")
-        spec = spec_for()
+        fixture_project = project if fixture_subdir is None else project / fixture_subdir
+        fixture_project.mkdir(parents=True, exist_ok=True)
+        copy_fixture(fixture_project)
+        spec = spec or spec_for()
         spec_path = root / "spec.json"
         spec_path.write_text(json.dumps(spec, indent=2), encoding="utf-8")
         generated = run_helper(
@@ -194,6 +286,7 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
         )
         self.assertEqual(generated.returncode, 0, generated.stderr)
         skill_root = Path(json.loads(generated.stdout)["skill_root"])
+        self.seed_generated_disposable_state(project, skill_root)
         return skill_root, spec
 
     def execute_generated_attempt(
@@ -201,34 +294,48 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
         project: Path,
         skill_root: Path,
         *,
-        evidence_name: str,
         action_name: str,
         expected_exit: int,
         expected_text: str,
     ) -> None:
         skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
-        launch = generated_command(skill_text, "Launch")
-        doctor = generated_command(skill_text, "Doctor")
-        drive = generated_command(skill_text, "Drive")
-        cleanup = generated_command(skill_text, "Cleanup")
-        action = generated_action_command(skill_root, action_name)
-        self.assertEqual(action, drive if action_name == "Check the ready state" else action)
+        launch, launch_cwd = generated_command_context(skill_text, "Launch")
+        doctor, doctor_cwd = generated_command_context(skill_text, "Doctor")
+        drive, drive_cwd = generated_command_context(skill_text, "Drive")
+        cleanup, cleanup_cwd = generated_command_context(skill_text, "Cleanup")
+        action, action_cwd = generated_action_context(skill_root, action_name)
+        if action_name == "Check the ready state":
+            self.assertEqual(action, drive)
+            self.assertEqual(action_cwd, drive_cwd)
 
-        records = [run_literal(launch, project), run_literal(doctor, project)]
-        drive_record = run_literal(drive if action_name == "Check the ready state" else action, project)
+        command = drive if action_name == "Check the ready state" else action
+        command_cwd = drive_cwd if action_name == "Check the ready state" else action_cwd
+        records = [
+            run_literal(launch, project, cwd=launch_cwd),
+            run_literal(doctor, project, cwd=doctor_cwd),
+        ]
+        drive_record = run_literal(command, project, cwd=command_cwd)
         records.append(drive_record)
         self.assertEqual(records[0]["exit_code"], 0)
         self.assertEqual(records[1]["exit_code"], 0, records[1])
         self.assertEqual(drive_record["exit_code"], expected_exit, drive_record)
         self.assertIn(expected_text, str(drive_record["visible_result"]))
-        records[-1]["read_only_side_effect"] = (project / "scratch" / "state.txt").read_text(encoding="utf-8").strip()
+        state_argument = next(
+            doctor[index + 1]
+            for index, value in enumerate(doctor)
+            if value == "--state" and index + 1 < len(doctor)
+        )
+        state_path = (project if doctor_cwd is None else project / doctor_cwd) / state_argument
+        disposable_paths = generated_disposable_paths(skill_root)
+        self.assertIn(str(state_path.relative_to(project)), disposable_paths)
+        records[-1]["read_only_side_effect"] = state_path.read_text(encoding="utf-8").strip()
 
-        evidence = project / "artifacts" / "tiny-fixture" / evidence_name
+        evidence = project / generated_action_evidence_path(skill_root, action_name)
         evidence.parent.mkdir(parents=True, exist_ok=True)
         evidence.write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
-        cleanup_record = run_literal(cleanup, project)
+        cleanup_record = run_literal(cleanup, project, cwd=cleanup_cwd)
         self.assertEqual(cleanup_record["exit_code"], 0, cleanup_record)
-        self.assertFalse((project / "scratch" / "state.txt").exists())
+        self.assertFalse(state_path.exists())
         self.assertTrue(evidence.is_file(), "generated cleanup must not remove proof")
         records.append(cleanup_record)
         evidence.write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
@@ -249,22 +356,152 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
             self.execute_generated_attempt(
                 project,
                 skill_root,
-                evidence_name="pass.json",
                 action_name="Check the ready state",
                 expected_exit=0,
                 expected_text="check passed: ready",
             )
 
-            (project / "scratch").mkdir(exist_ok=True)
-            (project / "scratch" / "state.txt").write_text("ready\n", encoding="utf-8")
+            self.seed_generated_disposable_state(project, skill_root)
             self.execute_generated_attempt(
                 project,
                 skill_root,
-                evidence_name="failure.json",
                 action_name="Check an incorrect expectation",
                 expected_exit=1,
                 expected_text="expected='wrong' actual='ready'",
             )
+
+    def test_generated_cwd_is_literal_executable_and_cleanup_cannot_enter_evidence(self) -> None:
+        spec = spec_with_working_directory()
+        for cleanup_cwd in ("artifacts", "artifacts/run"):
+            invalid_spec = spec_with_working_directory()
+            invalid_spec["app"]["cleanup"]["cwd"] = cleanup_cwd  # type: ignore[index]
+            with self.assertRaises(ScaffoldError):
+                validate_spec(invalid_spec)
+
+        with tempfile.TemporaryDirectory(prefix="create-verification-cwd-") as temporary:
+            root = Path(temporary)
+            skill_root, _ = self.create_skill(root, spec=spec, fixture_subdir="runner")
+            skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8")
+            for section in ("Launch", "Doctor", "Drive", "Cleanup"):
+                self.assertEqual(generated_command_context(skill_text, section)[1], "runner")
+            self.assertEqual(
+                generated_action_context(skill_root, "Check the ready state")[1],
+                "runner",
+            )
+            validated = run_helper("validate", "--skill-root", str(skill_root))
+            self.assertEqual(validated.returncode, 0, validated.stderr)
+            self.execute_generated_attempt(
+                root / "project",
+                skill_root,
+                action_name="Check the ready state",
+                expected_exit=0,
+                expected_text="check passed: ready",
+            )
+
+            skill_file = skill_root / "SKILL.md"
+            original = skill_file.read_text(encoding="utf-8")
+            cleanup_start = original.index("## Cleanup")
+            cleanup_end = original.index("## Helpers")
+            cleanup = original[cleanup_start:cleanup_end].replace(
+                "- Working directory: `runner`",
+                "- Working directory: `artifacts`",
+                1,
+            )
+            skill_file.write_text(original[:cleanup_start] + cleanup + original[cleanup_end:], encoding="utf-8")
+            errors = scaffold_module.validate_generated_skill(skill_root)
+            self.assertTrue(any("Cleanup.Command.cwd" in error for error in errors), errors)
+
+    def test_existing_tree_revalidates_all_emitted_command_contracts(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-command-validation-") as temporary:
+            root = Path(temporary)
+            skill_root, _ = self.create_skill(root)
+            skill_file = skill_root / "SKILL.md"
+            original_skill = skill_file.read_text(encoding="utf-8")
+            launch_line = next(
+                line for line in original_skill.splitlines() if line.startswith("- Command: ")
+            )
+            skill_file.write_text(
+                original_skill.replace(launch_line, launch_line.replace("`", "", 2), 1),
+                encoding="utf-8",
+            )
+            errors = scaffold_module.validate_generated_skill(skill_root)
+            self.assertTrue(any("Launch Command" in error and "inline code" in error for error in errors), errors)
+            skill_file.write_text(original_skill, encoding="utf-8")
+
+            for section in ("Doctor", "Drive"):
+                section_command = next(
+                    line
+                    for line in _generated_section_body(original_skill, section).splitlines()
+                    if line.strip().startswith("- Command: ")
+                )
+                skill_file.write_text(
+                    original_skill.replace(section_command, section_command.replace("`", "", 2), 1),
+                    encoding="utf-8",
+                )
+                errors = scaffold_module.validate_generated_skill(skill_root)
+                self.assertTrue(
+                    any(f"{section} Command" in error and "inline code" in error for error in errors),
+                    errors,
+                )
+                skill_file.write_text(original_skill, encoding="utf-8")
+
+            cleanup_line = next(
+                line
+                for line in _generated_section_body(original_skill, "Cleanup").splitlines()
+                if line.strip().startswith("- Command: ")
+            )
+            skill_file.write_text(
+                original_skill.replace(cleanup_line, "- Command: `rm -rf /tmp`", 1),
+                encoding="utf-8",
+            )
+            errors = scaffold_module.validate_generated_skill(skill_root)
+            self.assertTrue(any("Cleanup.Command.argv" in error for error in errors), errors)
+            skill_file.write_text(original_skill, encoding="utf-8")
+
+            skill_file.write_text(
+                original_skill.replace(cleanup_line, "- Command: `rm -rf artifacts`", 1),
+                encoding="utf-8",
+            )
+            errors = scaffold_module.validate_generated_skill(skill_root)
+            self.assertTrue(any("protected path 'artifacts'" in error for error in errors), errors)
+            skill_file.write_text(original_skill, encoding="utf-8")
+
+            feature_file = skill_root / "features" / "check-state.md"
+            original_feature = feature_file.read_text(encoding="utf-8")
+            action_line = next(
+                line for line in original_feature.splitlines() if line.strip().startswith("- Action: ")
+            )
+            feature_file.write_text(
+                original_feature.replace(
+                    action_line,
+                    f"{action_line[: len(action_line) - len(action_line.lstrip())]}- Action: `sh -c 'echo unsafe'`",
+                    1,
+                ),
+                encoding="utf-8",
+            )
+            errors = scaffold_module.validate_generated_skill(skill_root)
+            self.assertTrue(any("free-form shell" in error for error in errors), errors)
+
+    def test_no_pyyaml_frontmatter_fallback_rejects_non_string_scalars(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-frontmatter-") as temporary:
+            root = Path(temporary)
+            skill_root, _ = self.create_skill(root)
+            skill_file = skill_root / "SKILL.md"
+            original = skill_file.read_text(encoding="utf-8")
+            name_line = next(line for line in original.splitlines() if line.startswith("name: "))
+            description_line = next(
+                line for line in original.splitlines() if line.startswith("description: ")
+            )
+            replacements = {
+                name_line: "name: 42",
+                description_line: "description: null",
+            }
+            for source, replacement in replacements.items():
+                skill_file.write_text(original.replace(source, replacement, 1), encoding="utf-8")
+                with mock.patch.dict(sys.modules, {"yaml": None}):
+                    errors = scaffold_module.validate_generated_skill(skill_root)
+                self.assertTrue(any("must be a string" in error for error in errors), errors)
+                skill_file.write_text(original, encoding="utf-8")
 
     def test_collision_including_broken_symlink_preserves_existing_target(self) -> None:
         with tempfile.TemporaryDirectory(prefix="create-verification-collision-") as temporary:

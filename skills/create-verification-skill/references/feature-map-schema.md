@@ -23,8 +23,11 @@ file is a user-facing recipe, not an implementation design.
 The app-level specification supplies `setup`, `environment`, `seed_auth`,
 `isolation`, `ownership`, `evidence_scope`, and `failure_signals`, plus typed
 `launch`, `doctor`, `drive`, and `cleanup` commands. A command is an object
-with an `executable` and an `argv` array. It is not a shell string. The app
-also declares relative, non-overlapping `disposable_root` and `evidence_root`
+with an `executable`, an `argv` array, and an optional relative `cwd`. It is
+not a shell string. The generator renders `cwd` as a first-class `Working
+directory` instruction next to the quoted command. Cleanup cannot use the
+evidence root or a path below it as its working directory. The app also
+declares relative, non-overlapping `disposable_root` and `evidence_root`
 paths and lists the disposable paths below the disposable root.
 
 The generated Launch, Doctor, Drive, Evidence, and Cleanup sections repeat the

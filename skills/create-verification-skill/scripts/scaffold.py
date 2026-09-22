@@ -252,7 +252,13 @@ def _validate_command(value: Any, label: str, *, forbidden_roots: tuple[str, ...
                         f"{label}.argv[{index}] must not address protected path {root!r}"
                     )
     if "cwd" in command:
-        command["cwd"] = _safe_relative_path(command["cwd"], f"{label}.cwd")
+        cwd = _safe_relative_path(command["cwd"], f"{label}.cwd")
+        for root in forbidden_roots:
+            if _path_is_within(cwd, root):
+                raise ScaffoldError(
+                    f"{label}.cwd must not address protected path {root!r}"
+                )
+        command["cwd"] = cwd
     command["executable"] = executable
     command["argv"] = argv
     return command
@@ -395,8 +401,12 @@ def _render_command(command: dict[str, Any]) -> str:
     return shlex.join([command["executable"], *command["argv"]])
 
 
-def _command_line(label: str, command: dict[str, Any]) -> str:
-    return f"- {label}: {_code_span(_render_command(command))}"
+def _command_lines(label: str, command: dict[str, Any], *, indent: str = "") -> list[str]:
+    lines: list[str] = []
+    if "cwd" in command:
+        lines.append(f"{indent}- Working directory: {_code_span(command['cwd'])}")
+    lines.append(f"{indent}- {label}: {_code_span(_render_command(command))}")
+    return lines
 
 
 def _bullet(items: list[str]) -> str:
@@ -415,17 +425,20 @@ def _action_text(action: dict[str, Any], feature: dict[str, Any]) -> str:
     actors = action.get("actors", feature["actors"])
     fixtures = action.get("fixtures", feature["fixtures"])
     evidence = action["evidence"]
-    return "\n".join(
+    lines = [
+        f"- **{_markdown_text(action['action'])}.**",
+        f"  - Actors: {_markdown_text(', '.join(actors))}",
+        f"  - Fixtures: {_markdown_text(', '.join(fixtures))}",
+    ]
+    lines.extend(_command_lines("Action", action["command"], indent="  "))
+    lines.extend(
         (
-            f"- **{_markdown_text(action['action'])}.**",
-            f"  - Actors: {_markdown_text(', '.join(actors))}",
-            f"  - Fixtures: {_markdown_text(', '.join(fixtures))}",
-            f"  - Action: {_code_span(_render_command(action['command']))}",
             f"  - Expected result: {_markdown_text(action['expected_result'])}",
             f"  - Failure signals: {_markdown_text('; '.join(action['failure_signals']))}",
             f"  - Evidence: {_code_span(evidence['path'])}, {_markdown_text(evidence['proves'])}",
         )
     )
+    return "\n".join(lines)
 
 
 def _frontmatter_description(app: dict[str, Any]) -> str:
@@ -458,13 +471,13 @@ def _skill_markdown(spec: dict[str, Any]) -> str:
         "## Launch",
         "",
         *_context_lines(app),
-        _command_line("Command", app["launch"]),
+        *_command_lines("Command", app["launch"]),
         f"- Ready when: {_markdown_text(app['ready'])}",
         f"- Surface: {_markdown_text(app['surface'])}",
         "",
         "## Doctor",
         "",
-        _command_line("Command", app["doctor"]),
+        *_command_lines("Command", app["doctor"]),
         "- This is a read-only check of the process, build or version, endpoint or prompt, auth, and disposable state.",
         *_context_lines(app),
         f"- Healthy result: {_markdown_text(app['ready'])}",
@@ -472,7 +485,7 @@ def _skill_markdown(spec: dict[str, Any]) -> str:
         "## Drive",
         "",
         f"- Harness: {_markdown_text(app['harness'])}",
-        _command_line("Command", app["drive"]),
+        *_command_lines("Command", app["drive"]),
         "- Start from the feature map's Preconditions and use the linked recipe's literal action command.",
         f"- Isolation: {_markdown_text('; '.join(app['isolation']))}",
         "",
@@ -485,7 +498,7 @@ def _skill_markdown(spec: dict[str, Any]) -> str:
         "",
         "## Cleanup",
         "",
-        _command_line("Command", app["cleanup"]),
+        *_command_lines("Command", app["cleanup"]),
         *_context_lines(app),
         f"- Disposable root: {_code_span(app['disposable_root'])}",
         f"- Disposable paths: {', '.join(_code_span(path) for path in app['disposable_paths'])}",
@@ -586,6 +599,31 @@ def _write_tree(spec: dict[str, Any], root: Path) -> None:
         path.write_text(_feature_markdown(feature, app["harness"]), encoding="utf-8")
 
 
+YAML_NON_STRING_PLAIN_SCALAR = re.compile(
+    r"^[+-]?(?:"
+    r"0[bB][01_]+|0[oO][0-7_]+|0[xX][0-9a-fA-F_]+|"
+    r"0[0-7_]+|"
+    r"(?:0|[1-9][0-9_]*)(?:\.[0-9_]*)?(?:[eE][+-]?[0-9_]+)?|"
+    r"\.[0-9_]+(?:[eE][+-]?[0-9_]+)?|"
+    r"\.(?:inf|nan)|"
+    r"[0-9]+(?::[0-5]?[0-9])+)$",
+    re.IGNORECASE,
+)
+YAML_DATE_PLAIN_SCALAR = re.compile(
+    r"^[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}(?:$|[Tt ][0-9])"
+)
+
+
+def _is_non_string_yaml_scalar(value: str) -> bool:
+    plain_value = re.split(r"[ \t]+#", value, maxsplit=1)[0].rstrip()
+    if plain_value.casefold() in {"~", "null", "true", "false", "yes", "no", "on", "off"}:
+        return True
+    return bool(
+        YAML_NON_STRING_PLAIN_SCALAR.fullmatch(plain_value)
+        or YAML_DATE_PLAIN_SCALAR.fullmatch(plain_value)
+    )
+
+
 def _strict_frontmatter_subset(text: str) -> dict[str, str]:
     fields: dict[str, str] = {}
     for line in text.splitlines():
@@ -616,6 +654,8 @@ def _strict_frontmatter_subset(text: str) -> dict[str, str]:
             continue
         if value.startswith(("[", "{", "&", "*", "!", "|", ">", "%", "@", "`")):
             raise ScaffoldError(f"frontmatter field {key!r} is not a supported scalar")
+        if _is_non_string_yaml_scalar(value):
+            raise ScaffoldError(f"frontmatter field {key!r} must be a string")
         fields[key] = value
     return fields
 
@@ -866,6 +906,61 @@ def _code_label_value(lines: list[str], label: str) -> str | None:
     return values[0] if values else None
 
 
+def _inline_code_label_value(line: str, label: str) -> str | None:
+    match = re.fullmatch(
+        rf"- {re.escape(label)}: (?P<ticks>`+)(?P<value>.*?)(?P=ticks)\s*",
+        line.strip(),
+    )
+    if match is None:
+        return None
+    return match.group("value").strip()
+
+
+def _validate_rendered_command(
+    lines: list[str],
+    label: str,
+    location: str,
+    errors: list[str],
+    *,
+    forbidden_roots: tuple[str, ...] = (),
+) -> None:
+    prefix = f"- {label}:"
+    command_lines = [line for line in lines if line.strip().startswith(prefix)]
+    if len(command_lines) != 1:
+        errors.append(f"{location} must contain exactly one {label} command")
+        return
+    rendered = _inline_code_label_value(command_lines[0], label)
+    if not rendered:
+        errors.append(f"{location} {label} must be a non-empty inline code command")
+        return
+    try:
+        argv = shlex.split(rendered, posix=True)
+    except ValueError as exc:
+        errors.append(f"{location} {label} has invalid command quoting: {exc}")
+        return
+    if not argv:
+        errors.append(f"{location} {label} must contain an executable")
+        return
+
+    command: dict[str, Any] = {"executable": argv[0], "argv": argv[1:]}
+    cwd_prefix = "- Working directory:"
+    cwd_lines = [line for line in lines if line.strip().startswith(cwd_prefix)]
+    if len(cwd_lines) > 1:
+        errors.append(f"{location} must contain at most one Working directory")
+        return
+    if cwd_lines:
+        cwd = _inline_code_label_value(cwd_lines[0], "Working directory")
+        if not cwd:
+            errors.append(f"{location} Working directory must be a non-empty inline code path")
+            return
+        command["cwd"] = cwd
+
+    try:
+        _validate_command(command, f"{location}.{label}", forbidden_roots=forbidden_roots)
+    except ScaffoldError as exc:
+        errors.append(str(exc))
+
+
 def _inline_code_values(lines: list[str], label: str) -> list[str]:
     prefix = f"- {label}:"
     for line in lines:
@@ -986,6 +1081,7 @@ def _validate_feature(
         block = lines[start:end]
         for label in ("Actors", "Fixtures", "Action", "Expected result", "Failure signals", "Evidence"):
             _require_label(block, label, str(relative), errors)
+        _validate_rendered_command(block, "Action", str(relative), errors)
         evidence_line = next((line.strip() for line in block if line.strip().startswith("- Evidence:")), None)
         evidence_match = re.match(r"^- Evidence: `([^`]+)`(?:,|$)", evidence_line or "")
         if evidence_match is None:
@@ -1077,7 +1173,15 @@ def validate_generated_skill(
             if section is None:
                 continue
             if section_name in {"Launch", "Doctor", "Drive", "Cleanup"}:
-                _require_label(section[2], "Command", f"SKILL.md {section_name}", errors)
+                _validate_rendered_command(
+                    section[2],
+                    "Command",
+                    f"SKILL.md {section_name}",
+                    errors,
+                    forbidden_roots=(evidence_root,)
+                    if section_name == "Cleanup" and evidence_root is not None
+                    else (),
+                )
         maintenance = _section_lines(skill_lines, "## Maintenance")
         maintenance_ok = maintenance is not None and any(
             "#4 follow-up" in line and "unsupported until #4" in line
