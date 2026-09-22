@@ -9,7 +9,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
@@ -36,6 +36,7 @@ FRONTEND_BOUNDARY_UNSUPPORTED = (
     "Do not apply Django or deployment rules",
 )
 FAB_LIST_RE = re.compile(r"\bfab\s+--list(?:\s|$)")
+FABRIC3_RE = re.compile(r"\bfabric\s*3\b")
 FAB_ENVIRONMENT_RE = re.compile(
     r"\bfab\s+(?:demo|beta|live|prod|production)\b"
 )
@@ -61,12 +62,23 @@ DEPLOYMENT_OPERATION_RE = re.compile(
     r"roll(?:out|ing)?|rolling|scale)"
     r"(?![a-z0-9])"
 )
+PRODUCTION_LIVE_RE = re.compile(r"\b(?:production|prod|live)\b")
+SOURCE_TASK_RE = re.compile(
+    r"\b(?:write|edit|implement|refactor|add|fix|review)\b.*?"
+    r"\b(?:component|function|class|module|parser|source|code|file|package|"
+    r"queryset|serializer|view)\b"
+)
 BACKEND_CUE_RE = re.compile(r"\b(?:web-app|django|drf|orm|manage\.py|celery)\b")
 FRONTEND_CUE_RE = re.compile(
     r"\b(?:showpass-frontend|next(?:\.js|js)?|react(?:\s+native)?|frontend|client)\b"
 )
 FRONTEND_OWNER_CUE_RE = re.compile(
     r"\b(?:showpass-frontend|next(?:\.js|js)?|react(?:\s+native)?)\b"
+)
+LEGACY_UI_CUE_RE = re.compile(
+    r"\b(?:angularjs|angular\s+js|legacy\s+(?:ui|frontend|template|bridge|redirect)|"
+    r"(?:ui|frontend)\s+bridge|bridge\s+template|django\s+template|"
+    r"apps/main/(?:static|templates)|gulp|embedded\s+page)\b"
 )
 
 
@@ -80,6 +92,12 @@ NEGATIVE_STATUS_CASES = (
 )
 
 ROUTING_GUARD_CASES = (
+    ("fabric3", "Review a Fabric3 task", "unsafe"),
+    ("fabric-3", "Review a Fabric 3 task", "unsafe"),
+    ("generic-production-operation", "Run a production operation", "unsafe"),
+    ("generic-live-environment", "Review the live environment", "unsafe"),
+    ("generic-production", "production", "unsafe"),
+    ("generic-live", "live", "unsafe"),
     ("nested-fabric-beta-rollout", "fab beta web.frontend.deploy_nextjs", "unsafe"),
     ("nested-fabric-live-rollout", "fab live web.quick_rolling_update", "unsafe"),
     ("production-deployment-wording", "Run a production deployment", "unsafe"),
@@ -95,37 +113,82 @@ ROUTING_GUARD_CASES = (
         "Change a web-app Django view and its Next.js client",
         "ambiguous",
     ),
+    (
+        "legacy-ui-bridge",
+        "Fix the legacy UI bridge",
+        "web-app",
+    ),
+    (
+        "angularjs-bridge",
+        "Fix the AngularJS bridge",
+        "web-app",
+    ),
+    (
+        "mixed-angularjs-react",
+        "Fix the AngularJS bridge and update the React component",
+        "ambiguous",
+    ),
 )
+
+
+def _has_infrastructure_cue(text: str) -> bool:
+    return any(marker in text for marker in ("web-k8s", "kubectl", "gcloud")) or bool(
+        re.search(r"\bfab(?:\s|$)", text)
+    ) or "fabric" in text
+
+
+def _production_live_requires_review(text: str) -> bool:
+    return bool(PRODUCTION_LIVE_RE.search(text)) and not SOURCE_TASK_RE.search(text)
+
+
+def repositories_for_task(task: str) -> Tuple[str, ...]:
+    """Return the repository owners signaled by a short task cue."""
+
+    text = task.lower()
+    infrastructure = _has_infrastructure_cue(text)
+    backend_cue = bool(BACKEND_CUE_RE.search(text))
+    frontend_cue = bool(FRONTEND_CUE_RE.search(text))
+    modern_frontend_cue = bool(FRONTEND_OWNER_CUE_RE.search(text))
+    legacy_ui_cue = bool(LEGACY_UI_CUE_RE.search(text))
+
+    repositories: List[str] = []
+    if backend_cue or legacy_ui_cue:
+        repositories.append("web-app")
+    if modern_frontend_cue or (backend_cue and frontend_cue):
+        repositories.append("showpass-frontend")
+    if infrastructure:
+        repositories.append("web-k8s")
+    return tuple(dict.fromkeys(repositories))
 
 
 def route_for_task(task: str) -> str:
     """Return a safe repository route for a short task cue."""
 
     text = task.lower()
-    infrastructure = any(
-        marker in text
-        for marker in ("web-k8s", "kubectl", "gcloud")
-    ) or bool(re.search(r"\bfab(?:\s|$)", text))
+    infrastructure = _has_infrastructure_cue(text)
     cluster_mutation = bool(
-        FAB_ENVIRONMENT_RE.search(text)
+        FABRIC3_RE.search(text)
+        or FAB_ENVIRONMENT_RE.search(text)
         or FAB_MUTATION_RE.search(text)
         or KUBECTL_MUTATION_RE.search(text)
     )
     environment_mutation = bool(ENVIRONMENT_RE.search(text) and MUTATION_RE.search(text))
     deployment_mutation = bool(DEPLOYMENT_OPERATION_RE.search(text))
-    if cluster_mutation or environment_mutation or deployment_mutation:
+    if (
+        cluster_mutation
+        or environment_mutation
+        or deployment_mutation
+        or _production_live_requires_review(text)
+    ):
         return "unsafe"
 
-    backend_cue = bool(BACKEND_CUE_RE.search(text))
-    frontend_cue = bool(FRONTEND_CUE_RE.search(text))
-    if backend_cue and frontend_cue:
+    repositories = repositories_for_task(text)
+    if len(repositories) > 1:
         return "ambiguous"
-    if FAB_LIST_RE.search(text) or infrastructure or "fabric" in text:
+    if repositories:
+        return repositories[0]
+    if FAB_LIST_RE.search(text) or infrastructure:
         return "web-k8s"
-    if FRONTEND_OWNER_CUE_RE.search(text):
-        return "showpass-frontend"
-    if backend_cue:
-        return "web-app"
     return "general"
 
 
@@ -297,6 +360,13 @@ def check_documents(skill_text: str, ledger: Dict[str, Any]) -> List[str]:
     _registered_citations(ledger, skill_text, errors)
     errors.extend(_validate_frontend_boundary(skill_text))
 
+    for case in ledger.get("routing_cases", []):
+        rule = case.get("rule")
+        if case.get("expected") == "unsafe" and not rule:
+            errors.append("unsafe routing case is missing a source rule: %s" % case.get("name"))
+        elif rule is not None and rule not in rule_ids:
+            errors.append("routing case references unknown rule: %s" % case.get("name"))
+
     for marker in set(MARKER_RE.findall(skill_text)):
         if marker not in rule_ids:
             errors.append("SKILL.md contains an unregistered source marker %s" % marker)
@@ -329,6 +399,14 @@ def check_scenarios(ledger: Dict[str, Any], safety: Optional[str]) -> List[str]:
         actual = route_for_task(case["input"])
         if actual != case["expected"]:
             errors.append("%s routed to %s, expected %s" % (case["name"], actual, case["expected"]))
+        expected_repositories = case.get("repositories")
+        if expected_repositories is not None:
+            actual_repositories = repositories_for_task(case["input"])
+            if actual_repositories != tuple(expected_repositories):
+                errors.append(
+                    "%s resolved to repositories %s, expected %s"
+                    % (case["name"], actual_repositories, tuple(expected_repositories))
+                )
     return errors
 
 
