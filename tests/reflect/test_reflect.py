@@ -617,6 +617,42 @@ class ReflectBehaviorTests(unittest.TestCase):
             self.assertIn("unbound evidence", result.stdout)
             self.assertIn("supported only by inference or unknown evidence", result.stdout)
 
+    def test_malformed_evidence_state_is_controlled_rejection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory) / "fixture-workspace"
+            workspace.mkdir()
+            transcript = self.write_jsonl(
+                workspace,
+                "decision-trail.jsonl",
+                [
+                    {
+                        "id": "decision-1",
+                        "timestamp": "2026-01-15T10:00:00Z",
+                        "workspace": workspace.name,
+                        "topic": "payments",
+                        "state": "complete",
+                        "claim": "The local check is complete.",
+                        "required_checks": ["unit tests"],
+                        "completed_checks": ["unit tests"],
+                        "evidence": [
+                            {
+                                "check": "unit tests",
+                                "source": "decision-trail.jsonl#decision-1",
+                                "state": [],
+                            }
+                        ],
+                    }
+                ],
+            )
+
+            result = run_helper(workspace, *self.command_args(workspace, transcript, []))
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("REJECTED:", result.stderr)
+            self.assertIn("state must be fact, inference, or unknown", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+            self.assertNotIn("## Accepted", result.stdout)
+
     def test_candidate_comparison_selects_and_rejects_alternatives(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory) / "fixture-workspace"

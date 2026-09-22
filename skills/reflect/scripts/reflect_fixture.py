@@ -344,6 +344,8 @@ def parse_evidence(raw: Any, *, field: str) -> tuple[tuple[Evidence, ...], list[
             source_value = None
         else:
             source_value = validate_metadata(source, f"{entry}.source", limit=MAX_SOURCE_LENGTH)
+        if not isinstance(state, str):
+            raise ReflectError(f"{entry}.state must be fact, inference, or unknown")
         if state not in EVIDENCE_STATES:
             gaps.append(f"{entry}.state must be fact, inference, or unknown")
             state_value = "unknown"
@@ -1569,7 +1571,7 @@ def main(argv: list[str] | None = None) -> int:
             end="",
         )
         return 0
-    except (ReflectError, OSError, RuntimeError) as exc:
+    except (ReflectError, OSError, RuntimeError, TypeError) as exc:
         print(f"REJECTED: {exc}", file=sys.stderr)
         return 2
 
