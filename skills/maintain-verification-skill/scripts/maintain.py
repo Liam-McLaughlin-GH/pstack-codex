@@ -46,7 +46,24 @@ AUTHORITATIVE_FIELDS = (
 LIVE_STATUSES = {"pass", "fail", "verified-unreachable", "harness-gap", "not-run"}
 PATCH_KINDS = {"doc-drift", "harness-gap"}
 RECEIPT_VERSION = 2
+PROVENANCE_VERSION = 1
 DOCTOR_METADATA_FIELDS = ("target", "build", "endpoint", "auth", "disposable")
+POST_APPLY_FIELDS = ("redriven", "apply_id", "run_id", "session_id")
+SKILL_NAME_PATTERN = re.compile(r"^verify-[a-z0-9]+(?:-[a-z0-9]+)*$")
+TOP_LEVEL_FRONTMATTER_FIELD = re.compile(
+    r"^(?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]*(?P<value>.*))?$"
+)
+YAML_NON_STRING_PLAIN_SCALAR = re.compile(
+    r"^[+-]?(?:"
+    r"0[bB][01_]+|0[oO][0-7_]+|0[xX][0-9a-fA-F_]+|"
+    r"0[0-7_]+|"
+    r"(?:0|[1-9][0-9_]*)(?:\.[0-9_]*)?(?:[eE][+-]?[0-9_]+)?|"
+    r"\.[0-9_]+(?:[eE][+-]?[0-9_]+)?|"
+    r"\.(?:inf|nan)|"
+    r"[0-9]+(?::[0-5]?[0-9])+)$",
+    re.IGNORECASE,
+)
+YAML_DATE_PLAIN_SCALAR = re.compile(r"^[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}(?:$|[Tt ][0-9])")
 
 
 class MaintainError(ValueError):
@@ -176,20 +193,125 @@ def _finding(
     return result
 
 
-def _frontmatter_fields(text: str) -> dict[str, str]:
-    if not text.startswith("---\n"):
-        return {}
-    end = text.find("\n---", 4)
-    if end == -1:
-        return {}
+def _is_non_string_yaml_scalar(value: str) -> bool:
+    plain_value = re.split(r"[ \t]+#", value, maxsplit=1)[0].rstrip()
+    if plain_value.casefold() in {"~", "null", "true", "false", "yes", "no", "on", "off"}:
+        return True
+    return bool(
+        YAML_NON_STRING_PLAIN_SCALAR.fullmatch(plain_value)
+        or YAML_DATE_PLAIN_SCALAR.fullmatch(plain_value)
+    )
+
+
+def _strict_frontmatter_subset(text: str) -> dict[str, str]:
+    """Parse the supported frontmatter subset without a YAML dependency."""
+
     fields: dict[str, str] = {}
-    for line in text[4:end].splitlines():
-        if ":" not in line:
+    for line in text.splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
             continue
-        key, value = line.split(":", 1)
-        if key.strip() in {"name", "description"}:
-            fields[key.strip()] = value.strip().strip("\"'")
+        match = TOP_LEVEL_FRONTMATTER_FIELD.fullmatch(line)
+        if not match:
+            raise MaintainError(f"invalid YAML frontmatter line: {line!r}")
+        key = match.group("key")
+        if key in fields:
+            raise MaintainError(f"duplicate frontmatter field: {key}")
+        value = (match.group("value") or "").strip()
+        if not value:
+            raise MaintainError(f"frontmatter field {key!r} is empty")
+        if value.startswith('"'):
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError as exc:
+                raise MaintainError(f"frontmatter field {key!r} has invalid YAML quoting") from exc
+            if not isinstance(parsed, str):
+                raise MaintainError(f"frontmatter field {key!r} must be a string")
+            fields[key] = parsed
+            continue
+        if value.startswith("'"):
+            if len(value) < 2 or not value.endswith("'"):
+                raise MaintainError(f"frontmatter field {key!r} has an unterminated quote")
+            fields[key] = value[1:-1].replace("''", "'")
+            continue
+        if value.startswith(("[", "{", "&", "*", "!", "|", ">", "%", "@", "`")):
+            raise MaintainError(f"frontmatter field {key!r} is not a supported scalar")
+        if _is_non_string_yaml_scalar(value):
+            raise MaintainError(f"frontmatter field {key!r} must be a string")
+        fields[key] = re.split(r"[ \t]+#", value, maxsplit=1)[0].rstrip()
     return fields
+
+
+def _parse_frontmatter(path: Path) -> dict[str, str]:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise MaintainError(f"could not read frontmatter {path}: {exc}") from exc
+    lines = text.splitlines()
+    if not lines or lines[0] != "---":
+        raise MaintainError(f"{path} is missing YAML frontmatter")
+    try:
+        closing = next(index for index in range(1, len(lines)) if lines[index] == "---")
+    except StopIteration as exc:
+        raise MaintainError(f"{path} has unterminated YAML frontmatter") from exc
+    source = "\n".join(lines[1:closing])
+    try:
+        import yaml  # type: ignore[import-not-found]
+
+        class UniqueLoader(yaml.SafeLoader):  # type: ignore[name-defined]
+            pass
+
+        def construct_mapping(loader: Any, node: Any, deep: bool = False) -> dict[Any, Any]:
+            mapping: dict[Any, Any] = {}
+            for key_node, value_node in node.value:
+                key = loader.construct_object(key_node, deep=deep)
+                if key in mapping:
+                    raise MaintainError(f"duplicate frontmatter field: {key}")
+                mapping[key] = loader.construct_object(value_node, deep=deep)
+            return mapping
+
+        UniqueLoader.add_constructor(
+            yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+            construct_mapping,
+        )
+        parsed = yaml.load(source, Loader=UniqueLoader)
+        if not isinstance(parsed, dict):
+            raise MaintainError("frontmatter must be a YAML mapping")
+        fields = parsed
+    except ModuleNotFoundError:
+        fields = _strict_frontmatter_subset(source)
+    except MaintainError:
+        raise
+    except Exception as exc:
+        raise MaintainError(f"invalid YAML frontmatter: {exc}") from exc
+
+    if any(not isinstance(key, str) for key in fields):
+        raise MaintainError("frontmatter keys must be strings")
+    unknown = sorted(set(fields) - {"name", "description"})
+    if unknown:
+        raise MaintainError("unsupported frontmatter field(s): " + ", ".join(unknown))
+    for field in ("name", "description"):
+        if field not in fields:
+            raise MaintainError(f"{path} frontmatter is missing {field}")
+        if not isinstance(fields[field], str) or not fields[field].strip():
+            raise MaintainError(f"frontmatter field {field!r} must be a non-empty string")
+    return {"name": fields["name"], "description": fields["description"]}
+
+
+def _validate_frontmatter_fields(
+    frontmatter: dict[str, str], *, expected_name: str, path: Path
+) -> None:
+    name = frontmatter["name"].strip()
+    if not SKILL_NAME_PATTERN.fullmatch(name):
+        raise MaintainError(f"{path} has an invalid verification skill name: {name!r}")
+    if name != expected_name:
+        raise MaintainError("frontmatter name does not match the target directory")
+    if len(name) > 64:
+        raise MaintainError("frontmatter name exceeds 64 characters")
+    description = frontmatter["description"].strip()
+    if "<" in description or ">" in description:
+        raise MaintainError("frontmatter description must not contain angle brackets")
+    if len(description) > 1024:
+        raise MaintainError("frontmatter description exceeds 1024 characters")
 
 
 def _feature_sections(lines: Iterable[str]) -> list[str]:
@@ -233,7 +355,8 @@ def _validate_action_blocks(
 ) -> list[dict[str, Any]]:
     preamble, actions = _action_blocks(lines)
     findings: list[dict[str, Any]] = []
-    if not any(line.strip() == "Preconditions:" for line in preamble):
+    first_nonempty = next((line.strip() for line in preamble if line.strip()), None)
+    if first_nonempty != "Preconditions:":
         findings.append(
             _finding(
                 "doc-drift",
@@ -306,10 +429,11 @@ def validate_feature_map(skill_root: Path) -> tuple[list[str], list[dict[str, An
         findings.append(_finding("doc-drift", "verification skill is missing SKILL.md", path="SKILL.md"))
     else:
         skill_text = skill_file.read_text(encoding="utf-8")
-        fields = _frontmatter_fields(skill_text)
-        for field in ("name", "description"):
-            if not fields.get(field):
-                findings.append(_finding("doc-drift", f"SKILL.md frontmatter is missing {field}", path="SKILL.md"))
+        try:
+            frontmatter = _parse_frontmatter(skill_file)
+            _validate_frontmatter_fields(frontmatter, expected_name=skill_root.name, path=skill_file)
+        except MaintainError as exc:
+            findings.append(_finding("doc-drift", str(exc), path="SKILL.md"))
         sections = _feature_sections(skill_text.splitlines())
         missing = [section for section in REQUIRED_SKILL_SECTIONS if section not in sections]
         if missing:
@@ -445,10 +569,12 @@ def _validate_reader_report(
                     raise MaintainError(f"source entry must be a regular file: {entry['path']}")
             except MaintainError as exc:
                 findings.append(_finding("blocked", str(exc), feature_id=feature_id, source=_source_reference(entry)))
-        authoritative = _mapping(reader.get("authoritative", {}), f"{label}.authoritative")
+        authoritative = _mapping(reader.get("authoritative"), f"{label}.authoritative")
         normalized: dict[str, list[str]] = {}
         for field in AUTHORITATIVE_FIELDS:
-            normalized[field] = _text_list(authoritative.get(field, []), f"{label}.authoritative.{field}")
+            if field not in authoritative:
+                raise MaintainError(f"{label}.authoritative.{field} is required")
+            normalized[field] = _text_list(authoritative[field], f"{label}.authoritative.{field}")
         reader["authoritative"] = normalized
         harness = _mapping(reader.get("harness", {}), f"{label}.harness")
         harness_status = _text(harness.get("status"), f"{label}.harness.status").lower()
@@ -614,17 +740,52 @@ def _post_apply_feature_findings(
         return []
     findings: list[dict[str, Any]] = []
     binding = result.get("post_apply")
-    if binding is None:
-        binding = result.get("re_drive")
     if not isinstance(binding, dict):
-        binding = {}
+        findings.append(
+            _finding(
+                "evidence-failure",
+                "affected feature must contain a post_apply object",
+                feature_id=feature_id,
+            )
+        )
+        return findings
 
-    redriven = binding.get("redriven")
-    if redriven is None:
-        redriven = binding.get("re_driven")
-    if redriven is None:
-        redriven = result.get("redriven_after_apply")
-    if redriven is not True:
+    unknown_fields = sorted(set(binding) - set(POST_APPLY_FIELDS))
+    if unknown_fields:
+        findings.append(
+            _finding(
+                "evidence-failure",
+                "post_apply contains unsupported field(s): " + ", ".join(unknown_fields),
+                feature_id=feature_id,
+            )
+        )
+    for alias in (
+        "re_drive",
+        "re_driven",
+        "redriven_after_apply",
+        "apply_id",
+        "run_id",
+        "session_id",
+    ):
+        if alias in result:
+            findings.append(
+                _finding(
+                    "evidence-failure",
+                    f"affected feature uses unsupported post-apply alias: {alias}",
+                    feature_id=feature_id,
+                )
+            )
+
+    for field in POST_APPLY_FIELDS:
+        if field not in binding:
+            findings.append(
+                _finding(
+                    "evidence-failure",
+                    f"post_apply is missing {field}",
+                    feature_id=feature_id,
+                )
+            )
+    if binding.get("redriven") is not True:
         findings.append(
             _finding(
                 "evidence-failure",
@@ -634,7 +795,7 @@ def _post_apply_feature_findings(
         )
 
     for field in ("apply_id", "run_id", "session_id"):
-        actual = binding.get(field, result.get(field))
+        actual = binding.get(field)
         if actual != change_receipt.get(field):
             findings.append(
                 _finding(
@@ -760,6 +921,36 @@ def _validate_live_report(
     return by_id, findings
 
 
+def _absolute_regular_file(value: Any, label: str) -> Path:
+    raw = _text(value, label)
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        raise MaintainError(f"{label} must be an absolute path")
+    if path.is_symlink() or not path.is_file():
+        raise MaintainError(f"{label} must be a regular file: {raw}")
+    return path.resolve()
+
+
+def _digest_map(
+    value: Any, label: str, expected_paths: list[str], findings: list[dict[str, Any]]
+) -> dict[str, str]:
+    if not isinstance(value, dict):
+        findings.append(_finding("evidence-failure", f"{label} must be an object"))
+        return {}
+    expected = set(expected_paths)
+    actual = set(value)
+    if actual != expected:
+        findings.append(_finding("evidence-failure", f"{label} must contain exactly the changed file paths"))
+    normalized: dict[str, str] = {}
+    for relative in expected_paths:
+        digest = value.get(relative)
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            findings.append(_finding("evidence-failure", f"{label} has an invalid digest for {relative}"))
+            continue
+        normalized[relative] = digest
+    return normalized
+
+
 def _validate_change_receipt(
     path: Path | None, skill_root: Path, feature_ids: list[str]
 ) -> tuple[dict[str, Any] | None, list[str], bool, list[dict[str, Any]]]:
@@ -807,6 +998,7 @@ def _validate_change_receipt(
             findings.append(_finding("evidence-failure", f"change receipt names unknown feature {feature_id}", feature_id=feature_id))
 
     raw_changes = receipt.get("changes")
+    normalized_changes: list[dict[str, Any]] = []
     if not isinstance(raw_changes, list) or not raw_changes:
         findings.append(_finding("evidence-failure", "change receipt must contain changes"))
     else:
@@ -837,26 +1029,75 @@ def _validate_change_receipt(
             if not set(change_features).intersection(affected_features):
                 findings.append(_finding("evidence-failure", f"{label} does not identify an affected feature"))
             change_feature_ids.update(change_features)
+            normalized_changes.append(
+                {"path": change_path, "kind": raw_change.get("kind"), "feature_ids": change_features}
+            )
         if set(change_paths) != set(changed_files):
             findings.append(_finding("evidence-failure", "change receipt changes do not cover changed_files"))
         if change_feature_ids != set(affected_features):
             findings.append(_finding("evidence-failure", "change receipt affected_features do not match its changes"))
 
-    raw_digests = receipt.get("file_digests")
-    if not isinstance(raw_digests, dict):
-        findings.append(_finding("evidence-failure", "change receipt must contain file_digests"))
-    else:
+    after_digests = _digest_map(receipt.get("file_digests"), "change receipt file_digests", changed_files, findings)
+    for relative, digest in after_digests.items():
+        try:
+            changed_path = _safe_path(skill_root, relative, "change receipt path", require_exists=True)
+            if _sha256(changed_path) != digest:
+                findings.append(_finding("evidence-failure", f"changed file does not match its apply receipt: {relative}"))
+        except (MaintainError, OSError) as exc:
+            findings.append(_finding("evidence-failure", str(exc)))
+
+    before_digests = _digest_map(
+        receipt.get("before_file_digests"), "change receipt before_file_digests", changed_files, findings
+    )
+    plan_sha256 = receipt.get("plan_sha256")
+    if not isinstance(plan_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", plan_sha256):
+        findings.append(_finding("evidence-failure", "change receipt has an invalid plan_sha256"))
+
+    provenance: dict[str, Any] | None = None
+    try:
+        provenance_path = _absolute_regular_file(
+            receipt.get("provenance_path"), "change receipt provenance_path"
+        )
+        provenance = _load_json(provenance_path)
+    except (MaintainError, OSError) as exc:
+        findings.append(_finding("evidence-failure", str(exc)))
+
+    if provenance is not None:
+        if provenance.get("provenance_version") != PROVENANCE_VERSION:
+            findings.append(_finding("evidence-failure", "apply provenance has an unsupported provenance_version"))
+        for field in ("apply_id", "run_id", "session_id"):
+            if provenance.get(field) != receipt.get(field):
+                findings.append(_finding("evidence-failure", f"apply provenance does not match {field}"))
+        if provenance.get("skill_root") != str(skill_root):
+            findings.append(_finding("evidence-failure", "apply provenance names a different verification skill"))
+        if provenance.get("plan_sha256") != plan_sha256:
+            findings.append(_finding("evidence-failure", "apply provenance does not match plan_sha256"))
+        if provenance.get("changed_files") != changed_files:
+            findings.append(_finding("evidence-failure", "apply provenance does not match changed_files"))
+        if provenance.get("affected_features") != affected_features:
+            findings.append(_finding("evidence-failure", "apply provenance does not match affected_features"))
+        if provenance.get("changes") != normalized_changes:
+            findings.append(_finding("evidence-failure", "apply provenance does not match changes"))
+        if provenance.get("before_file_digests") != before_digests:
+            findings.append(_finding("evidence-failure", "apply provenance does not match before_file_digests"))
+        if provenance.get("after_file_digests") != after_digests:
+            findings.append(_finding("evidence-failure", "apply provenance does not match file_digests"))
+
+        try:
+            plan_path = _absolute_regular_file(provenance.get("plan_path"), "apply provenance plan_path")
+            if not isinstance(plan_sha256, str) or _sha256(plan_path) != plan_sha256:
+                findings.append(_finding("evidence-failure", "patch plan does not match apply provenance"))
+            expected_provenance_path = plan_path.with_name(
+                f"{plan_path.name}.{receipt.get('apply_id')}.provenance.json"
+            )
+            if provenance_path != expected_provenance_path:
+                findings.append(_finding("evidence-failure", "provenance path does not match the apply identity"))
+        except (MaintainError, OSError) as exc:
+            findings.append(_finding("evidence-failure", str(exc)))
+
         for relative in changed_files:
-            digest = raw_digests.get(relative)
-            if not isinstance(digest, str) or not digest.strip():
-                findings.append(_finding("evidence-failure", f"change receipt is missing the digest for {relative}"))
-                continue
-            try:
-                changed_path = _safe_path(skill_root, relative, "change receipt path", require_exists=True)
-                if _sha256(changed_path) != digest:
-                    findings.append(_finding("evidence-failure", f"changed file does not match its apply receipt: {relative}"))
-            except (MaintainError, OSError) as exc:
-                findings.append(_finding("evidence-failure", str(exc)))
+            if before_digests.get(relative) == after_digests.get(relative):
+                findings.append(_finding("evidence-failure", f"apply provenance has no content transition for {relative}"))
 
     return receipt, changed_files, not findings, findings
 
@@ -957,6 +1198,31 @@ def _atomic_write(path: Path, text: str) -> None:
                 pass
 
 
+def _atomic_create(path: Path, text: str) -> None:
+    """Create a new durable record without replacing an existing one."""
+
+    if os.path.lexists(path):
+        raise MaintainError(f"durable apply provenance already exists: {path}")
+    temporary: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=path.parent, delete=False
+        ) as handle:
+            temporary = handle.name
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        temporary = None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+
+
 def apply_patch_plan(
     skill_root: Path,
     patch_plan_path: Path,
@@ -967,6 +1233,11 @@ def apply_patch_plan(
     """Apply only explicit doc or harness replacements below skill_root."""
 
     skill_root = _real_directory(skill_root, "skill root")
+    patch_plan_path = patch_plan_path.expanduser()
+    if patch_plan_path.is_symlink() or not patch_plan_path.is_file():
+        raise MaintainError(f"patch plan must be a regular file: {patch_plan_path}")
+    patch_plan_path = patch_plan_path.resolve()
+    plan_sha256 = _sha256(patch_plan_path)
     plan = _load_json(patch_plan_path)
     changes = plan.get("changes")
     if not isinstance(changes, list) or not changes:
@@ -1024,16 +1295,37 @@ def apply_patch_plan(
     run_id = _text(run_id, "apply run_id")
     session_id = _text(session_id, "apply session_id")
 
+    changed_files = [path.relative_to(skill_root).as_posix() for path in proposed]
+    before_file_digests = {relative: _sha256(skill_root / relative) for relative in changed_files}
+    provenance_path = patch_plan_path.with_name(
+        f"{patch_plan_path.name}.{apply_id}.provenance.json"
+    )
+    provenance = {
+        "provenance_version": PROVENANCE_VERSION,
+        "apply_id": apply_id,
+        "run_id": run_id,
+        "session_id": session_id,
+        "skill_root": str(skill_root),
+        "plan_path": str(patch_plan_path),
+        "plan_sha256": plan_sha256,
+        "affected_features": affected_features,
+        "changed_files": changed_files,
+        "before_file_digests": before_file_digests,
+        "changes": metadata,
+    }
+
     written: list[Path] = []
     try:
         for path, text in proposed.items():
             _atomic_write(path, text)
             written.append(path)
+        after_file_digests = {relative: _sha256(skill_root / relative) for relative in changed_files}
+        provenance["after_file_digests"] = after_file_digests
+        _atomic_create(provenance_path, json.dumps(provenance, indent=2, sort_keys=True))
     except Exception:
         for path in written:
             _atomic_write(path, originals[path])
         raise
-    changed_files = [path.relative_to(skill_root).as_posix() for path in proposed]
     return {
         "receipt_version": RECEIPT_VERSION,
         "outcome": "changed",
@@ -1041,9 +1333,12 @@ def apply_patch_plan(
         "run_id": run_id,
         "session_id": session_id,
         "skill_root": str(skill_root),
+        "provenance_path": str(provenance_path),
+        "plan_sha256": plan_sha256,
         "affected_features": affected_features,
         "changed_files": changed_files,
-        "file_digests": {relative: _sha256(skill_root / relative) for relative in changed_files},
+        "before_file_digests": before_file_digests,
+        "file_digests": after_file_digests,
         "changes": metadata,
     }
 

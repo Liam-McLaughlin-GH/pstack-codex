@@ -4,6 +4,14 @@ The maintenance helper accepts four small JSON receipts. They are evidence
 from a coordinator or read-only source reader, not instructions to execute.
 Paths in a source reader or patch plan are checked before use.
 
+## Target frontmatter
+
+The target `SKILL.md` frontmatter is a YAML mapping with exactly two supported
+keys: `name` and `description`. Both values must be non-empty strings. Duplicate
+keys, unknown keys, malformed YAML, and non-string values are validation
+errors. `name` must match the project-local target directory and the
+`verify-<app>` name pattern.
+
 ## Source-reader report
 
 The top-level object contains one `readers` entry for every feature file:
@@ -43,9 +51,12 @@ The top-level object contains one `readers` entry for every feature file:
 does not claim source coverage. Each source entry is an object with a
 repository-relative path and a non-empty `lines` or `symbol` citation. The
 helper checks that the path exists below `project-root` as a regular file; a
-directory is not source evidence. `authoritative` keeps the exact user-facing
-strings that the matching feature section or action must contain. Use an empty
-list for a category that does not apply. A missing harness uses
+directory is not source evidence. A complete reader must include the
+`authoritative` object and all five keys shown above. Each key must be an
+explicit array of strings. Use an empty list for a category that does not
+apply; omitting the key is invalid. `authoritative` keeps the exact
+user-facing strings that the matching feature section or action must contain.
+A missing harness uses
 `{"status": "missing", "reason": "..."}` and becomes a `harness-gap`.
 
 ## Live-pass report
@@ -126,9 +137,13 @@ span must occur exactly once, every target must be an existing regular file,
 and all targets must remain inside the verification directory. Feature-file
 changes derive their affected feature from the path. Harness changes must set
 `feature_ids` on the change or `affected_features` on the plan. The helper
-preflights the complete plan before writing and emits a version-2 receipt with
-`apply_id`, `run_id`, `session_id`, `affected_features`, and SHA-256 digests of
-the changed files. Save that output as the change log.
+preflights the complete plan before writing. It writes a separate durable
+provenance record beside the patch plan, then emits a version-2 receipt with
+`apply_id`, `run_id`, `session_id`, `provenance_path`, `plan_sha256`,
+`affected_features`, `before_file_digests`, and SHA-256 digests of the changed
+files. Save the helper output unchanged as the change log and retain the
+provenance record. A hand-written receipt without that helper-produced record
+cannot prove `changed`.
 
 For a post-correction live report, set `run.phase` to `post-apply` and copy
 the apply receipt's `run_id`, `session_id`, and `apply_id` into the run object.
@@ -143,8 +158,11 @@ Every affected feature result also carries a `post_apply` object:
 }
 ```
 
-The final audit compares those identities and the file digests before it can
-return `changed`.
+The final audit requires that object, compares those identities and the file
+digests, checks the patch-plan identity and before-state in the provenance
+record, and requires an actual before/after content transition before it can
+return `changed`. No result-level identity fields or alternate post-apply keys
+are accepted.
 
 ## Cleanup manifest
 

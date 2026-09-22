@@ -32,8 +32,9 @@ product failure a documentation fix.
    If there is more than one target, ask which one to maintain.
 3. Read the target `SKILL.md`, `features/README.md`, and every linked feature
    file. Use the issue #2 feature-map contract: each feature keeps the four
-   ordered H2 sections and each action records `Actors`, `Fixtures`, `Action`,
-   `Expected result`, and `Evidence` in that order. Read
+   ordered H2 sections, starts its driving section with `Preconditions:` as
+   the first non-empty line, and each action records `Actors`, `Fixtures`,
+   `Action`, `Expected result`, and `Evidence` in that order. Read
    [the maintenance receipt schema](references/maintenance-report-schema.md)
    before collecting reports.
 4. Treat the verification directory as the complete write boundary. Product
@@ -57,8 +58,9 @@ instructions. A reader must return:
 - the feature summary in user language;
 - exact regular-file source paths and a non-empty line or symbol citation for
   every source entry;
-- authoritative entry points, commands, selectors, fixtures, and expected
-  results, with empty lists where a category does not apply;
+- an `authoritative` object with all five explicit string-array fields:
+  entry points, commands, selectors, fixtures, and expected results. Use an
+  empty array only when a category does not apply;
 - one concise live recipe with its actor, fixture, action, expected result, and
   evidence; and
 - `harness.status` as `available` or `missing`, with a reason for `missing`.
@@ -87,15 +89,19 @@ python3 skills/maintain-verification-skill/scripts/maintain.py audit \
 ```
 
 The audit checks the feature index, dead or duplicate links, the feature-file
-shape, ordered action fields, frontmatter, required Launch/Doctor/Drive/Evidence/Cleanup/Helpers
-sections, source citations, authoritative map values, Doctor receipt, live
-coverage, and retained evidence. It returns exit code `0` for `clean` or
+shape, the first-line precondition rule, ordered action fields, strict target
+frontmatter, required Launch/Doctor/Drive/Evidence/Cleanup/Helpers sections,
+source citations, authoritative map values, Doctor receipt, live coverage, and
+retained evidence. It returns exit code `0` for `clean` or
 `changed`, and `1` for `blocked`; malformed input or unsafe paths return `2`.
 
-`apply` emits a versioned correction receipt. Keep it as the change log passed
-to the final audit. A `changed` result requires that receipt's apply, run, and
-session IDs to match a post-apply live report, and every affected feature must
-carry a matching re-drive receipt. A copied baseline live report cannot prove
+`apply` emits a versioned correction receipt and writes a durable provenance
+record beside the patch plan. Keep the helper output as the change log and
+retain the provenance record for the final audit. A `changed` result requires the
+helper-produced record, its plan identity and before-state, the receipt's
+apply/run/session IDs to match a post-apply live report, and every affected
+feature to carry the documented `post_apply` object with a matching re-drive
+receipt. A copied baseline live report or hand-written receipt cannot prove
 `changed`.
 
 Use these classifications:

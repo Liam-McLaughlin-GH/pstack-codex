@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -461,6 +462,130 @@ class MaintainVerificationSkillBehaviorTests(unittest.TestCase):
             self.assertEqual(missing_payload["outcome"], "blocked")
             self.assertTrue(any(item["kind"] == "evidence-failure" for item in missing_payload["findings"]))
 
+            alias_live = json.loads(json.dumps(post_live))
+            alias_feature = alias_live["features"][0]
+            alias_feature["redriven_after_apply"] = True
+            alias_feature.update(
+                {
+                    "apply_id": receipt["apply_id"],
+                    "run_id": receipt["run_id"],
+                    "session_id": receipt["session_id"],
+                }
+            )
+            alias_path = root / "alias-live.json"
+            alias_path.write_text(json.dumps(alias_live), encoding="utf-8")
+            alias_result = run_helper(
+                "audit",
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--project-root",
+                str(fixture["project"]),
+                "--reader-report",
+                str(fixture["reader_path"]),
+                "--live-report",
+                str(alias_path),
+                "--change-log",
+                str(change_log),
+                "--json",
+            )
+            self.assertEqual(alias_result.returncode, 1, alias_result.stderr)
+            alias_payload = json_output(alias_result)
+            self.assertEqual(alias_payload["outcome"], "blocked")
+            self.assertTrue(any(item["kind"] == "evidence-failure" for item in alias_payload["findings"]))
+
+            alias_feature["post_apply"] = {
+                "redriven": True,
+                "apply_id": receipt["apply_id"],
+                "run_id": receipt["run_id"],
+                "session_id": receipt["session_id"],
+            }
+            alias_path.write_text(json.dumps(alias_live), encoding="utf-8")
+            aliases_with_binding = run_helper(
+                "audit",
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--project-root",
+                str(fixture["project"]),
+                "--reader-report",
+                str(fixture["reader_path"]),
+                "--live-report",
+                str(alias_path),
+                "--change-log",
+                str(change_log),
+                "--json",
+            )
+            self.assertEqual(aliases_with_binding.returncode, 1, aliases_with_binding.stderr)
+            aliases_payload = json_output(aliases_with_binding)
+            self.assertEqual(aliases_payload["outcome"], "blocked")
+            self.assertTrue(any(item["kind"] == "evidence-failure" for item in aliases_payload["findings"]))
+
+    def test_fabricated_change_receipt_requires_helper_provenance(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-fabricated-receipt-") as temporary:
+            root = Path(temporary)
+            fixture = create_project(root, stale=False)
+            changed_file = "features/check-state.md"
+            changed_path = fixture["skill_root"] / changed_file
+            receipt = {
+                "receipt_version": 2,
+                "outcome": "changed",
+                "apply_id": "fabricated-apply",
+                "run_id": "fabricated-run",
+                "session_id": "fabricated-session",
+                "skill_root": str(fixture["skill_root"]),
+                "plan_sha256": "0" * 64,
+                "affected_features": ["check-state"],
+                "changed_files": [changed_file],
+                "before_file_digests": {changed_file: "1" * 64},
+                "file_digests": {
+                    changed_file: hashlib.sha256(changed_path.read_bytes()).hexdigest()
+                },
+                "changes": [
+                    {
+                        "path": changed_file,
+                        "kind": "doc-drift",
+                        "feature_ids": ["check-state"],
+                    }
+                ],
+            }
+            change_log = root / "fabricated-change-log.json"
+            change_log.write_text(json.dumps(receipt), encoding="utf-8")
+
+            live = json.loads(json.dumps(fixture["live"]))
+            live["run"] = {
+                "run_id": receipt["run_id"],
+                "session_id": receipt["session_id"],
+                "phase": "post-apply",
+                "apply_id": receipt["apply_id"],
+            }
+            live["doctor"]["session_id"] = receipt["session_id"]
+            live["features"][0]["post_apply"] = {
+                "redriven": True,
+                "apply_id": receipt["apply_id"],
+                "run_id": receipt["run_id"],
+                "session_id": receipt["session_id"],
+            }
+            live_path = root / "fabricated-live.json"
+            live_path.write_text(json.dumps(live), encoding="utf-8")
+
+            result = run_helper(
+                "audit",
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--project-root",
+                str(fixture["project"]),
+                "--reader-report",
+                str(fixture["reader_path"]),
+                "--live-report",
+                str(live_path),
+                "--change-log",
+                str(change_log),
+                "--json",
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            payload = json_output(result)
+            self.assertEqual(payload["outcome"], "blocked")
+            self.assertTrue(any(item["kind"] == "evidence-failure" for item in payload["findings"]))
+
     def test_audit_and_doctor_use_the_same_strict_doctor_contract(self) -> None:
         required = ("target", "build", "endpoint", "auth", "disposable")
         with tempfile.TemporaryDirectory(prefix="maintain-verification-doctor-") as temporary:
@@ -587,6 +712,149 @@ class MaintainVerificationSkillBehaviorTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             findings = json_output(result)["findings"]
             self.assertTrue(any(item["kind"] == "doc-drift" for item in findings))
+
+    def test_driving_section_requires_preconditions_as_its_first_nonempty_line(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-preconditions-") as temporary:
+            root = Path(temporary)
+            fixture = create_project(root, stale=False)
+            feature_path = fixture["skill_root"] / "features" / "check-state.md"
+            text = feature_path.read_text(encoding="utf-8").replace(
+                "## Driving it with shell\n\nPreconditions:",
+                "## Driving it with shell\n\nIntroductory text.\n\nPreconditions:",
+                1,
+            )
+            feature_path.write_text(text, encoding="utf-8")
+            result = run_helper(
+                "audit",
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--project-root",
+                str(fixture["project"]),
+                "--reader-report",
+                str(fixture["reader_path"]),
+                "--live-report",
+                str(fixture["live_path"]),
+                "--json",
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            findings = json_output(result)["findings"]
+            self.assertTrue(
+                any(
+                    item["kind"] == "doc-drift"
+                    and "must start with Preconditions" in item["message"]
+                    for item in findings
+                )
+            )
+
+    def test_complete_source_reader_requires_all_authoritative_string_arrays(self) -> None:
+        authoritative_fields = (
+            "entry_points",
+            "commands",
+            "selectors",
+            "fixtures",
+            "expected_results",
+        )
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-authoritative-") as temporary:
+            root = Path(temporary)
+            fixture = create_project(root, stale=False)
+
+            for field in authoritative_fields:
+                readers = json.loads(fixture["reader_path"].read_text(encoding="utf-8"))
+                readers["readers"][0]["authoritative"].pop(field)
+                reader_path = root / f"missing-{field}.json"
+                reader_path.write_text(json.dumps(readers), encoding="utf-8")
+                result = run_helper(
+                    "audit",
+                    "--skill-root",
+                    str(fixture["skill_root"]),
+                    "--project-root",
+                    str(fixture["project"]),
+                    "--reader-report",
+                    str(reader_path),
+                    "--live-report",
+                    str(fixture["live_path"]),
+                    "--json",
+                )
+                self.assertEqual(result.returncode, 2, field)
+                self.assertIn(f"authoritative.{field}", result.stderr)
+
+            readers = json.loads(fixture["reader_path"].read_text(encoding="utf-8"))
+            readers["readers"][0].pop("authoritative")
+            missing_object = root / "missing-authoritative.json"
+            missing_object.write_text(json.dumps(readers), encoding="utf-8")
+            result = run_helper(
+                "audit",
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--project-root",
+                str(fixture["project"]),
+                "--reader-report",
+                str(missing_object),
+                "--live-report",
+                str(fixture["live_path"]),
+                "--json",
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("authoritative must be an object", result.stderr)
+
+            readers = json.loads(fixture["reader_path"].read_text(encoding="utf-8"))
+            readers["readers"][0]["authoritative"]["commands"] = "not-an-array"
+            invalid_array = root / "invalid-authoritative-array.json"
+            invalid_array.write_text(json.dumps(readers), encoding="utf-8")
+            result = run_helper(
+                "audit",
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--project-root",
+                str(fixture["project"]),
+                "--reader-report",
+                str(invalid_array),
+                "--live-report",
+                str(fixture["live_path"]),
+                "--json",
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("authoritative.commands must be an array", result.stderr)
+
+    def test_target_frontmatter_is_strict_and_matches_target_name(self) -> None:
+        variants = {
+            "wrong-name": "name: verify-other\ndescription: Verify the tiny CLI.\n",
+            "malformed": "name: [verify-tiny\ndescription: Verify the tiny CLI.\n",
+            "duplicate": "name: verify-tiny\nname: verify-tiny\ndescription: Verify the tiny CLI.\n",
+            "unknown": "name: verify-tiny\ndescription: Verify the tiny CLI.\nowner: qa\n",
+            "non-string": "name: verify-tiny\ndescription: null\n",
+        }
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-frontmatter-") as temporary:
+            root = Path(temporary)
+            fixture = create_project(root, stale=False)
+            skill_file = fixture["skill_root"] / "SKILL.md"
+            original = skill_file.read_text(encoding="utf-8")
+            body = original.split("---\n", 2)[2]
+            for label, fields in variants.items():
+                skill_file.write_text(f"---\n{fields}---\n{body}", encoding="utf-8")
+                result = run_helper(
+                    "audit",
+                    "--skill-root",
+                    str(fixture["skill_root"]),
+                    "--project-root",
+                    str(fixture["project"]),
+                    "--reader-report",
+                    str(fixture["reader_path"]),
+                    "--live-report",
+                    str(fixture["live_path"]),
+                    "--json",
+                )
+                self.assertEqual(result.returncode, 1, label)
+                payload = json_output(result)
+                self.assertEqual(payload["outcome"], "blocked", label)
+                self.assertTrue(
+                    any(
+                        item["kind"] == "doc-drift" and item.get("path") == "SKILL.md"
+                        for item in payload["findings"]
+                    ),
+                    label,
+                )
+            skill_file.write_text(original, encoding="utf-8")
 
     def test_source_entries_need_citations_and_regular_files(self) -> None:
         with tempfile.TemporaryDirectory(prefix="maintain-verification-sources-") as temporary:
