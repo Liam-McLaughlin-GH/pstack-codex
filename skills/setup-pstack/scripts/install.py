@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shlex
 import stat
 import sys
 import tempfile
@@ -44,6 +45,42 @@ from safe_fs import (  # noqa: E402
 class InstallError(RuntimeError):
     """Raised when a skill cannot be installed without risking a collision."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: str = "failed",
+        residue: Path | None = None,
+        retry: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.residue = residue
+        self.retry = retry
+
+    def as_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {"status": self.status, "error": str(self)}
+        if self.residue is not None:
+            result["residue"] = str(self.residue)
+        if self.retry is not None:
+            result["retry"] = self.retry
+        return result
+
+
+@dataclass(frozen=True)
+class CleanupOutcome:
+    status: str
+    residue: Path | None = None
+    retry: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {"status": self.status}
+        if self.residue is not None:
+            result["residue"] = str(self.residue)
+        if self.retry is not None:
+            result["retry"] = self.retry
+        return result
+
 
 @dataclass(frozen=True)
 class InstallPlan:
@@ -70,6 +107,19 @@ class InstallPlan:
 def _validate_skill_name(name: str) -> None:
     if not name or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in name):
         raise InstallError(f"invalid skill directory name: {name!r}")
+
+
+def _cleanup_retry_hint(residue: Path, expected_metadata: os.stat_result | None = None) -> str:
+    command = [
+        sys.executable,
+        str(SCRIPT_DIRECTORY / "install.py"),
+        "cleanup",
+        "--residue",
+        str(residue),
+    ]
+    if expected_metadata is not None:
+        command.extend(("--expected-dev", str(expected_metadata.st_dev), "--expected-ino", str(expected_metadata.st_ino)))
+    return shlex.join(command)
 
 
 def _source_snapshot(source: Path) -> TreeSnapshot:
@@ -214,6 +264,60 @@ def _destination_target_is_absent(destination_fd: int, name: str) -> None:
     raise InstallError(f"target appeared during install: {name}")
 
 
+def _cleanup_residue(
+    residue: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> CleanupOutcome:
+    residue = canonical_path(residue)
+    if not residue.name.startswith(".setup-pstack-install-"):
+        raise InstallError(f"refusing to clean an unrecognized install residue: {residue}")
+    try:
+        parent_handle = open_directory(residue.parent)
+    except (OSError, SafeFilesystemError) as exc:
+        raise InstallError(f"could not open install residue parent safely: {residue.parent}: {exc}") from exc
+    try:
+        with directory_lock(parent_handle.fd):
+            try:
+                metadata = lstat_at(parent_handle.fd, residue.name)
+            except FileNotFoundError:
+                return CleanupOutcome("cleanup_already_complete")
+            if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+                raise InstallError(f"install residue is not a real directory: {residue}")
+            if expected_identity is not None and (metadata.st_dev, metadata.st_ino) != expected_identity:
+                raise InstallError(
+                    f"install cleanup refused (status=cleanup_refused); residue identity changed at {residue}. "
+                    "Inspect the replacement before issuing a new cleanup command.",
+                    status="cleanup_refused",
+                    residue=residue,
+                )
+            try:
+                remove_tree_at(parent_handle.fd, residue.name, expected_metadata=metadata)
+            except SafeFilesystemError as exc:
+                retry = _cleanup_retry_hint(residue, metadata)
+                raise InstallError(
+                    f"install cleanup refused (status=cleanup_refused); residue is preserved at {residue}. "
+                    f"Retry with {retry}: {exc}",
+                    status="cleanup_refused",
+                    residue=residue,
+                    retry=retry,
+                ) from exc
+            except OSError as exc:
+                retry = _cleanup_retry_hint(residue, metadata)
+                raise InstallError(
+                    f"install cleanup is incomplete (status=cleanup_pending); residue is preserved at {residue}. "
+                    f"Retry with {retry}: {exc}",
+                    status="cleanup_pending",
+                    residue=residue,
+                    retry=retry,
+                ) from exc
+            sync_directory(parent_handle.fd)
+            return CleanupOutcome("cleanup_complete")
+    finally:
+        close_created_directories(parent_handle.created)
+        os.close(parent_handle.fd)
+
+
 def apply_install(source: Path, destination: Path) -> InstallPlan:
     """Install a skill from a stable snapshot with atomic directory publication."""
 
@@ -228,7 +332,9 @@ def apply_install(source: Path, destination: Path) -> InstallPlan:
 
     staging_name: str | None = None
     staging_fd: int | None = None
+    staging_metadata: os.stat_result | None = None
     completed = False
+    primary_error: InstallError | None = None
     try:
         with directory_lock(destination_handle.fd):
             plan = _target_plan(source, destination, destination_handle.fd, snapshot)
@@ -239,6 +345,7 @@ def apply_install(source: Path, destination: Path) -> InstallPlan:
                 raise InstallError(plan.reason or f"cannot install into {plan.target}")
 
             staging_name, staging_fd = create_unique_directory(destination_handle.fd, ".setup-pstack-install-")
+            staging_metadata = os.fstat(staging_fd)
             write_snapshot(
                 staging_fd,
                 TreeSnapshot(snapshot.directories, snapshot.files, {}),
@@ -256,23 +363,50 @@ def apply_install(source: Path, destination: Path) -> InstallPlan:
             completed = True
             return plan
     except (OSError, SafeFilesystemError) as exc:
-        raise InstallError(f"install failed and was rolled back: {exc}") from exc
+        primary_error = InstallError(f"install failed and was rolled back: {exc}")
+        raise primary_error from exc
     finally:
+        cleanup_errors: list[str] = []
         if staging_fd is not None:
             os.close(staging_fd)
         if staging_name is not None:
             try:
-                remove_tree_at(destination_handle.fd, staging_name)
-            except OSError:
-                pass
+                remove_tree_at(
+                    destination_handle.fd,
+                    staging_name,
+                    expected_metadata=staging_metadata,
+                )
+            except (OSError, SafeFilesystemError) as exc:
+                cleanup_errors.append(f"staging residue {destination_handle.path / staging_name}: {exc}")
         if not completed:
             try:
                 cleanup_created_directories(destination_handle.created)
-            except OSError:
-                pass
+            except (OSError, SafeFilesystemError) as exc:
+                cleanup_errors.append(f"created parent cleanup: {exc}")
         else:
             close_created_directories(destination_handle.created)
         os.close(destination_handle.fd)
+        if cleanup_errors:
+            detail = "; ".join(cleanup_errors)
+            residue_text = next(
+                (
+                    part.split(":", 1)[0].removeprefix("staging residue ")
+                    for part in cleanup_errors
+                    if part.startswith("staging residue ")
+                ),
+                None,
+            )
+            residue = Path(residue_text) if residue_text else None
+            retry = _cleanup_retry_hint(residue, staging_metadata) if residue is not None else None
+            message = f"install rollback cleanup is incomplete (status=cleanup_pending): {detail}"
+            if residue is not None and retry is not None:
+                message += f". Retry with {retry}"
+            raise InstallError(
+                message,
+                status="cleanup_pending",
+                residue=residue,
+                retry=retry,
+            ) from primary_error
 
 
 def _format_result(plan: InstallPlan, as_json: bool) -> str:
@@ -342,8 +476,12 @@ def _self_test() -> None:
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("command", nargs="?", choices=("cleanup",), help="recover a reported staging residue")
     parser.add_argument("--source", type=Path, help="skill directory containing SKILL.md")
     parser.add_argument("--destination", type=Path, help="explicit Codex discovery skills directory")
+    parser.add_argument("--residue", type=Path, help="reported staging residue for cleanup")
+    parser.add_argument("--expected-dev", type=int, help="expected residue device from a cleanup receipt")
+    parser.add_argument("--expected-ino", type=int, help="expected residue inode from a cleanup receipt")
     parser.add_argument("--apply", action="store_true", help="apply the preview")
     parser.add_argument("--json", action="store_true", help="print a machine-readable plan")
     parser.add_argument("--self-test", action="store_true", help="exercise isolated install scenarios")
@@ -355,6 +493,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         _self_test()
         return 0
+    if args.command == "cleanup":
+        if not args.residue:
+            raise SystemExit("--residue is required for cleanup")
+        if (args.expected_dev is None) != (args.expected_ino is None):
+            raise SystemExit("--expected-dev and --expected-ino must be provided together")
+        try:
+            expected_identity = None
+            if args.expected_dev is not None and args.expected_ino is not None:
+                expected_identity = (args.expected_dev, args.expected_ino)
+            outcome = _cleanup_residue(args.residue, expected_identity=expected_identity)
+            print(json.dumps(outcome.as_dict(), indent=2 if args.json else None, sort_keys=True))
+            return 0
+        except InstallError as exc:
+            if args.json:
+                print(json.dumps(exc.as_dict(), indent=2, sort_keys=True), file=sys.stderr)
+            else:
+                print(f"install cleanup failed: {exc}", file=sys.stderr)
+            return 1
     if not args.source or not args.destination:
         raise SystemExit("--source and --destination are required unless --self-test is used")
     try:
@@ -362,7 +518,10 @@ def main(argv: list[str] | None = None) -> int:
         print(_format_result(plan, args.json))
         return 0
     except InstallError as exc:
-        print(f"install failed: {exc}", file=sys.stderr)
+        if args.json:
+            print(json.dumps(exc.as_dict(), indent=2, sort_keys=True), file=sys.stderr)
+        else:
+            print(f"install failed: {exc}", file=sys.stderr)
         return 1
 
 

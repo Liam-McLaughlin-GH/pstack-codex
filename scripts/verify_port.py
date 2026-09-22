@@ -43,6 +43,10 @@ MULTILINE_CURSOR_TASK_IMPORT = re.compile(
     r"\bfrom\s+cursor_tools\s+import\s*\((?P<body>(?=[^)]*\n)[^)]*\bTask\b[^)]*)\)",
     re.IGNORECASE | re.DOTALL,
 )
+BACKSLASH_CURSOR_TASK_IMPORT = re.compile(
+    r"\bfrom\s+cursor_tools\s+import(?P<body>(?:[^\n]|\\[ \t]*\r?\n[ \t]*)*\bTask\b)",
+    re.IGNORECASE,
+)
 BOUNDARY_ANNOTATION = re.compile(r"\bUNSUPPORTED[-_ ]SEAM\s*:\s*(?P<detail>[^\n]+)", re.IGNORECASE)
 SEAM_ANNOTATION_ALIASES = {
     "Cursor path": ("cursor path", "cursor rules", "cursor target"),
@@ -288,18 +292,19 @@ def _check_boundary_mentions(root: Path, path: Path, text: str, errors: list[str
                     "add an explicit same-line UNSUPPORTED-SEAM annotation or use a Codex surface"
                 )
 
-    for match in MULTILINE_CURSOR_TASK_IMPORT.finditer(text):
-        annotations = [
-            annotation.group("detail").casefold()
-            for annotation in BOUNDARY_ANNOTATION.finditer(match.group(0))
-        ]
-        if any(alias in detail for detail in annotations for alias in SEAM_ANNOTATION_ALIASES["Cursor Task call"]):
-            continue
-        line_number = text.count("\n", 0, match.start()) + 1
-        errors.append(
-            f"{path.relative_to(root)}:{line_number} contains an active unsupported seam 'Cursor Task call'; "
-            "add an explicit same-line UNSUPPORTED-SEAM annotation or use a Codex surface"
-        )
+    for import_pattern in (MULTILINE_CURSOR_TASK_IMPORT, BACKSLASH_CURSOR_TASK_IMPORT):
+        for match in import_pattern.finditer(text):
+            annotations = [
+                annotation.group("detail").casefold()
+                for annotation in BOUNDARY_ANNOTATION.finditer(match.group(0))
+            ]
+            if any(alias in detail for detail in annotations for alias in SEAM_ANNOTATION_ALIASES["Cursor Task call"]):
+                continue
+            line_number = text.count("\n", 0, match.start()) + 1
+            errors.append(
+                f"{path.relative_to(root)}:{line_number} contains an active unsupported seam 'Cursor Task call'; "
+                "add an explicit same-line UNSUPPORTED-SEAM annotation or use a Codex surface"
+            )
 
 
 def _load_skill_helper(path: Path):

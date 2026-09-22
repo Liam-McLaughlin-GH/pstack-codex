@@ -47,16 +47,17 @@ EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4, "ultra": 
 BUDGET_TARGET = {"small": "medium", "medium": "high", "large": "xhigh", "unlimited": "max"}
 
 
-def _cleanup_retry_hint(residue: Path) -> str:
-    return shlex.join(
-        (
-            sys.executable,
-            str(SCRIPT_DIRECTORY / "configure.py"),
-            "cleanup",
-            "--residue",
-            str(residue),
-        )
-    )
+def _cleanup_retry_hint(residue: Path, expected_metadata: os.stat_result | None = None) -> str:
+    command = [
+        sys.executable,
+        str(SCRIPT_DIRECTORY / "configure.py"),
+        "cleanup",
+        "--residue",
+        str(residue),
+    ]
+    if expected_metadata is not None:
+        command.extend(("--expected-dev", str(expected_metadata.st_dev), "--expected-ino", str(expected_metadata.st_ino)))
+    return shlex.join(command)
 
 
 def _recovery_hint(root: Path, residue: Path) -> str:
@@ -362,6 +363,8 @@ def _preserve_existing_selection(
     names = [_agent_name(spec, index) for index in range(1, spec.fanout + 1)]
     if not all(name in existing for name in names):
         return False
+    if inferred_default is None:
+        return True
     values = [existing[name][0] for name in names]
     return values[0] != inferred_default if spec.fanout == 1 else any(value != inferred_default for value in values)
 
@@ -520,6 +523,54 @@ def _restore_backup_if_root_absent(parent_fd: int, root_name: str, backup_name: 
     return False
 
 
+def _publication_state(
+    parent_fd: int,
+    parent_path: Path,
+    root_name: str,
+    residue_name: str,
+    expected_root: os.stat_result,
+    expected_residue: os.stat_result | None,
+    expected_snapshot: TreeSnapshot | None = None,
+) -> TransactionOutcome:
+    residue = parent_path / residue_name
+    try:
+        live_root = lstat_at(parent_fd, root_name)
+    except FileNotFoundError:
+        live_root = None
+    state_matches = live_root is not None and _same_entry(live_root, expected_root)
+    if state_matches and expected_snapshot is not None:
+        root_fd: int | None = None
+        try:
+            root_fd = open_child_directory(parent_fd, root_name)
+            opened_root = os.fstat(root_fd)
+            state_matches = _same_entry(opened_root, expected_root) and snapshot_tree(root_fd) == expected_snapshot
+            current_root = lstat_at(parent_fd, root_name)
+            state_matches = state_matches and _same_entry(current_root, expected_root)
+        except (OSError, SafeFilesystemError):
+            state_matches = False
+        finally:
+            if root_fd is not None:
+                os.close(root_fd)
+    if not state_matches:
+        try:
+            current_residue = lstat_at(parent_fd, residue_name)
+        except FileNotFoundError:
+            return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
+        if expected_residue is not None and _same_entry(current_residue, expected_residue):
+            if live_root is not None and _same_entry(live_root, expected_root):
+                return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
+            return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue, current_residue))
+        return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
+
+    try:
+        current_residue = lstat_at(parent_fd, residue_name)
+    except FileNotFoundError:
+        return TransactionOutcome("published")
+    if expected_residue is not None and _same_entry(current_residue, expected_residue):
+        return TransactionOutcome("published_cleanup_pending", residue, _cleanup_retry_hint(residue, current_residue))
+    return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
+
+
 def _cleanup_published_generation(
     parent_fd: int,
     parent_path: Path,
@@ -527,16 +578,45 @@ def _cleanup_published_generation(
     residue_name: str,
     expected_root: os.stat_result,
     expected_residue: os.stat_result,
+    expected_snapshot: TreeSnapshot | None = None,
 ) -> TransactionOutcome:
     """Remove only the old generation still behind the expected live root."""
 
     residue = parent_path / residue_name
+    if expected_snapshot is not None:
+        state = _publication_state(
+            parent_fd,
+            parent_path,
+            root_name,
+            residue_name,
+            expected_root,
+            expected_residue,
+            expected_snapshot,
+        )
+        if state.status != "published_cleanup_pending":
+            return state
     try:
         live_root = lstat_at(parent_fd, root_name)
     except FileNotFoundError:
-        return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue))
+        return _publication_state(
+            parent_fd,
+            parent_path,
+            root_name,
+            residue_name,
+            expected_root,
+            expected_residue,
+            expected_snapshot,
+        )
     if not _same_entry(live_root, expected_root):
-        return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue))
+        return _publication_state(
+            parent_fd,
+            parent_path,
+            root_name,
+            residue_name,
+            expected_root,
+            expected_residue,
+            expected_snapshot,
+        )
 
     try:
         old_generation = lstat_at(parent_fd, residue_name)
@@ -556,20 +636,24 @@ def _cleanup_published_generation(
             guard_metadata=expected_root,
         )
     except (OSError, SafeFilesystemError):
-        try:
-            live_root = lstat_at(parent_fd, root_name)
-        except FileNotFoundError:
-            return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue))
-        if not _same_entry(live_root, expected_root):
-            return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue))
-        try:
-            old_generation = lstat_at(parent_fd, residue_name)
-        except FileNotFoundError:
-            return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
-        if not _same_entry(old_generation, expected_residue):
-            return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
-        return TransactionOutcome("published_cleanup_pending", residue, _cleanup_retry_hint(residue))
-    return TransactionOutcome("published")
+        return _publication_state(
+            parent_fd,
+            parent_path,
+            root_name,
+            residue_name,
+            expected_root,
+            expected_residue,
+            expected_snapshot,
+        )
+    return _publication_state(
+        parent_fd,
+        parent_path,
+        root_name,
+        residue_name,
+        expected_root,
+        None,
+        expected_snapshot,
+    )
 
 
 def _publish_generation_with_recovery(
@@ -578,6 +662,7 @@ def _publish_generation_with_recovery(
     root_name: str,
     staging_name: str,
     root_metadata: os.stat_result,
+    expected_snapshot: TreeSnapshot | None = None,
 ) -> TransactionOutcome:
     """Fallback for platforms without an atomic directory exchange primitive."""
 
@@ -614,11 +699,25 @@ def _publish_generation_with_recovery(
         try:
             published_metadata = lstat_at(parent_fd, root_name)
         except FileNotFoundError:
-            residue = parent_path / backup_name
-            return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue))
+            return _publication_state(
+                parent_fd,
+                parent_path,
+                root_name,
+                backup_name,
+                staged_metadata,
+                root_metadata,
+                expected_snapshot,
+            )
         if not _same_entry(published_metadata, staged_metadata):
-            residue = parent_path / backup_name
-            return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue))
+            return _publication_state(
+                parent_fd,
+                parent_path,
+                root_name,
+                backup_name,
+                staged_metadata,
+                root_metadata,
+                expected_snapshot,
+            )
         return _cleanup_published_generation(
             parent_fd,
             parent_path,
@@ -626,6 +725,7 @@ def _publish_generation_with_recovery(
             backup_name,
             staged_metadata,
             root_metadata,
+            expected_snapshot,
         )
     finally:
         if root_moved:
@@ -644,13 +744,23 @@ def _publish_generation(
     root_name: str,
     staging_name: str,
     root_metadata: os.stat_result | None,
+    expected_snapshot: TreeSnapshot | None = None,
 ) -> TransactionOutcome:
     if root_metadata is None:
+        staged_metadata = lstat_at(parent_fd, staging_name)
         try:
             atomic_rename_noreplace_at(parent_fd, staging_name, root_name)
         except FileExistsError as exc:
             raise ConfigurationError(f"agents root appeared during configuration: {root_name}") from exc
-        return TransactionOutcome("published")
+        return _publication_state(
+            parent_fd,
+            parent_path,
+            root_name,
+            staging_name,
+            staged_metadata,
+            None,
+            expected_snapshot,
+        )
 
     residue = parent_path / staging_name
     staged_metadata = lstat_at(parent_fd, staging_name)
@@ -671,7 +781,14 @@ def _publish_generation(
         if exchanged:
             pass
         elif unchanged and isinstance(exc, SafeFilesystemError):
-            return _publish_generation_with_recovery(parent_fd, parent_path, root_name, staging_name, root_metadata)
+            return _publish_generation_with_recovery(
+                parent_fd,
+                parent_path,
+                root_name,
+                staging_name,
+                root_metadata,
+                expected_snapshot,
+            )
         elif unchanged:
             raise
         else:
@@ -706,10 +823,15 @@ def _publish_generation(
         staging_name,
         staged_metadata,
         root_metadata,
+        expected_snapshot,
     )
 
 
-def _cleanup_residue(residue: Path) -> TransactionOutcome:
+def _cleanup_residue(
+    residue: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+) -> TransactionOutcome:
     residue = canonical_path(residue)
     if not residue.name.startswith(".pstack-agents-"):
         raise ConfigurationError(f"refusing to clean an unrecognized transaction residue: {residue}")
@@ -725,15 +847,18 @@ def _cleanup_residue(residue: Path) -> TransactionOutcome:
                 return TransactionOutcome("cleanup_already_complete")
             if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
                 raise ConfigurationError(f"transaction residue is not a real directory: {residue}")
+            if expected_identity is not None and (metadata.st_dev, metadata.st_ino) != expected_identity:
+                raise ConfigurationError(f"cleanup refused; residue identity changed at {residue}")
             try:
                 remove_tree_at(parent_handle.fd, residue.name, expected_metadata=metadata)
             except SafeFilesystemError as exc:
                 raise ConfigurationError(
-                    f"cleanup refused; residue identity changed or is unsafe at {residue}: {exc}"
+                    f"cleanup refused; residue identity changed or is unsafe at {residue}. "
+                    f"Retry with {_cleanup_retry_hint(residue, metadata)}: {exc}"
                 ) from exc
             except OSError as exc:
                 raise ConfigurationError(
-                    f"cleanup failed; residue is preserved at {residue}. Retry with {_cleanup_retry_hint(residue)}: {exc}"
+                    f"cleanup failed; residue is preserved at {residue}. Retry with {_cleanup_retry_hint(residue, metadata)}: {exc}"
                 ) from exc
             sync_directory(parent_handle.fd)
             return TransactionOutcome("cleanup_complete")
@@ -760,6 +885,7 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
     completed = False
     primary_error: BaseException | None = None
     outcome: TransactionOutcome | None = None
+    published_snapshot: TreeSnapshot | None = None
     try:
         with directory_lock(parent_handle.fd):
             root_fd, current_snapshot, root_metadata = _open_agents_root_at(parent_handle.fd, agents_root.name)
@@ -776,6 +902,7 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
                         item.content.encode("utf-8"),
                         replace=True,
                     )
+                published_snapshot = snapshot_tree(staging_fd)
                 sync_directory(staging_fd)
                 os.close(staging_fd)
                 staging_fd = None
@@ -785,9 +912,23 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
                     agents_root.name,
                     staging_name,
                     root_metadata,
+                    published_snapshot,
                 )
+                published_residue_name = staging_name
                 staging_name = None
                 sync_directory(parent_handle.fd)
+                if outcome.status == "published":
+                    if staging_metadata is None:
+                        raise ConfigurationError("published generation has no identity")
+                    outcome = _publication_state(
+                        parent_handle.fd,
+                        parent_handle.path,
+                        agents_root.name,
+                        published_residue_name,
+                        staging_metadata,
+                        root_metadata,
+                        published_snapshot,
+                    )
                 completed = True
                 return outcome
             finally:
@@ -817,7 +958,7 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
         if not completed:
             try:
                 cleanup_created_directories(parent_handle.created)
-            except OSError as exc:
+            except (OSError, SafeFilesystemError) as exc:
                 cleanup_errors.append(f"created parent cleanup: {exc}")
                 close_created_directories(parent_handle.created)
         else:
@@ -831,7 +972,7 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
             )
             message = f"configuration cleanup is incomplete: {detail}"
             if retry:
-                message += f". Retry with {_cleanup_retry_hint(Path(retry))}"
+                message += f". Retry with {_cleanup_retry_hint(Path(retry), staging_metadata)}"
             if primary_error is not None:
                 raise ConfigurationError(f"{primary_error}; {message}") from primary_error
             raise ConfigurationError(message)
@@ -896,6 +1037,8 @@ def _parser() -> argparse.ArgumentParser:
     subparsers.add_parser("self-test", help="exercise model selection and config writes in a temporary directory")
     cleanup = subparsers.add_parser("cleanup", help="retry removal of a reported transaction residue")
     cleanup.add_argument("--residue", type=Path, required=True, help="residue path reported by an apply")
+    cleanup.add_argument("--expected-dev", type=int, help="expected residue device from a cleanup receipt")
+    cleanup.add_argument("--expected-ino", type=int, help="expected residue inode from a cleanup receipt")
     cleanup.add_argument("--json", action="store_true")
     return parser
 
@@ -907,7 +1050,12 @@ def main(argv: list[str] | None = None) -> int:
             _self_test()
             return 0
         if args.command == "cleanup":
-            outcome = _cleanup_residue(args.residue)
+            if (args.expected_dev is None) != (args.expected_ino is None):
+                raise ConfigurationError("--expected-dev and --expected-ino must be provided together")
+            expected_identity = None
+            if args.expected_dev is not None and args.expected_ino is not None:
+                expected_identity = (args.expected_dev, args.expected_ino)
+            outcome = _cleanup_residue(args.residue, expected_identity=expected_identity)
             print(json.dumps(outcome.as_dict(), indent=2 if args.json else None, sort_keys=True))
             return 0
         if args.command == "discover":

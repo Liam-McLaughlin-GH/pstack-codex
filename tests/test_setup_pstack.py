@@ -219,6 +219,93 @@ class SetupPstackBehaviorTests(unittest.TestCase):
                 module.atomic_rename_noreplace_at = original_publish
             self.assertFalse((root / "new-root").exists())
 
+    def test_installer_rollback_reports_identity_bound_cleanup_receipt(self) -> None:
+        module = load_module(INSTALLER, "install_for_cleanup_receipt_test")
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-install-cleanup-receipt-test-") as temporary:
+            root = Path(temporary)
+            source = root / "source" / "setup-pstack"
+            write_skill(source)
+            destination = root / "destination"
+            destination.mkdir()
+            replacement = root / "replacement"
+            replacement.mkdir()
+            (replacement / "operator.txt").write_text("keep me\n", encoding="utf-8")
+            original_publish = module.atomic_rename_noreplace_at
+            original_remove = module.remove_tree_at
+            swapped = False
+
+            def fail_publication(parent_fd: int, source_name: str, target_name: str) -> None:
+                raise OSError("injected publication failure")
+
+            def swap_staging(parent_fd: int, name: str, **kwargs: object) -> None:
+                nonlocal swapped
+                if not swapped:
+                    swapped = True
+                    residue = destination / name
+                    os.rename(residue, root / "original-staging")
+                    os.rename(replacement, residue)
+                original_remove(parent_fd, name, **kwargs)
+
+            module.atomic_rename_noreplace_at = fail_publication
+            module.remove_tree_at = swap_staging
+            try:
+                with self.assertRaises(module.InstallError) as raised:
+                    module.apply_install(source, destination)
+            finally:
+                module.atomic_rename_noreplace_at = original_publish
+                module.remove_tree_at = original_remove
+            self.assertTrue(swapped)
+            self.assertEqual(raised.exception.status, "cleanup_pending")
+            self.assertIsNotNone(raised.exception.residue)
+            self.assertIn("install.py cleanup --residue", raised.exception.retry or "")
+            self.assertIn("--expected-dev", raised.exception.retry or "")
+            self.assertIn("cleanup_pending", str(raised.exception))
+            self.assertEqual((destination / raised.exception.residue.name / "operator.txt").read_text(encoding="utf-8"), "keep me\n")
+            self.assertTrue((root / "original-staging" / "SKILL.md").is_file())
+
+    @unittest.skipUnless(hasattr(os, "link"), "hard links are unavailable")
+    def test_installer_rejects_a_hardlink_source_swap(self) -> None:
+        module = load_module(INSTALLER, "install_for_hardlink_race_test")
+        safe_fs = sys.modules["safe_fs"]
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-install-hardlink-test-") as temporary:
+            root = Path(temporary)
+            source = root / "source" / "setup-pstack"
+            write_skill(source)
+            source_file = source / "payload.txt"
+            source_file.write_text("safe\n", encoding="utf-8")
+            outside_file = root / "outside.txt"
+            outside_file.write_text("SECRET\n", encoding="utf-8")
+            destination = root / "destination"
+            original_read = safe_fs.read_regular_file_at
+            swapped = False
+
+            def swap_source_file(directory_fd: int, name: str, **kwargs: object) -> bytes:
+                nonlocal swapped
+                if name == "payload.txt" and not swapped:
+                    swapped = True
+                    source_file.unlink()
+                    try:
+                        os.link(outside_file, source_file)
+                    except OSError as exc:
+                        source_file.write_text("safe\n", encoding="utf-8")
+                        self.skipTest(f"hardlink probe unavailable: {exc}")
+                try:
+                    return original_read(directory_fd, name, **kwargs)
+                finally:
+                    if source_file.is_symlink() or source_file.stat().st_ino == outside_file.stat().st_ino:
+                        source_file.unlink()
+                    source_file.write_text("safe\n", encoding="utf-8")
+
+            safe_fs.read_regular_file_at = swap_source_file
+            try:
+                with self.assertRaises(module.InstallError):
+                    module.apply_install(source, destination)
+            finally:
+                safe_fs.read_regular_file_at = original_read
+            self.assertTrue(swapped)
+            self.assertFalse(destination.exists())
+            self.assertEqual(source_file.read_text(encoding="utf-8"), "safe\n")
+
     def test_installer_noreplace_refuses_competitor_after_absent_check(self) -> None:
         module = load_module(INSTALLER, "install_for_noreplace_test")
         with tempfile.TemporaryDirectory(prefix="setup-pstack-install-noreplace-test-") as temporary:
@@ -362,12 +449,12 @@ class SetupPstackBehaviorTests(unittest.TestCase):
 
             original_read = safe_fs.read_regular_file_at
 
-            def swap_source_file(directory_fd: int, name: str) -> bytes:
+            def swap_source_file(directory_fd: int, name: str, **kwargs: object) -> bytes:
                 if name == "payload.txt":
                     source_file.unlink()
                     os.symlink(outside / "payload.txt", source_file)
                 try:
-                    return original_read(directory_fd, name)
+                    return original_read(directory_fd, name, **kwargs)
                 finally:
                     if source_file.is_symlink():
                         source_file.unlink()
@@ -470,6 +557,69 @@ class SetupPstackBehaviorTests(unittest.TestCase):
                 module.atomic_exchange_at = original_exchange
             self.assertEqual((raced_agents / "operator.txt").read_text(encoding="utf-8"), "keep me\n")
             self.assertFalse((raced_agents / "pstack-feature.toml").exists())
+
+    def test_configuration_revalidates_the_live_root_before_reporting_published(self) -> None:
+        module = load_module(CONFIGURER, "configure_for_final_publication_check_test")
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-config-final-publication-test-") as temporary:
+            root = Path(temporary)
+            models = {"codex-test": module.Model("codex-test", ("low", "medium", "high", "xhigh"))}
+            agents = root / ".codex" / "agents"
+            initial = module.build_plan(models, agents, budget="medium", default_model="codex-test")
+            module.apply_plan(initial, agents)
+            replacement = module.build_plan(models, agents, budget="large")
+            competitor = root / "competitor"
+            competitor.mkdir()
+            (competitor / "operator.txt").write_text("keep me\n", encoding="utf-8")
+            original_state = module._publication_state
+            swapped = False
+
+            def swap_after_publication_check(*args: object, **kwargs: object):
+                nonlocal swapped
+                outcome = original_state(*args, **kwargs)
+                if not swapped and outcome.status == "published":
+                    swapped = True
+                    os.rename(agents, root / "published-generation")
+                    os.rename(competitor, agents)
+                return outcome
+
+            module._publication_state = swap_after_publication_check
+            try:
+                outcome = module.apply_plan(replacement, agents, allow_replace=True)
+            finally:
+                module._publication_state = original_state
+            self.assertTrue(swapped)
+            self.assertEqual(outcome.status, "publication_recovery_pending")
+            self.assertEqual((agents / "operator.txt").read_text(encoding="utf-8"), "keep me\n")
+            self.assertIn('model_reasoning_effort = "xhigh"', (root / "published-generation" / "pstack-feature.toml").read_text(encoding="utf-8"))
+
+    def test_configuration_refuses_a_live_root_state_change_before_reporting_published(self) -> None:
+        module = load_module(CONFIGURER, "configure_for_final_state_check_test")
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-config-final-state-test-") as temporary:
+            root = Path(temporary)
+            models = {"codex-test": module.Model("codex-test", ("low", "medium", "high", "xhigh"))}
+            agents = root / ".codex" / "agents"
+            initial = module.build_plan(models, agents, budget="medium", default_model="codex-test")
+            module.apply_plan(initial, agents)
+            replacement = module.build_plan(models, agents, budget="large")
+            original_state = module._publication_state
+            mutated = False
+
+            def mutate_after_publication_check(*args: object, **kwargs: object):
+                nonlocal mutated
+                outcome = original_state(*args, **kwargs)
+                if not mutated and outcome.status == "published":
+                    mutated = True
+                    (agents / "pstack-feature.toml").write_text("operator edit\n", encoding="utf-8")
+                return outcome
+
+            module._publication_state = mutate_after_publication_check
+            try:
+                outcome = module.apply_plan(replacement, agents, allow_replace=True)
+            finally:
+                module._publication_state = original_state
+            self.assertTrue(mutated)
+            self.assertEqual(outcome.status, "publication_recovery_pending")
+            self.assertEqual((agents / "pstack-feature.toml").read_text(encoding="utf-8"), "operator edit\n")
 
     def test_configuration_rejects_stale_preview_and_reports_cleanup_residue(self) -> None:
         module = load_module(CONFIGURER, "configure_for_transaction_test")
@@ -632,6 +782,82 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertIn("refused", str(raised.exception))
             self.assertEqual((residue / "victim.txt").read_text(encoding="utf-8"), "victim\n")
             self.assertEqual((root / "expected-residue" / "expected.txt").read_text(encoding="utf-8"), "expected\n")
+
+    def test_cleanup_residue_binds_nested_file_and_directory_identities(self) -> None:
+        module = load_module(CONFIGURER, "configure_for_nested_cleanup_identity_test")
+        safe_fs = sys.modules["safe_fs"]
+        for kind in ("file", "directory"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(prefix="setup-pstack-nested-cleanup-test-") as temporary:
+                root = Path(temporary)
+                parent = root / "parent"
+                parent.mkdir()
+                residue = parent / ".pstack-agents-old-test"
+                residue.mkdir()
+                victim = residue / "victim"
+                replacement = root / "replacement"
+                if kind == "file":
+                    victim.write_text("expected\n", encoding="utf-8")
+                    replacement.write_text("replacement\n", encoding="utf-8")
+                else:
+                    victim.mkdir()
+                    (victim / "expected.txt").write_text("expected\n", encoding="utf-8")
+                    replacement.mkdir()
+                    (replacement / "replacement.txt").write_text("replacement\n", encoding="utf-8")
+                original_lstat = safe_fs.lstat_at
+                seen = 0
+
+                def swap_nested_entry(directory_fd: int, name: str) -> os.stat_result:
+                    nonlocal seen
+                    if name == "victim":
+                        seen += 1
+                        if seen == 2:
+                            os.rename(victim, root / "expected-victim")
+                            os.rename(replacement, victim)
+                    return original_lstat(directory_fd, name)
+
+                safe_fs.lstat_at = swap_nested_entry
+                try:
+                    with self.assertRaises(module.ConfigurationError) as raised:
+                        module._cleanup_residue(residue)
+                finally:
+                    safe_fs.lstat_at = original_lstat
+                self.assertIn("refused", str(raised.exception))
+                if kind == "file":
+                    self.assertEqual((victim).read_text(encoding="utf-8"), "replacement\n")
+                    self.assertEqual((root / "expected-victim").read_text(encoding="utf-8"), "expected\n")
+                else:
+                    self.assertEqual((victim / "replacement.txt").read_text(encoding="utf-8"), "replacement\n")
+                    self.assertEqual((root / "expected-victim" / "expected.txt").read_text(encoding="utf-8"), "expected\n")
+
+    def test_cleanup_retry_refuses_a_replaced_residue_identity(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-cleanup-retry-identity-test-") as temporary:
+            root = Path(temporary)
+            parent = root / "parent"
+            parent.mkdir()
+            residue = parent / ".pstack-agents-old-test"
+            residue.mkdir()
+            (residue / "expected.txt").write_text("expected\n", encoding="utf-8")
+            expected = residue.stat()
+            replacement = root / "replacement"
+            replacement.mkdir()
+            (replacement / "operator.txt").write_text("keep me\n", encoding="utf-8")
+            os.rename(residue, root / "original-residue")
+            os.rename(replacement, residue)
+            cleanup = run_script(
+                CONFIGURER,
+                "cleanup",
+                "--residue",
+                str(residue),
+                "--expected-dev",
+                str(expected.st_dev),
+                "--expected-ino",
+                str(expected.st_ino),
+                "--json",
+            )
+            self.assertNotEqual(cleanup.returncode, 0)
+            self.assertIn("identity changed", cleanup.stderr)
+            self.assertEqual((residue / "operator.txt").read_text(encoding="utf-8"), "keep me\n")
+            self.assertEqual((root / "original-residue" / "expected.txt").read_text(encoding="utf-8"), "expected\n")
 
     def test_configuration_updates_budget_and_default_without_losing_reviewed_choices(self) -> None:
         with tempfile.TemporaryDirectory(prefix="setup-pstack-config-cli-test-") as temporary:
@@ -811,6 +1037,22 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertEqual(applied_reset.returncode, 0, applied_reset.stderr)
             self.assertNotIn("model =", (agents / "pstack-feature.toml").read_text(encoding="utf-8"))
             self.assertNotIn("model_reasoning_effort =", (agents / "pstack-feature.toml").read_text(encoding="utf-8"))
+
+            alias_majority_default_change = run_script(
+                CONFIGURER,
+                "preview",
+                *apply_args[1:-1],
+                "--budget",
+                "medium",
+                "--default-model",
+                "codex-test",
+                "--json",
+            )
+            self.assertEqual(alias_majority_default_change.returncode, 0, alias_majority_default_change.stderr)
+            alias_majority_agents = json.loads(alias_majority_default_change.stdout)["agents"]
+            self.assertEqual({item["status"] for item in alias_majority_agents}, {"unchanged"})
+            self.assertEqual({item["model"] for item in alias_majority_agents}, {None})
+            self.assertEqual({item["effort"] for item in alias_majority_agents}, {None})
 
             rejected_upstream_role = run_script(
                 CONFIGURER,
@@ -1043,6 +1285,15 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             helper.write_text("from cursor_tools import (\n    Task,\n    OtherTool,\n)\n", encoding="utf-8")
             multiline_task_errors = module.verify_port(root, run_helpers=False)
             self.assertTrue(any("Cursor Task call" in error for error in multiline_task_errors))
+
+            helper.write_text("from cursor_tools import \\\n    Task,\n", encoding="utf-8")
+            backslash_task_errors = module.verify_port(root, run_helpers=False)
+            self.assertTrue(any("Cursor Task call" in error for error in backslash_task_errors))
+
+            helper.write_text("from cursor_tools import \\\n    Task,  # UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")
+            mjs_helper.write_text("from cursor_tools import Task  // UNSUPPORTED-SEAM: Cursor Task\nTask(prompt)  // UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")
+            extensionless_helper.write_text("from cursor_tools import Task  # UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")
+            self.assertEqual(module.verify_port(root, run_helpers=False), [])
 
             helper.write_text("result = Task(prompt, model=\"grok\")  # UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")
             mjs_helper.write_text("from cursor_tools import Task  // UNSUPPORTED-SEAM: Cursor Task\nTask(prompt)  // UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")

@@ -160,7 +160,19 @@ def lstat_at(directory_fd: int, name: str) -> os.stat_result:
     return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
 
 
-def read_regular_file_at(directory_fd: int, name: str) -> bytes:
+def _same_entry(left: os.stat_result, right: os.stat_result) -> bool:
+    return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def read_regular_file_at(
+    directory_fd: int,
+    name: str,
+    *,
+    expected_metadata: os.stat_result | None = None,
+) -> bytes:
+    expected_metadata = expected_metadata or lstat_at(directory_fd, name)
+    if not stat.S_ISREG(expected_metadata.st_mode):
+        raise SafeFilesystemError(f"file is not regular: {name}")
     try:
         file_fd = os.open(name, _FILE_FLAGS, dir_fd=directory_fd)
     except OSError as exc:
@@ -168,8 +180,11 @@ def read_regular_file_at(directory_fd: int, name: str) -> bytes:
             raise SafeFilesystemError(f"file is a symlink: {name}") from exc
         raise
     try:
-        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+        opened_metadata = os.fstat(file_fd)
+        if not stat.S_ISREG(opened_metadata.st_mode):
             raise SafeFilesystemError(f"file is not regular: {name}")
+        if not _same_entry(opened_metadata, expected_metadata):
+            raise SafeFilesystemError(f"file identity changed during read: {name}")
         chunks: list[bytes] = []
         while True:
             chunk = os.read(file_fd, 1024 * 1024)
@@ -326,7 +341,11 @@ def snapshot_tree(root_fd: int, *, reject_symlinks: bool = False) -> TreeSnapsho
                 finally:
                     os.close(child_fd)
             elif stat.S_ISREG(mode):
-                files[relative] = read_regular_file_at(directory_fd, name)
+                files[relative] = read_regular_file_at(
+                    directory_fd,
+                    name,
+                    expected_metadata=metadata,
+                )
             elif stat.S_ISLNK(mode):
                 if reject_symlinks:
                     raise SafeFilesystemError(f"tree contains a symlink: {relative}")
@@ -362,6 +381,43 @@ def write_snapshot(root_fd: int, snapshot: TreeSnapshot) -> None:
             os.close(parent_fd)
 
 
+def _bind_tree_at(
+    parent_fd: int,
+    name: str,
+    expected_metadata: os.stat_result | None,
+) -> dict[tuple[str, ...], os.stat_result]:
+    metadata = lstat_at(parent_fd, name)
+    if expected_metadata is not None and not _same_entry(metadata, expected_metadata):
+        raise SafeFilesystemError(f"entry identity changed during removal: {name}")
+    identities: dict[tuple[str, ...], os.stat_result] = {(): metadata}
+
+    def visit(directory_fd: int, prefix: tuple[str, ...]) -> None:
+        for child in sorted(os.listdir(directory_fd)):
+            child_metadata = lstat_at(directory_fd, child)
+            child_path = prefix + (child,)
+            identities[child_path] = child_metadata
+            if stat.S_ISDIR(child_metadata.st_mode):
+                child_fd = _open_child_directory(directory_fd, child)
+                try:
+                    opened_metadata = os.fstat(child_fd)
+                    if not _same_entry(opened_metadata, child_metadata):
+                        raise SafeFilesystemError(f"entry identity changed during removal: {child}")
+                    visit(child_fd, child_path)
+                finally:
+                    os.close(child_fd)
+
+    if stat.S_ISDIR(metadata.st_mode):
+        directory_fd = _open_child_directory(parent_fd, name)
+        try:
+            opened_metadata = os.fstat(directory_fd)
+            if not _same_entry(opened_metadata, metadata):
+                raise SafeFilesystemError(f"entry identity changed during removal: {name}")
+            visit(directory_fd, ())
+        finally:
+            os.close(directory_fd)
+    return identities
+
+
 def remove_tree_at(
     parent_fd: int,
     name: str,
@@ -384,37 +440,66 @@ def remove_tree_at(
 
     def validate_entry(entry_name: str, expected: os.stat_result | None) -> os.stat_result:
         entry_metadata = lstat_at(parent_fd, entry_name)
-        if expected is not None and (
-            entry_metadata.st_dev,
-            entry_metadata.st_ino,
-        ) != (expected.st_dev, expected.st_ino):
+        if expected is not None and not _same_entry(entry_metadata, expected):
             raise SafeFilesystemError(f"entry identity changed during removal: {entry_name}")
         return entry_metadata
 
-    metadata = validate_entry(name, expected_metadata)
+    identities = _bind_tree_at(parent_fd, name, expected_metadata)
+    metadata = validate_entry(name, identities[()])
     if guard_name is not None:
         validate_entry(guard_name, guard_metadata)
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
-        if guard_name is not None:
+
+    def remove_bound(
+        directory_parent_fd: int,
+        entry_name: str,
+        relative: tuple[str, ...],
+        entry_metadata: os.stat_result,
+        *,
+        top_level: bool = False,
+    ) -> None:
+        current_metadata = lstat_at(directory_parent_fd, entry_name)
+        if not _same_entry(current_metadata, entry_metadata):
+            raise SafeFilesystemError(f"entry identity changed during removal: {entry_name}")
+        if stat.S_ISDIR(entry_metadata.st_mode):
+            directory_fd = _open_child_directory(directory_parent_fd, entry_name)
+            try:
+                opened_metadata = os.fstat(directory_fd)
+                if not _same_entry(opened_metadata, entry_metadata):
+                    raise SafeFilesystemError(f"entry identity changed during removal: {entry_name}")
+                children = sorted(os.listdir(directory_fd))
+                expected_children = {
+                    path[0]
+                    for path in identities
+                    if len(path) == len(relative) + 1 and path[:-1] == relative
+                }
+                if set(children) != expected_children:
+                    raise SafeFilesystemError(f"directory contents changed during removal: {entry_name}")
+                for child in children:
+                    child_relative = relative + (child,)
+                    remove_bound(
+                        directory_fd,
+                        child,
+                        child_relative,
+                        identities[child_relative],
+                    )
+            finally:
+                os.close(directory_fd)
+            current_metadata = lstat_at(directory_parent_fd, entry_name)
+            if not _same_entry(current_metadata, entry_metadata):
+                raise SafeFilesystemError(f"entry identity changed during removal: {entry_name}")
+            if top_level and guard_name is not None:
+                validate_entry(guard_name, guard_metadata)
+            os.rmdir(entry_name, dir_fd=directory_parent_fd)
+            return
+
+        current_metadata = lstat_at(directory_parent_fd, entry_name)
+        if not _same_entry(current_metadata, entry_metadata):
+            raise SafeFilesystemError(f"entry identity changed during removal: {entry_name}")
+        if top_level and guard_name is not None:
             validate_entry(guard_name, guard_metadata)
-        os.unlink(name, dir_fd=parent_fd)
-        return
-    directory_fd = _open_child_directory(parent_fd, name)
-    try:
-        opened_metadata = os.fstat(directory_fd)
-        if expected_metadata is not None and (
-            opened_metadata.st_dev,
-            opened_metadata.st_ino,
-        ) != (expected_metadata.st_dev, expected_metadata.st_ino):
-            raise SafeFilesystemError(f"entry identity changed during removal: {name}")
-        for child in sorted(os.listdir(directory_fd)):
-            remove_tree_at(directory_fd, child)
-    finally:
-        os.close(directory_fd)
-    validate_entry(name, expected_metadata)
-    if guard_name is not None:
-        validate_entry(guard_name, guard_metadata)
-    os.rmdir(name, dir_fd=parent_fd)
+        os.unlink(entry_name, dir_fd=directory_parent_fd)
+
+    remove_bound(parent_fd, name, (), metadata, top_level=True)
 
 
 def sync_directory(directory_fd: int) -> None:
