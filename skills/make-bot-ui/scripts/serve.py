@@ -4,10 +4,14 @@
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import json
 import os
+import secrets
 from dataclasses import dataclass
 from http import HTTPStatus
+from http.client import HTTPException, InvalidURL
+from http.cookies import CookieError, SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
@@ -20,6 +24,9 @@ PAYLOAD_FIELDS = ("action", "message")
 MAX_BODY_BYTES = 16 * 1024
 WEBHOOK_URL_ENV = "MAKE_BOT_UI_WEBHOOK_URL"
 WEBHOOK_KEY_ENV = "MAKE_BOT_UI_WEBHOOK_KEY"
+TRIGGER_TOKEN_ENV = "MAKE_BOT_UI_TRIGGER_TOKEN"
+TRIGGER_COOKIE_NAME = "make_bot_ui_trigger"
+TOKEN_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~+/=")
 
 
 @dataclass(frozen=True)
@@ -28,6 +35,8 @@ class RelayConfig:
     webhook_key: str
     failure_log: Path
     timeout: float = 8.0
+    trigger_token: str = ""
+    allow_local_http: bool = False
 
 
 @dataclass(frozen=True)
@@ -62,10 +71,77 @@ def validate_payload(value: Any) -> dict[str, str]:
     return {field: value[field] for field in PAYLOAD_FIELDS}
 
 
+def validate_sender_key(value: Any) -> str:
+    """Reject values that cannot be safely used as HTTP header values."""
+
+    if not isinstance(value, str) or not value:
+        raise ValueError("invalid webhook configuration")
+    if any(ord(character) < 0x20 or ord(character) == 0x7F for character in value):
+        raise ValueError("invalid webhook configuration")
+    try:
+        value.encode("latin-1")
+    except UnicodeError as error:
+        raise ValueError("invalid webhook configuration") from error
+    return value
+
+
+def _is_loopback_host(hostname: str) -> bool:
+    if hostname.rstrip(".").lower() == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(hostname).is_loopback
+    except ValueError:
+        return False
+
+
+def validate_webhook_url(value: Any, *, allow_local_http: bool = False) -> str:
+    """Allow HTTPS endpoints and explicitly opted-in loopback HTTP fixtures."""
+
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise ValueError("invalid webhook configuration")
+    if any(character.isspace() or ord(character) == 0x7F for character in value):
+        raise ValueError("invalid webhook configuration")
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        parsed.port  # Force malformed ports to fail before Request construction.
+    except (TypeError, UnicodeError, ValueError) as error:
+        raise ValueError("invalid webhook configuration") from error
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("invalid webhook configuration")
+    if parsed.scheme == "http" and not (allow_local_http and _is_loopback_host(hostname)):
+        raise ValueError("invalid webhook configuration")
+    return value
+
+
+def validate_trigger_token(value: Any) -> str:
+    """Keep the local bearer/cookie token safe for both transports."""
+
+    if not isinstance(value, str) or not value or any(character not in TOKEN_CHARS for character in value):
+        raise ValueError("invalid trigger configuration")
+    return value
+
+
 def append_failure(failure_log: Path, payload: dict[str, str]) -> None:
     failure_log.parent.mkdir(parents=True, exist_ok=True)
     with failure_log.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(payload, separators=(",", ":"), sort_keys=True) + "\n")
+
+
+def _failed_relay(config: RelayConfig, payload: dict[str, str], status: int | None = None) -> RelayResult:
+    try:
+        append_failure(config.failure_log, payload)
+    except (OSError, TypeError, ValueError):
+        pass
+    return RelayResult(False, status)
 
 
 def post_webhook(
@@ -75,31 +151,32 @@ def post_webhook(
 ) -> RelayResult:
     """Send exactly one request and record only the payload when it fails."""
 
-    body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-    request = Request(
-        config.webhook_url,
-        data=body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {config.webhook_key}",
-            "X-Automation-Key": config.webhook_key,
-        },
-        method="POST",
-    )
     try:
+        webhook_url = validate_webhook_url(config.webhook_url, allow_local_http=config.allow_local_http)
+        webhook_key = validate_sender_key(config.webhook_key)
+        body = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        request = Request(
+            webhook_url,
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {webhook_key}",
+                "X-Automation-Key": webhook_key,
+            },
+            method="POST",
+        )
         with opener(request, timeout=config.timeout) as response:
             status = response.getcode()
             response.read()
     except HTTPError as error:
         error.close()
-        append_failure(config.failure_log, payload)
-        return RelayResult(False, None)
-    except (OSError, TimeoutError, URLError):
-        append_failure(config.failure_log, payload)
-        return RelayResult(False, None)
+        return _failed_relay(config, payload)
+    except InvalidURL:
+        return _failed_relay(config, payload)
+    except (HTTPException, OSError, URLError, TypeError, ValueError):
+        return _failed_relay(config, payload)
     if status != HTTPStatus.OK:
-        append_failure(config.failure_log, payload)
-        return RelayResult(False, status)
+        return _failed_relay(config, payload, status)
     return RelayResult(True, status)
 
 
@@ -170,13 +247,24 @@ PAGE = """<!doctype html>
 
 
 def make_handler(config: RelayConfig) -> type[BaseHTTPRequestHandler]:
+    validate_trigger_token(config.trigger_token)
+
     class RelayHandler(BaseHTTPRequestHandler):
         server_version = "make-bot-ui/1"
 
         def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
             path = urlsplit(self.path).path
             if path == "/":
-                self._send_bytes(PAGE.encode("utf-8"), "text/html; charset=utf-8")
+                self._send_bytes(
+                    PAGE.encode("utf-8"),
+                    "text/html; charset=utf-8",
+                    headers={
+                        "Set-Cookie": (
+                            f"{TRIGGER_COOKIE_NAME}={config.trigger_token}; "
+                            "Path=/; HttpOnly; SameSite=Strict"
+                        )
+                    },
+                )
             elif path == "/healthz":
                 self._send_json(HTTPStatus.OK, {"ok": True})
             else:
@@ -185,6 +273,9 @@ def make_handler(config: RelayConfig) -> type[BaseHTTPRequestHandler]:
         def do_POST(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
             if urlsplit(self.path).path != "/send":
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                return
+            if not self._authorized_trigger():
+                self._send_json(HTTPStatus.UNAUTHORIZED, {"error": "unauthorized"})
                 return
             content_length = self.headers.get("Content-Length")
             try:
@@ -207,18 +298,48 @@ def make_handler(config: RelayConfig) -> type[BaseHTTPRequestHandler]:
             else:
                 self._send_json(HTTPStatus.BAD_GATEWAY, {"error": "webhook request failed"})
 
-        def _send_bytes(self, body: bytes, content_type: str) -> None:
+        def _authorized_trigger(self) -> bool:
+            expected = f"Bearer {config.trigger_token}"
+            authorization = self.headers.get("Authorization", "")
+            if secrets.compare_digest(authorization, expected):
+                return True
+            cookie_header = self.headers.get("Cookie", "")
+            cookies = SimpleCookie()
+            try:
+                cookies.load(cookie_header)
+            except CookieError:
+                return False
+            trigger = cookies.get(TRIGGER_COOKIE_NAME)
+            return trigger is not None and secrets.compare_digest(trigger.value, config.trigger_token)
+
+        def _send_bytes(
+            self,
+            body: bytes,
+            content_type: str,
+            *,
+            headers: dict[str, str] | None = None,
+        ) -> None:
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(body)))
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
 
-        def _send_json(self, status: HTTPStatus, value: dict[str, Any]) -> None:
+        def _send_json(
+            self,
+            status: HTTPStatus,
+            value: dict[str, Any],
+            *,
+            headers: dict[str, str] | None = None,
+        ) -> None:
             body = json.dumps(value, separators=(",", ":")).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            for name, header_value in (headers or {}).items():
+                self.send_header(name, header_value)
             self.end_headers()
             self.wfile.write(body)
 
@@ -238,14 +359,34 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--webhook-url", default=os.environ.get(WEBHOOK_URL_ENV))
     parser.add_argument("--failure-log", type=Path, default=Path(".make-bot-ui-failures.jsonl"))
+    parser.add_argument(
+        "--allow-local-http",
+        action="store_true",
+        help="allow an HTTP webhook only when its host is loopback; for local tests",
+    )
     args = parser.parse_args()
-    if not args.webhook_url or not os.environ.get(WEBHOOK_KEY_ENV):
-        parser.error(f"set {WEBHOOK_URL_ENV} and {WEBHOOK_KEY_ENV}; the key is read from the environment only")
+    webhook_key = os.environ.get(WEBHOOK_KEY_ENV)
+    trigger_token = os.environ.get(TRIGGER_TOKEN_ENV)
+    if not args.webhook_url or not webhook_key or not trigger_token:
+        parser.error(
+            f"set {WEBHOOK_URL_ENV}, {WEBHOOK_KEY_ENV}, and {TRIGGER_TOKEN_ENV}; "
+            "credentials are read from the environment only"
+        )
+    try:
+        validate_trigger_token(trigger_token)
+    except ValueError:
+        parser.error(f"{TRIGGER_TOKEN_ENV} must contain only HTTP token characters")
 
     server = create_server(
         args.host,
         args.port,
-        RelayConfig(args.webhook_url, os.environ[WEBHOOK_KEY_ENV], args.failure_log),
+        RelayConfig(
+            args.webhook_url,
+            webhook_key,
+            args.failure_log,
+            trigger_token=trigger_token,
+            allow_local_http=args.allow_local_http,
+        ),
     )
     print(f"make-bot-ui listening on {args.host}:{server.server_port}", flush=True)
     try:

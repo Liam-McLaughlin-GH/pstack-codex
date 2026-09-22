@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from contextlib import redirect_stderr
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -71,13 +73,19 @@ class RunningServer:
         self.server.server_close()
 
 
-def request_json(url: str, *, method: str = "GET", payload: dict[str, str] | None = None) -> tuple[int, dict]:
+def request_json(
+    url: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, str] | None = None,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, dict]:
     data = None
-    headers = {}
+    request_headers = dict(headers or {})
     if payload is not None:
         data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    request = Request(url, data=data, headers=headers, method=method)
+        request_headers["Content-Type"] = "application/json"
+    request = Request(url, data=data, headers=request_headers, method=method)
     try:
         with urlopen(request, timeout=2) as response:
             return response.status, json.loads(response.read())
@@ -88,14 +96,28 @@ def request_json(url: str, *, method: str = "GET", payload: dict[str, str] | Non
             error.close()
 
 
-def request_text(url: str) -> tuple[int, str]:
-    with urlopen(Request(url, method="GET"), timeout=2) as response:
-        return response.status, response.read().decode("utf-8")
-
-
 class MakeBotUIServerTests(unittest.TestCase):
-    def start_relay(self, target: str, failure_log: Path) -> RunningServer:
-        config = serve.RelayConfig(target, "test-secret", failure_log, timeout=1)
+    @staticmethod
+    def authorization_headers() -> dict[str, str]:
+        return {"Authorization": "Bearer trigger-secret"}
+
+    def start_relay(
+        self,
+        target: str,
+        failure_log: Path,
+        *,
+        webhook_key: str = "test-secret",
+        trigger_token: str = "trigger-secret",
+        allow_local_http: bool = True,
+    ) -> RunningServer:
+        config = serve.RelayConfig(
+            target,
+            webhook_key,
+            failure_log,
+            timeout=1,
+            trigger_token=trigger_token,
+            allow_local_http=allow_local_http,
+        )
         server = ThreadingHTTPServer(("127.0.0.1", 0), serve.make_handler(config))
         return RunningServer(server)
 
@@ -105,16 +127,23 @@ class MakeBotUIServerTests(unittest.TestCase):
             with tempfile.TemporaryDirectory(prefix="make-bot-ui-test-") as temporary:
                 failure_log = Path(temporary) / "failures.jsonl"
                 with self.start_relay(target, failure_log) as local:
-                    status, page = request_text(local + "/")
+                    with urlopen(Request(local + "/", method="GET"), timeout=2) as response:
+                        status = response.status
+                        page = response.read().decode("utf-8")
+                        cookie = response.headers["Set-Cookie"].split(";", 1)[0]
                     self.assertEqual(status, HTTPStatus.OK)
                     self.assertIn("Send status check", page)
                     self.assertNotIn(target, page)
                     self.assertNotIn("test-secret", page)
+                    self.assertNotIn("trigger-secret", page)
 
                     request = Request(local + "/send", method="POST", data=json.dumps({
                         "action": "status",
                         "message": "status check",
-                    }).encode("utf-8"), headers={"Content-Type": "application/json"})
+                    }).encode("utf-8"), headers={
+                        "Content-Type": "application/json",
+                        "Cookie": cookie,
+                    })
                     with urlopen(request, timeout=2) as response:
                         self.assertEqual(response.status, HTTPStatus.OK)
                         self.assertEqual(json.loads(response.read())["status"], HTTPStatus.OK)
@@ -137,6 +166,7 @@ class MakeBotUIServerTests(unittest.TestCase):
                         local + "/send",
                         method="POST",
                         payload={"action": "note", "message": "harmless failure"},
+                        headers=self.authorization_headers(),
                     )
                     self.assertEqual(status, HTTPStatus.BAD_GATEWAY)
                     self.assertEqual(body, {"error": "webhook request failed"})
@@ -157,19 +187,174 @@ class MakeBotUIServerTests(unittest.TestCase):
                         local + "/send",
                         method="POST",
                         payload={"action": "status", "message": "ok", "key": "do-not-forward"},
+                        headers=self.authorization_headers(),
                     )
                     self.assertEqual(status, HTTPStatus.BAD_REQUEST)
                     self.assertEqual(body, {"error": "invalid webhook payload"})
         self.assertEqual(capture.requests, [])
 
+    def test_unauthorized_trigger_does_not_reach_webhook(self) -> None:
+        capture = CaptureState()
+        with RunningServer(ThreadingHTTPServer(("127.0.0.1", 0), capture_handler(capture))) as target:
+            with tempfile.TemporaryDirectory(prefix="make-bot-ui-auth-test-") as temporary:
+                failure_log = Path(temporary) / "failures.jsonl"
+                with self.start_relay(target, failure_log) as local:
+                    payload = {"action": "status", "message": "must not send"}
+                    status, body = request_json(local + "/send", method="POST", payload=payload)
+                    self.assertEqual(status, HTTPStatus.UNAUTHORIZED)
+                    self.assertEqual(body, {"error": "unauthorized"})
+
+                    status, body = request_json(
+                        local + "/send",
+                        method="POST",
+                        payload=payload,
+                        headers={"Authorization": "Bearer wrong-token"},
+                    )
+                    self.assertEqual(status, HTTPStatus.UNAUTHORIZED)
+                    self.assertEqual(body, {"error": "unauthorized"})
+        self.assertEqual(capture.requests, [])
+        self.assertFalse(failure_log.exists())
+
+    def test_malformed_webhook_endpoints_return_generic_502_and_log_payload(self) -> None:
+        endpoints = (
+            "not-a-url",
+            "http://[::1",
+            "http://127.0.0.1:notaport/",
+            "https:///missing-host",
+            "http://example.com/webhook",
+            "ftp://example.com/webhook",
+        )
+        payload = {"action": "status", "message": "invalid endpoint"}
+        for endpoint in endpoints:
+            with self.subTest(endpoint=endpoint):
+                with tempfile.TemporaryDirectory(prefix="make-bot-ui-endpoint-test-") as temporary:
+                    failure_log = Path(temporary) / "failures.jsonl"
+                    with self.start_relay(endpoint, failure_log) as local:
+                        status, body = request_json(
+                            local + "/send",
+                            method="POST",
+                            payload=payload,
+                            headers=self.authorization_headers(),
+                        )
+                    self.assertEqual(status, HTTPStatus.BAD_GATEWAY)
+                    self.assertEqual(body, {"error": "webhook request failed"})
+                    self.assertEqual(
+                        failure_log.read_text(encoding="utf-8"),
+                        '{"action":"status","message":"invalid endpoint"}\n',
+                    )
+
+    def test_control_character_sender_key_returns_502_without_traceback_or_key_log(self) -> None:
+        capture = CaptureState()
+        secret = "bad\nX-Leak: yes"
+        with RunningServer(ThreadingHTTPServer(("127.0.0.1", 0), capture_handler(capture))) as target:
+            with tempfile.TemporaryDirectory(prefix="make-bot-ui-key-test-") as temporary:
+                failure_log = Path(temporary) / "failures.jsonl"
+                stderr = io.StringIO()
+                with redirect_stderr(stderr), self.start_relay(
+                    target,
+                    failure_log,
+                    webhook_key=secret,
+                ) as local:
+                    status, body = request_json(
+                        local + "/send",
+                        method="POST",
+                        payload={"action": "status", "message": "invalid key"},
+                        headers=self.authorization_headers(),
+                    )
+                self.assertEqual(status, HTTPStatus.BAD_GATEWAY)
+                self.assertEqual(body, {"error": "webhook request failed"})
+                self.assertEqual(
+                    failure_log.read_text(encoding="utf-8"),
+                    '{"action":"status","message":"invalid key"}\n',
+                )
+                self.assertNotIn("bad", stderr.getvalue())
+        self.assertEqual(capture.requests, [])
+
+    def test_https_policy_requires_explicit_loopback_http_opt_in(self) -> None:
+        self.assertEqual(
+            serve.validate_webhook_url("https://example.com/webhook"),
+            "https://example.com/webhook",
+        )
+        with self.assertRaises(ValueError):
+            serve.validate_webhook_url("http://127.0.0.1:8765/webhook")
+        with self.assertRaises(ValueError):
+            serve.validate_webhook_url("http://example.com/webhook", allow_local_http=True)
+        self.assertEqual(
+            serve.validate_webhook_url("http://127.0.0.1:8765/webhook", allow_local_http=True),
+            "http://127.0.0.1:8765/webhook",
+        )
+
+    def test_request_construction_is_skipped_for_invalid_configuration(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="make-bot-ui-validation-test-") as temporary:
+            config = serve.RelayConfig(
+                "not-a-url",
+                "bad\r\nX-Leak: yes",
+                Path(temporary) / "failures.jsonl",
+                trigger_token="trigger-secret",
+            )
+            with patch.object(serve, "Request", side_effect=AssertionError("request must not be built")):
+                result = serve.post_webhook(config, {"action": "status", "message": "validation"})
+            self.assertEqual(result, serve.RelayResult(False, None))
+
 
 class MakeBotUICapabilityTests(unittest.TestCase):
     def test_prefers_playwright_cli_when_present(self) -> None:
+        help_text = "playwright-cli open snapshot click screenshot"
         with patch.object(capabilities.shutil, "which", return_value="/usr/local/bin/playwright-cli"):
-            result = capabilities.select_browser_adapter()
+            with patch.object(
+                capabilities.subprocess,
+                "run",
+                return_value=capabilities.subprocess.CompletedProcess(
+                    ["/usr/local/bin/playwright-cli", "--help"],
+                    0,
+                    stdout=help_text,
+                    stderr="",
+                ),
+            ) as probe:
+                result = capabilities.select_browser_adapter()
+        probe.assert_called_once_with(
+            ["/usr/local/bin/playwright-cli", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
         self.assertEqual(result["adapter"], "playwright-cli")
         self.assertEqual(result["status"], "available")
         self.assertEqual(result["fallback"], "manual-browser")
+
+    def test_false_playwright_path_falls_back_after_identity_probe(self) -> None:
+        with patch.object(capabilities.shutil, "which", return_value="/bin/echo"):
+            with patch.object(
+                capabilities.subprocess,
+                "run",
+                return_value=capabilities.subprocess.CompletedProcess(
+                    ["/bin/echo", "--help"],
+                    0,
+                    stdout="--help\n",
+                    stderr="",
+                ),
+            ):
+                result = capabilities.select_browser_adapter("/bin/echo")
+        self.assertEqual(result["adapter"], "manual-browser")
+        self.assertEqual(result["status"], "fallback")
+        self.assertIn("playwright cli capability probe", result["reason"].lower())
+
+    def test_playwright_identity_without_required_commands_falls_back(self) -> None:
+        with patch.object(capabilities.shutil, "which", return_value="/tmp/playwright-cli"):
+            with patch.object(
+                capabilities.subprocess,
+                "run",
+                return_value=capabilities.subprocess.CompletedProcess(
+                    ["/tmp/playwright-cli", "--help"],
+                    0,
+                    stdout="playwright-cli open snapshot\n",
+                    stderr="",
+                ),
+            ):
+                result = capabilities.select_browser_adapter()
+        self.assertEqual(result["adapter"], "manual-browser")
+        self.assertEqual(result["status"], "fallback")
 
     def test_exercises_manual_fallback_when_browser_adapter_is_missing(self) -> None:
         with patch.object(capabilities.shutil, "which", return_value=None):

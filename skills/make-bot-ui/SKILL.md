@@ -37,8 +37,15 @@ files:
 ```sh
 export MAKE_BOT_UI_WEBHOOK_URL='https://example.invalid/webhook'
 export MAKE_BOT_UI_WEBHOOK_KEY='set-this-locally'
+export MAKE_BOT_UI_TRIGGER_TOKEN='set-a-separate-local-token'
 python3 skills/make-bot-ui/scripts/serve.py --port 8765
 ```
+
+`MAKE_BOT_UI_TRIGGER_TOKEN` protects `/send`. The page receives it only as an
+HttpOnly, same-origin cookie, and direct callers must send
+`Authorization: Bearer <trigger-token>`. Missing or incorrect authorization is
+rejected before the payload is read or relayed. Keep this token separate from
+the webhook sender key.
 
 The server binds to `0.0.0.0` by default so an already-connected tailnet peer
 can reach it. Its outbound request uses:
@@ -47,6 +54,9 @@ can reach it. Its outbound request uses:
 - `Authorization: Bearer <key>` and `X-Automation-Key: <key>`;
 - one JSON object containing the declared fields;
 - an 8-second timeout and no retry.
+
+Webhook URLs must use HTTPS. For a loopback fixture only, pass
+`--allow-local-http`; non-loopback HTTP remains rejected even with that flag.
 
 HTTP 200 is the successful wake response. If the request fails, append the
 same JSON payload to the configured local failure log. The log is for a
