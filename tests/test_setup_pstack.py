@@ -206,18 +206,121 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             source = root / "source" / "setup-pstack"
             write_skill(source)
             destination = root / "new-root" / ".agents" / "skills"
-            original_rename = module.os.rename
+            original_publish = module.atomic_rename_noreplace_at
 
-            def fail_publication(source_path: Path, target_path: Path, **kwargs: object) -> None:
+            def fail_publication(parent_fd: int, source_name: str, target_name: str) -> None:
                 raise OSError("injected publication failure")
 
-            module.os.rename = fail_publication
+            module.atomic_rename_noreplace_at = fail_publication
             try:
                 with self.assertRaises(module.InstallError):
                     module.apply_install(source, destination)
             finally:
-                module.os.rename = original_rename
+                module.atomic_rename_noreplace_at = original_publish
             self.assertFalse((root / "new-root").exists())
+
+    def test_installer_noreplace_refuses_competitor_after_absent_check(self) -> None:
+        module = load_module(INSTALLER, "install_for_noreplace_test")
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-install-noreplace-test-") as temporary:
+            root = Path(temporary)
+            source = root / "source" / "setup-pstack"
+            write_skill(source)
+            destination = root / "destination"
+            destination.mkdir()
+            competitor = destination / source.name
+            original_publish = module.atomic_rename_noreplace_at
+            injected = False
+
+            def publish_with_competitor(parent_fd: int, source_name: str, target_name: str) -> None:
+                nonlocal injected
+                if not injected:
+                    injected = True
+                    competitor.mkdir()
+                    (competitor / "SKILL.md").write_text("competitor\n", encoding="utf-8")
+                original_publish(parent_fd, source_name, target_name)
+
+            module.atomic_rename_noreplace_at = publish_with_competitor
+            try:
+                with self.assertRaises(module.InstallError):
+                    module.apply_install(source, destination)
+            finally:
+                module.atomic_rename_noreplace_at = original_publish
+            self.assertTrue(injected)
+            self.assertEqual((competitor / "SKILL.md").read_text(encoding="utf-8"), "competitor\n")
+            self.assertEqual(list(destination.glob(".setup-pstack-install-*")), [])
+
+    def test_self_tests_and_repeated_preview_leave_no_bytecode_residue(self) -> None:
+        def bytecode_paths(path: Path) -> set[Path]:
+            return {
+                candidate.relative_to(path)
+                for candidate in path.rglob("*")
+                if candidate.is_file() and (candidate.suffix == ".pyc" or "__pycache__" in candidate.parts)
+            }
+
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-bytecode-test-") as temporary:
+            root = Path(temporary)
+            skill = root / "skill" / "setup-pstack"
+            shutil.copytree(
+                ROOT / "skills" / "setup-pstack",
+                skill,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            catalog = root / "models.json"
+            catalog.write_text(
+                json.dumps(
+                    {
+                        "models": [
+                            {
+                                "slug": "codex-test",
+                                "supported_reasoning_levels": [{"effort": value} for value in ("low", "medium", "high")],
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            agents = root / ".codex" / "agents"
+            configure = skill / "scripts" / "configure.py"
+            installer = skill / "scripts" / "install.py"
+            before = bytecode_paths(root)
+            first = run_script(
+                configure,
+                "preview",
+                "--catalog",
+                str(catalog),
+                "--agents-root",
+                str(agents),
+                "--budget",
+                "medium",
+                "--default-model",
+                "codex-test",
+                "--json",
+                cwd=root,
+            )
+            second = run_script(
+                configure,
+                "preview",
+                "--catalog",
+                str(catalog),
+                "--agents-root",
+                str(agents),
+                "--budget",
+                "medium",
+                "--default-model",
+                "codex-test",
+                "--json",
+                cwd=root,
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            self.assertEqual(second.returncode, 0, second.stderr)
+            self.assertEqual(first.stdout, second.stdout)
+            for script, arguments in (
+                (installer, ("--self-test",)),
+                (configure, ("self-test",)),
+            ):
+                completed = run_script(script, *arguments, cwd=root)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(bytecode_paths(root), before)
 
     def test_installer_keeps_writes_on_open_directory_and_rejects_source_swap(self) -> None:
         module = load_module(INSTALLER, "install_for_race_test")
@@ -388,12 +491,12 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             original_remove = module.remove_tree_at
             failed = False
 
-            def fail_cleanup(parent_fd: int, name: str) -> None:
+            def fail_cleanup(parent_fd: int, name: str, **kwargs: object) -> None:
                 nonlocal failed
                 if not failed and name.startswith(".pstack-agents-"):
                     failed = True
                     raise OSError("injected old-generation cleanup failure")
-                original_remove(parent_fd, name)
+                original_remove(parent_fd, name, **kwargs)
 
             module.remove_tree_at = fail_cleanup
             try:
@@ -409,6 +512,126 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertEqual(cleanup.returncode, 0, cleanup.stderr)
             self.assertEqual(json.loads(cleanup.stdout)["status"], "cleanup_complete")
             self.assertFalse(outcome.residue.exists())
+
+    def test_configuration_refuses_swapped_live_root_or_residue_during_cleanup(self) -> None:
+        module = load_module(CONFIGURER, "configure_for_cleanup_identity_test")
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-config-cleanup-identity-test-") as temporary:
+            root = Path(temporary)
+            models = {"codex-test": module.Model("codex-test", ("low", "medium", "high", "xhigh"))}
+            agents = root / ".codex" / "agents"
+            initial = module.build_plan(models, agents, budget="medium", default_model="codex-test")
+            module.apply_plan(initial, agents)
+            replacement = module.build_plan(models, agents, budget="large")
+            original_remove = module.remove_tree_at
+
+            competitor_root = root / "competitor-root"
+            competitor_root.mkdir()
+            (competitor_root / "operator.txt").write_text("keep root\n", encoding="utf-8")
+            swapped = False
+
+            def swap_live_root(parent_fd: int, name: str, **kwargs: object) -> None:
+                nonlocal swapped
+                if not swapped and kwargs.get("guard_name") == agents.name:
+                    swapped = True
+                    os.rename(agents, root / "published-generation")
+                    os.rename(competitor_root, agents)
+                original_remove(parent_fd, name, **kwargs)
+
+            module.remove_tree_at = swap_live_root
+            try:
+                outcome = module.apply_plan(replacement, agents, allow_replace=True)
+            finally:
+                module.remove_tree_at = original_remove
+            self.assertTrue(swapped)
+            self.assertEqual(outcome.status, "root_replacement_cleanup_pending")
+            self.assertEqual((agents / "operator.txt").read_text(encoding="utf-8"), "keep root\n")
+            self.assertTrue((root / "published-generation" / "pstack-feature.toml").is_file())
+            self.assertTrue(outcome.residue is not None and outcome.residue.is_dir())
+
+            agents = root / "residue-agents"
+            initial = module.build_plan(models, agents, budget="medium", default_model="codex-test")
+            module.apply_plan(initial, agents)
+            replacement = module.build_plan(models, agents, budget="large")
+            competitor_residue = root / "competitor-residue"
+            competitor_residue.mkdir()
+            (competitor_residue / "operator.txt").write_text("keep residue\n", encoding="utf-8")
+            swapped = False
+
+            def swap_residue(parent_fd: int, name: str, **kwargs: object) -> None:
+                nonlocal swapped
+                if not swapped and kwargs.get("expected_metadata") is not None:
+                    residue = agents.parent / name
+                    swapped = True
+                    os.rename(residue, root / "original-residue")
+                    os.rename(competitor_residue, residue)
+                original_remove(parent_fd, name, **kwargs)
+
+            module.remove_tree_at = swap_residue
+            try:
+                outcome = module.apply_plan(replacement, agents, allow_replace=True)
+            finally:
+                module.remove_tree_at = original_remove
+            self.assertTrue(swapped)
+            self.assertEqual(outcome.status, "publication_recovery_pending")
+            self.assertEqual((outcome.residue / "operator.txt").read_text(encoding="utf-8"), "keep residue\n")
+            self.assertTrue((root / "original-residue" / "pstack-feature.toml").is_file())
+
+    def test_configuration_fallback_publishes_and_cleans_by_identity(self) -> None:
+        module = load_module(CONFIGURER, "configure_for_fallback_test")
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-config-fallback-test-") as temporary:
+            root = Path(temporary)
+            models = {"codex-test": module.Model("codex-test", ("low", "medium", "high", "xhigh"))}
+            agents = root / ".codex" / "agents"
+            initial = module.build_plan(models, agents, budget="medium", default_model="codex-test")
+            module.apply_plan(initial, agents)
+            replacement = module.build_plan(models, agents, budget="large")
+            original_exchange = module.atomic_exchange_at
+
+            def unavailable_exchange(parent_fd: int, first_name: str, second_name: str) -> None:
+                raise module.SafeFilesystemError("injected unavailable exchange")
+
+            module.atomic_exchange_at = unavailable_exchange
+            try:
+                outcome = module.apply_plan(replacement, agents, allow_replace=True)
+            finally:
+                module.atomic_exchange_at = original_exchange
+            self.assertEqual(outcome.status, "published")
+            self.assertIn('model_reasoning_effort = "xhigh"', (agents / "pstack-feature.toml").read_text(encoding="utf-8"))
+            self.assertEqual(list(agents.parent.glob(".pstack-agents-old-*")), [])
+
+    def test_cleanup_residue_refuses_a_swapped_victim(self) -> None:
+        module = load_module(CONFIGURER, "configure_for_cleanup_residue_test")
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-cleanup-residue-test-") as temporary:
+            root = Path(temporary)
+            parent = root / "parent"
+            parent.mkdir()
+            residue = parent / ".pstack-agents-old-test"
+            residue.mkdir()
+            (residue / "expected.txt").write_text("expected\n", encoding="utf-8")
+            replacement = root / "replacement"
+            replacement.mkdir()
+            (replacement / "victim.txt").write_text("victim\n", encoding="utf-8")
+            original_remove = module.remove_tree_at
+            swapped = False
+
+            def swap_victim(parent_fd: int, name: str, **kwargs: object) -> None:
+                nonlocal swapped
+                if not swapped:
+                    swapped = True
+                    os.rename(residue, root / "expected-residue")
+                    os.rename(replacement, residue)
+                original_remove(parent_fd, name, **kwargs)
+
+            module.remove_tree_at = swap_victim
+            try:
+                with self.assertRaises(module.ConfigurationError) as raised:
+                    module._cleanup_residue(residue)
+            finally:
+                module.remove_tree_at = original_remove
+            self.assertTrue(swapped)
+            self.assertIn("refused", str(raised.exception))
+            self.assertEqual((residue / "victim.txt").read_text(encoding="utf-8"), "victim\n")
+            self.assertEqual((root / "expected-residue" / "expected.txt").read_text(encoding="utf-8"), "expected\n")
 
     def test_configuration_updates_budget_and_default_without_losing_reviewed_choices(self) -> None:
         with tempfile.TemporaryDirectory(prefix="setup-pstack-config-cli-test-") as temporary:
@@ -816,6 +1039,10 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             extensionless_helper.write_text("from cursor_tools import Task\n", encoding="utf-8")
             task_errors = module.verify_port(root, run_helpers=False)
             self.assertGreaterEqual(len([error for error in task_errors if "Cursor Task call" in error]), 3)
+
+            helper.write_text("from cursor_tools import (\n    Task,\n    OtherTool,\n)\n", encoding="utf-8")
+            multiline_task_errors = module.verify_port(root, run_helpers=False)
+            self.assertTrue(any("Cursor Task call" in error for error in multiline_task_errors))
 
             helper.write_text("result = Task(prompt, model=\"grok\")  # UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")
             mjs_helper.write_text("from cursor_tools import Task  // UNSUPPORTED-SEAM: Cursor Task\nTask(prompt)  // UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")

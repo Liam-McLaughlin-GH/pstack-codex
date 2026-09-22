@@ -18,12 +18,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+sys.dont_write_bytecode = True
 if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 
 from safe_fs import (  # noqa: E402
     SafeFilesystemError,
     TreeSnapshot,
+    atomic_rename_noreplace_at,
     cleanup_created_directories,
     close_created_directories,
     create_unique_directory,
@@ -243,12 +245,10 @@ def apply_install(source: Path, destination: Path) -> InstallPlan:
             )
             sync_directory(staging_fd)
             _destination_target_is_absent(destination_handle.fd, source.name)
-            os.rename(
-                staging_name,
-                source.name,
-                src_dir_fd=destination_handle.fd,
-                dst_dir_fd=destination_handle.fd,
-            )
+            try:
+                atomic_rename_noreplace_at(destination_handle.fd, staging_name, source.name)
+            except FileExistsError as exc:
+                raise InstallError(f"target appeared during install: {source.name}") from exc
             staging_name = None
             os.close(staging_fd)
             staging_fd = None

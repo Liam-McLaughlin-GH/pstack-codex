@@ -362,17 +362,58 @@ def write_snapshot(root_fd: int, snapshot: TreeSnapshot) -> None:
             os.close(parent_fd)
 
 
-def remove_tree_at(parent_fd: int, name: str) -> None:
-    metadata = lstat_at(parent_fd, name)
+def remove_tree_at(
+    parent_fd: int,
+    name: str,
+    *,
+    expected_metadata: os.stat_result | None = None,
+    guard_name: str | None = None,
+    guard_metadata: os.stat_result | None = None,
+) -> None:
+    """Remove an entry without following links, optionally binding identities.
+
+    ``guard_name``/``guard_metadata`` protect a sibling publication root while
+    a residue generation is removed. The caller still serializes the parent
+    directory with ``directory_lock``; the repeated checks close the unsafe
+    check-then-remove windows for callers that also need to detect an
+    uncooperative replacement.
+    """
+
+    if guard_name is not None and guard_metadata is None:
+        raise ValueError("guard_metadata is required when guard_name is set")
+
+    def validate_entry(entry_name: str, expected: os.stat_result | None) -> os.stat_result:
+        entry_metadata = lstat_at(parent_fd, entry_name)
+        if expected is not None and (
+            entry_metadata.st_dev,
+            entry_metadata.st_ino,
+        ) != (expected.st_dev, expected.st_ino):
+            raise SafeFilesystemError(f"entry identity changed during removal: {entry_name}")
+        return entry_metadata
+
+    metadata = validate_entry(name, expected_metadata)
+    if guard_name is not None:
+        validate_entry(guard_name, guard_metadata)
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        if guard_name is not None:
+            validate_entry(guard_name, guard_metadata)
         os.unlink(name, dir_fd=parent_fd)
         return
     directory_fd = _open_child_directory(parent_fd, name)
     try:
+        opened_metadata = os.fstat(directory_fd)
+        if expected_metadata is not None and (
+            opened_metadata.st_dev,
+            opened_metadata.st_ino,
+        ) != (expected_metadata.st_dev, expected_metadata.st_ino):
+            raise SafeFilesystemError(f"entry identity changed during removal: {name}")
         for child in sorted(os.listdir(directory_fd)):
             remove_tree_at(directory_fd, child)
     finally:
         os.close(directory_fd)
+    validate_entry(name, expected_metadata)
+    if guard_name is not None:
+        validate_entry(guard_name, guard_metadata)
     os.rmdir(name, dir_fd=parent_fd)
 
 

@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+sys.dont_write_bytecode = True
 if str(SCRIPT_DIRECTORY) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIRECTORY))
 
@@ -511,9 +512,64 @@ def _restore_backup_if_root_absent(parent_fd: int, root_name: str, backup_name: 
     try:
         lstat_at(parent_fd, root_name)
     except FileNotFoundError:
-        os.rename(backup_name, root_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        try:
+            atomic_rename_noreplace_at(parent_fd, backup_name, root_name)
+        except FileExistsError:
+            return False
         return True
     return False
+
+
+def _cleanup_published_generation(
+    parent_fd: int,
+    parent_path: Path,
+    root_name: str,
+    residue_name: str,
+    expected_root: os.stat_result,
+    expected_residue: os.stat_result,
+) -> TransactionOutcome:
+    """Remove only the old generation still behind the expected live root."""
+
+    residue = parent_path / residue_name
+    try:
+        live_root = lstat_at(parent_fd, root_name)
+    except FileNotFoundError:
+        return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue))
+    if not _same_entry(live_root, expected_root):
+        return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue))
+
+    try:
+        old_generation = lstat_at(parent_fd, residue_name)
+    except FileNotFoundError:
+        return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
+    if not stat.S_ISDIR(old_generation.st_mode) or stat.S_ISLNK(old_generation.st_mode):
+        return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
+    if not _same_entry(old_generation, expected_residue):
+        return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
+
+    try:
+        remove_tree_at(
+            parent_fd,
+            residue_name,
+            expected_metadata=expected_residue,
+            guard_name=root_name,
+            guard_metadata=expected_root,
+        )
+    except (OSError, SafeFilesystemError):
+        try:
+            live_root = lstat_at(parent_fd, root_name)
+        except FileNotFoundError:
+            return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue))
+        if not _same_entry(live_root, expected_root):
+            return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue))
+        try:
+            old_generation = lstat_at(parent_fd, residue_name)
+        except FileNotFoundError:
+            return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
+        if not _same_entry(old_generation, expected_residue):
+            return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
+        return TransactionOutcome("published_cleanup_pending", residue, _cleanup_retry_hint(residue))
+    return TransactionOutcome("published")
 
 
 def _publish_generation_with_recovery(
@@ -526,12 +582,13 @@ def _publish_generation_with_recovery(
     """Fallback for platforms without an atomic directory exchange primitive."""
 
     backup_name = unique_entry_name(parent_fd, ".pstack-agents-old-")
+    staged_metadata = lstat_at(parent_fd, staging_name)
     root_moved = False
     try:
         current = lstat_at(parent_fd, root_name)
         if not _same_entry(current, root_metadata):
             raise ConfigurationError("agents root changed during configuration")
-        os.rename(root_name, backup_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        atomic_rename_noreplace_at(parent_fd, root_name, backup_name)
         root_moved = True
         moved = lstat_at(parent_fd, backup_name)
         if not _same_entry(moved, root_metadata):
@@ -555,17 +612,27 @@ def _publish_generation_with_recovery(
             raise
         root_moved = False
         try:
-            remove_tree_at(parent_fd, backup_name)
-        except (OSError, SafeFilesystemError) as exc:
+            published_metadata = lstat_at(parent_fd, root_name)
+        except FileNotFoundError:
             residue = parent_path / backup_name
-            return TransactionOutcome("published_cleanup_pending", residue, _cleanup_retry_hint(residue))
-        return TransactionOutcome("published")
+            return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue))
+        if not _same_entry(published_metadata, staged_metadata):
+            residue = parent_path / backup_name
+            return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue))
+        return _cleanup_published_generation(
+            parent_fd,
+            parent_path,
+            root_name,
+            backup_name,
+            staged_metadata,
+            root_metadata,
+        )
     finally:
         if root_moved:
             try:
                 if _restore_backup_if_root_absent(parent_fd, root_name, backup_name):
                     root_moved = False
-            except OSError:
+            except (OSError, SafeFilesystemError):
                 # Keep the backup in place. The caller's error names it so a
                 # later explicit cleanup/recovery attempt cannot miss it.
                 pass
@@ -632,18 +699,14 @@ def _publish_generation(
             f"{parent_path / root_name}"
         )
 
-    try:
-        current_root = lstat_at(parent_fd, root_name)
-    except FileNotFoundError:
-        return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue))
-    if not _same_entry(current_root, staged_metadata):
-        return TransactionOutcome("root_replacement_cleanup_pending", residue, _cleanup_retry_hint(residue))
-
-    try:
-        remove_tree_at(parent_fd, staging_name)
-    except (OSError, SafeFilesystemError):
-        return TransactionOutcome("published_cleanup_pending", residue, _cleanup_retry_hint(residue))
-    return TransactionOutcome("published")
+    return _cleanup_published_generation(
+        parent_fd,
+        parent_path,
+        root_name,
+        staging_name,
+        staged_metadata,
+        root_metadata,
+    )
 
 
 def _cleanup_residue(residue: Path) -> TransactionOutcome:
@@ -663,8 +726,12 @@ def _cleanup_residue(residue: Path) -> TransactionOutcome:
             if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
                 raise ConfigurationError(f"transaction residue is not a real directory: {residue}")
             try:
-                remove_tree_at(parent_handle.fd, residue.name)
-            except (OSError, SafeFilesystemError) as exc:
+                remove_tree_at(parent_handle.fd, residue.name, expected_metadata=metadata)
+            except SafeFilesystemError as exc:
+                raise ConfigurationError(
+                    f"cleanup refused; residue identity changed or is unsafe at {residue}: {exc}"
+                ) from exc
+            except OSError as exc:
                 raise ConfigurationError(
                     f"cleanup failed; residue is preserved at {residue}. Retry with {_cleanup_retry_hint(residue)}: {exc}"
                 ) from exc
@@ -688,6 +755,7 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
     parent_handle = open_directory(agents_root.parent, create=True)
     staging_name: str | None = None
     staging_fd: int | None = None
+    staging_metadata: os.stat_result | None = None
     root_fd: int | None = None
     completed = False
     primary_error: BaseException | None = None
@@ -699,6 +767,7 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
                 _validate_agents_snapshot(current_snapshot, agents_root)
                 _validate_plan_snapshot(plan, agents_root, current_snapshot)
                 staging_name, staging_fd = create_unique_directory(parent_handle.fd, ".pstack-agents-")
+                staging_metadata = os.fstat(staging_fd)
                 write_snapshot(staging_fd, current_snapshot)
                 for item in changed:
                     write_regular_file_at(
@@ -738,7 +807,11 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
             os.close(staging_fd)
         if staging_name is not None:
             try:
-                remove_tree_at(parent_handle.fd, staging_name)
+                remove_tree_at(
+                    parent_handle.fd,
+                    staging_name,
+                    expected_metadata=staging_metadata,
+                )
             except (OSError, SafeFilesystemError) as exc:
                 cleanup_errors.append(f"staging residue {parent_handle.path / staging_name}: {exc}")
         if not completed:
