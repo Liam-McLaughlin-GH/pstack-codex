@@ -8,7 +8,10 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 
@@ -21,6 +24,9 @@ sys.path.insert(0, str(HELPER_DIR))
 from automate_me import (  # noqa: E402
     CollisionError,
     PreferenceApproval,
+    PreferenceInteraction,
+    PreferenceQuestion,
+    PreferenceResponse,
     RoutingError,
     ScopeError,
     SkillDraft,
@@ -31,9 +37,11 @@ from automate_me import (  # noqa: E402
     is_skill_discoverable,
     read_allowlisted_artifacts,
     route_request,
+    validate_skill_discoverability,
     validate_skill_tree,
     write_generated_skill,
 )
+import automate_me  # noqa: E402
 
 
 def skill_creator_initializer() -> Path | None:
@@ -55,6 +63,43 @@ def skill_creator_initializer() -> Path | None:
 
 
 class AutomateMeBehaviorTests(unittest.TestCase):
+    def _approval(self, intent: str, *, status: str = "accepted", approved: bool = True):
+        interaction = PreferenceInteraction(
+            questions=(
+                PreferenceQuestion(
+                    question_id="focus",
+                    prompt="Which conventions should be captured?",
+                    options=("Replies", "Verification", "Process", "Other"),
+                    allow_multiple=True,
+                ),
+                PreferenceQuestion(
+                    question_id="follow_up",
+                    prompt="Which result matters most?",
+                    options=("Short", "Thorough", "Fast", "Explicit"),
+                    follow_up_for="focus",
+                ),
+            ),
+            free_form_prompt="What else should the generated skill preserve?",
+        )
+        response = PreferenceResponse(
+            status=status,
+            answers={
+                "focus": ("Replies",),
+                "follow_up": ("Short",),
+            }
+            if status == "accepted"
+            else {},
+            free_form="Keep replies short." if status == "accepted" else "",
+        )
+        return PreferenceApproval(
+            approved=approved,
+            intent=intent,
+            skill_name="alex-mode",
+            signals=("keep replies short",),
+            interaction=interaction,
+            response=response,
+        )
+
     def test_routing_fixture_covers_skill_script_reference_and_no_artifact(self) -> None:
         cases = json.loads((FIXTURE_DIR / "requests.json").read_text(encoding="utf-8"))
         self.assertEqual(
@@ -112,12 +157,7 @@ class AutomateMeBehaviorTests(unittest.TestCase):
                 ),
                 workspace_root=workspace,
                 operation=decision.operation,
-                approval=PreferenceApproval(
-                    approved=True,
-                    intent="create",
-                    skill_name="alex-mode",
-                    signals=("keep replies short",),
-                ),
+                approval=self._approval("create"),
             )
             target = workspace / decision.target
             self.assertEqual(result.target, "skills/alex-mode")
@@ -138,6 +178,130 @@ class AutomateMeBehaviorTests(unittest.TestCase):
         ):
             decision = route_request(request)
             self.assertEqual(decision.artifact, "none", request)
+
+    def test_negated_automate_me_and_intervening_punctuation_are_routed_safely(self) -> None:
+        for request in (
+            "Do not automate me.",
+            "Please don't, under any circumstances, automate me!",
+            "I do not want you to automate me; route this elsewhere.",
+            "Do not, under any circumstances, create my alex-mode skill.",
+            "The automate-me helper is already installed.",
+        ):
+            decision = route_request(request)
+            self.assertEqual(decision.artifact, "none", request)
+            self.assertEqual(decision.operation, "none", request)
+
+        decision = route_request("Automate me—create my alex-mode skill, please.")
+        self.assertEqual(decision.artifact, "skill")
+        self.assertEqual(decision.operation, "create")
+        self.assertEqual(decision.target, "skills/alex-mode")
+
+    def test_preference_interaction_requires_bounded_questions_and_response_states(self) -> None:
+        with self.assertRaises(ValidationError):
+            PreferenceQuestion(
+                question_id="focus",
+                prompt="Too few choices",
+                options=("One", "Two", "Three"),
+                allow_multiple=True,
+            )
+        with self.assertRaises(ValidationError):
+            PreferenceInteraction(
+                questions=(
+                    PreferenceQuestion(
+                        question_id="focus",
+                        prompt="Choose focus",
+                        options=("One", "Two", "Three", "Four"),
+                        allow_multiple=True,
+                    ),
+                    PreferenceQuestion(
+                        question_id="follow_up",
+                        prompt="Choose detail",
+                        options=("One", "Two", "Three", "Four"),
+                        follow_up_for="wrong-question",
+                    ),
+                ),
+                free_form_prompt="Anything else?",
+            )
+
+        interaction = PreferenceInteraction(
+            questions=(
+                PreferenceQuestion(
+                    question_id="focus",
+                    prompt="Choose focus",
+                    options=("One", "Two", "Three", "Four"),
+                    allow_multiple=True,
+                ),
+            ),
+            free_form_prompt="Anything else?",
+        )
+        with self.assertRaises(ValidationError):
+            PreferenceApproval(
+                approved=True,
+                intent="create",
+                skill_name="alex-mode",
+                signals=("keep replies short",),
+                interaction=interaction,
+                response=PreferenceResponse(
+                    status="accepted", answers={}, free_form=""
+                ),
+            )
+
+        declined = PreferenceApproval(
+            approved=False,
+            intent="create",
+            skill_name="alex-mode",
+            signals=("keep replies short",),
+            interaction=interaction,
+            response=PreferenceResponse(status="declined", answers={}),
+        )
+        with tempfile.TemporaryDirectory(prefix="automate-me-declined-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            evidence = self._write_evidence(workspace)
+            with self.assertRaises(ValidationError):
+                write_generated_skill(
+                    "skills/alex-mode",
+                    SkillDraft(
+                        name="alex-mode",
+                        description="Apply approved Alex conventions.",
+                        rules=("Keep replies short.",),
+                        evidence=evidence,
+                    ),
+                    workspace_root=workspace,
+                    operation="create",
+                    approval=declined,
+                )
+
+        accepted = self._approval("create")
+        self.assertEqual(accepted.response.status, "accepted")
+        self.assertEqual(accepted.interaction.validate_response(accepted.response), ())
+
+    def test_preference_approval_mapping_requires_the_full_interaction(self) -> None:
+        base = {
+            "approved": True,
+            "intent": "create",
+            "skill_name": "alex-mode",
+            "signals": ["keep replies short"],
+        }
+        with self.assertRaises(ValidationError):
+            PreferenceApproval.from_mapping(base)
+        base["interaction"] = {
+            "questions": [
+                {
+                    "id": "focus",
+                    "prompt": "Choose focus",
+                    "options": ["Replies", "Verification", "Process", "Other"],
+                    "allow_multiple": True,
+                }
+            ],
+            "free_form_prompt": "Anything else?",
+        }
+        base["response"] = {
+            "status": "accepted",
+            "answers": {"focus": ["Replies"]},
+            "free_form": "Keep replies short.",
+        }
+        parsed = PreferenceApproval.from_mapping(base)
+        self.assertTrue(parsed.approved)
 
     def test_existing_discovery_is_scoped_and_update_intent_is_explicit(self) -> None:
         with tempfile.TemporaryDirectory(prefix="automate-me-discovery-") as temp_dir:
@@ -201,6 +365,31 @@ class AutomateMeBehaviorTests(unittest.TestCase):
             escape_link.symlink_to(outside)
             with self.assertRaises(ScopeError):
                 read_allowlisted_artifacts(workspace, [escape_link])
+
+    def test_allowlist_uses_one_lexical_identity_for_relative_absolute_and_parent_aliases(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-lexical-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            records_dir = workspace / "records"
+            records_dir.mkdir(parents=True)
+            record = records_dir / "slice-a.md"
+            record.write_text("slice_id: a\nPreference: keep replies short\n", encoding="utf-8")
+            absolute = record.absolute()
+            with self.assertRaises(ScopeError):
+                read_allowlisted_artifacts(workspace, ["records/slice-a.md", absolute])
+
+            outside = Path(temp_dir) / "outside-records"
+            outside.mkdir()
+            (outside / "slice-b.md").write_text(
+                "Preference: keep replies short\n", encoding="utf-8"
+            )
+            (records_dir / "alias-parent").symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(ScopeError):
+                read_allowlisted_artifacts(workspace, ["records/alias-parent/slice-b.md"])
+
+            with self.assertRaises(ScopeError):
+                read_allowlisted_artifacts(workspace, [Path(temp_dir) / "outside.md"])
 
     def test_artifacts_require_unique_files_and_distinct_slice_identities(self) -> None:
         with tempfile.TemporaryDirectory(prefix="automate-me-records-") as temp_dir:
@@ -325,12 +514,7 @@ class AutomateMeBehaviorTests(unittest.TestCase):
                 draft,
                 workspace_root=temp_root / "project",
                 operation="update",
-                approval=PreferenceApproval(
-                    approved=True,
-                    intent="update",
-                    skill_name="alex-mode",
-                    signals=("keep replies short",),
-                ),
+                approval=self._approval("update"),
             )
             self.assertEqual(result.operation, "update")
             self.assertEqual(validate_skill_tree(target), ())
@@ -382,12 +566,7 @@ Read [provenance](references/provenance.md).
                 ),
                 workspace_root=workspace,
                 operation="update",
-                approval=PreferenceApproval(
-                    approved=True,
-                    intent="update",
-                    skill_name="alex-mode",
-                    signals=("keep replies short",),
-                ),
+                approval=self._approval("update"),
             )
             self.assertIn("Approved local exception", (target / "SKILL.md").read_text())
             self.assertIn("Keep the release checklist visible", (target / "SKILL.md").read_text())
@@ -448,12 +627,7 @@ Read [provenance](references/provenance.md).
                     draft,
                     workspace_root=workspace,
                     operation="create",
-                    approval=PreferenceApproval(
-                        approved=False,
-                        intent="create",
-                        skill_name="alex-mode",
-                        signals=("keep replies short",),
-                    ),
+                    approval=self._approval("create", status="declined", approved=False),
                 )
             one_record_draft = SkillDraft(
                 name="alex-mode",
@@ -467,12 +641,7 @@ Read [provenance](references/provenance.md).
                     one_record_draft,
                     workspace_root=workspace,
                     operation="create",
-                    approval=PreferenceApproval(
-                        approved=True,
-                        intent="create",
-                        skill_name="alex-mode",
-                        signals=("keep replies short",),
-                    ),
+                    approval=self._approval("create"),
                 )
 
     def test_relative_links_reject_absolute_and_protocol_relative_targets(self) -> None:
@@ -487,6 +656,126 @@ Read [provenance](references/provenance.md).
                 errors = validate_skill_tree(skill, require_provenance=False)
                 self.assertTrue(any("link" in error for error in errors), link)
 
+    def test_every_bundled_markdown_file_is_link_checked_relative_to_itself(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-bundled-links-") as temp_dir:
+            skill = Path(temp_dir) / "safe-skill"
+            (skill / "references").mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                f'''---
+name: safe-skill
+description: "Safe"
+---
+
+Read [style](references/style.md) and [provenance](references/provenance.md).
+''',
+                encoding="utf-8",
+            )
+            (skill / "references" / "style.md").write_text(
+                "Read [missing](nested/not-there.md).\n", encoding="utf-8"
+            )
+            (skill / "references" / "provenance.md").write_text(
+                f"{UPSTREAM_COMMIT}\nCopyright (c) 2026 Lauren Tan\nMIT License\n",
+                encoding="utf-8",
+            )
+            errors = validate_skill_tree(skill)
+            self.assertTrue(any("not-there" in error for error in errors))
+
+    def test_discovery_rejects_direct_and_nested_dangling_aliases(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-discovery-alias-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            skills = workspace / "skills"
+            skills.mkdir(parents=True)
+            (skills / "dangling").symlink_to(workspace / "missing", target_is_directory=True)
+            with self.assertRaises(ScopeError):
+                discover_existing_skills(workspace)
+
+            (skills / "dangling").unlink()
+            target = skills / "alex-mode"
+            (target / "agents").mkdir(parents=True)
+            (target / "SKILL.md").write_text(
+                '---\nname: alex-mode\ndescription: "Alex"\n---\n',
+                encoding="utf-8",
+            )
+            (target / "agents" / "openai.yaml").symlink_to(
+                workspace / "missing-openai.yaml"
+            )
+            errors = validate_skill_discoverability(target)
+            self.assertTrue(any("symlink" in error for error in errors))
+
+    def test_concurrent_updates_are_serialized_without_losing_rules(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-lock-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            evidence = self._write_evidence(workspace)
+            initial = SkillDraft(
+                name="alex-mode",
+                description="Apply approved Alex conventions.",
+                rules=("Keep replies short.",),
+                evidence=evidence,
+            )
+            write_generated_skill(
+                "skills/alex-mode",
+                initial,
+                workspace_root=workspace,
+                operation="create",
+                approval=self._approval("create"),
+            )
+            first_ready = threading.Event()
+            release_first = threading.Event()
+            second_done = threading.Event()
+
+            def first_injector(point: str) -> None:
+                if point == "before_install":
+                    first_ready.set()
+                    self.assertTrue(release_first.wait(timeout=5))
+
+            def run_first() -> None:
+                write_generated_skill(
+                    "skills/alex-mode",
+                    SkillDraft(
+                        name="alex-mode",
+                        description="Apply first conventions.",
+                        rules=("Use explicit checkpoints.",),
+                        evidence=evidence,
+                    ),
+                    workspace_root=workspace,
+                    operation="update",
+                    approval=self._approval("update"),
+                    failure_injector=first_injector,
+                )
+
+            def run_second() -> None:
+                write_generated_skill(
+                    "skills/alex-mode",
+                    SkillDraft(
+                        name="alex-mode",
+                        description="Apply second conventions.",
+                        rules=("Keep a short handoff.",),
+                        evidence=evidence,
+                    ),
+                    workspace_root=workspace,
+                    operation="update",
+                    approval=self._approval("update"),
+                )
+                second_done.set()
+
+            first = threading.Thread(target=run_first)
+            second = threading.Thread(target=run_second)
+            first.start()
+            self.assertTrue(first_ready.wait(timeout=5))
+            second.start()
+            time.sleep(0.1)
+            self.assertFalse(second_done.is_set())
+            release_first.set()
+            first.join(timeout=5)
+            second.join(timeout=5)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            final_text = (workspace / "skills" / "alex-mode" / "SKILL.md").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("Use explicit checkpoints.", final_text)
+            self.assertIn("Keep a short handoff.", final_text)
+
     def test_failed_update_rolls_back_and_symlinked_tree_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory(prefix="automate-me-rollback-") as temp_dir:
             workspace = Path(temp_dir) / "project"
@@ -497,12 +786,7 @@ Read [provenance](references/provenance.md).
                 rules=("Keep replies short.",),
                 evidence=evidence,
             )
-            approval = PreferenceApproval(
-                approved=True,
-                intent="create",
-                skill_name="alex-mode",
-                signals=("keep replies short",),
-            )
+            approval = self._approval("create")
             target = workspace / "skills" / "alex-mode"
             write_generated_skill(
                 target,
@@ -522,12 +806,7 @@ Read [provenance](references/provenance.md).
                     draft,
                     workspace_root=workspace,
                     operation="update",
-                    approval=PreferenceApproval(
-                        approved=True,
-                        intent="update",
-                        skill_name="alex-mode",
-                        signals=("keep replies short",),
-                    ),
+                    approval=self._approval("update"),
                     failure_injector=lambda point: (
                         (_ for _ in ()).throw(OSError("injected install failure"))
                         if point == "after_backup"
@@ -540,7 +819,9 @@ Read [provenance](references/provenance.md).
                 if path.is_file()
             }
             self.assertEqual(after, before)
-            self.assertFalse(any(path.name.startswith(".alex-mode.") for path in target.parent.iterdir()))
+            self.assertFalse(
+                any(path.name.startswith(".alex-mode.") for path in target.parent.iterdir())
+            )
 
             outside = workspace / "outside.md"
             outside.write_text("outside", encoding="utf-8")
@@ -551,13 +832,72 @@ Read [provenance](references/provenance.md).
                     draft,
                     workspace_root=workspace,
                     operation="update",
-                    approval=PreferenceApproval(
-                        approved=True,
-                        intent="update",
-                        skill_name="alex-mode",
-                        signals=("keep replies short",),
-                    ),
+                    approval=self._approval("update"),
                 )
+
+    def test_output_paths_are_direct_and_alias_safe(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-output-alias-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            evidence = self._write_evidence(workspace)
+            draft = SkillDraft(
+                name="alex-mode",
+                description="Apply approved Alex conventions.",
+                rules=("Keep replies short.",),
+                evidence=evidence,
+            )
+            with self.assertRaises(ValidationError):
+                write_generated_skill(
+                    "aliases/alex-mode",
+                    draft,
+                    workspace_root=workspace,
+                    operation="create",
+                    approval=self._approval("create"),
+                )
+
+            skills = workspace / "skills"
+            skills.mkdir(parents=True)
+            outside = Path(temp_dir) / "outside"
+            outside.mkdir()
+            (skills / "alex-mode").symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(CollisionError):
+                write_generated_skill(
+                    "skills/alex-mode",
+                    draft,
+                    workspace_root=workspace,
+                    operation="create",
+                    approval=self._approval("create"),
+                )
+
+            (skills / "alex-mode").unlink()
+            (workspace / "skills-alias").symlink_to(skills, target_is_directory=True)
+            with self.assertRaises(ValidationError):
+                write_generated_skill(
+                    "skills-alias/alex-mode",
+                    draft,
+                    workspace_root=workspace,
+                    operation="create",
+                    approval=self._approval("create"),
+                )
+
+    def test_create_publication_does_not_use_replace(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-no-replace-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            evidence = self._write_evidence(workspace)
+            draft = SkillDraft(
+                name="alex-mode",
+                description="Apply approved Alex conventions.",
+                rules=("Keep replies short.",),
+                evidence=evidence,
+            )
+            with patch.object(automate_me.os, "replace", side_effect=AssertionError("replace")):
+                write_generated_skill(
+                    "skills/alex-mode",
+                    draft,
+                    workspace_root=workspace,
+                    operation="create",
+                    approval=self._approval("create"),
+                )
+            self.assertTrue((workspace / "skills" / "alex-mode" / "SKILL.md").is_file())
 
     def _write_evidence(self, workspace: Path):
         records_dir = workspace / "records"
@@ -612,12 +952,7 @@ Read [existing](references/existing.md) and [provenance](references/provenance.m
                     draft,
                     workspace_root=workspace,
                     operation="create",
-                    approval=PreferenceApproval(
-                        approved=True,
-                        intent="create",
-                        skill_name="alex-mode",
-                        signals=("keep replies short",),
-                    ),
+                    approval=self._approval("create"),
                 )
             self.assertEqual((target / "SKILL.md").read_bytes(), before_skill)
             self.assertEqual(
@@ -630,12 +965,7 @@ Read [existing](references/existing.md) and [provenance](references/provenance.m
                 draft,
                 workspace_root=workspace,
                 operation="update",
-                approval=PreferenceApproval(
-                    approved=True,
-                    intent="update",
-                    skill_name="alex-mode",
-                    signals=("keep replies short",),
-                ),
+                approval=self._approval("update"),
             )
             self.assertNotEqual((target / "SKILL.md").read_bytes(), before_skill)
             self.assertEqual(

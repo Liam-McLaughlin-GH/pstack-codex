@@ -14,6 +14,8 @@ only explicit update intent can update an existing skill.
 Keep detailed material in a directly linked file under `references/` when the
 skill needs it. Resolve every relative link from the skill directory. Reject a
 missing link, an absolute link, and a link that escapes the skill directory.
+Validate links in every bundled/reference Markdown file, using descriptor-
+relative no-follow reads for the linked file and its parent components.
 
 Use the skill-creator initializer only in a temporary or explicitly approved
 workspace. The initializer is an authoring aid, not permission to modify the
@@ -23,14 +25,26 @@ allowlisted evidence reads, collision handling, generation, and link checks.
 The repository's shared port checker is structural only. It does not replace
 the helper exercise, a collision test, or a review of the generated skill.
 
-The helper's evidence reads accept only an explicit bounded allowlist, reject
-duplicate canonical files and aliases, require distinct slice identities, and
-validate optional recent slice timestamps. Signal confirmation requires an
-exact positive structured evidence entry in at least two slices. Durable
-generation also requires structured approval matching the operation and skill
-name, with at least two evidence slices.
+The helper's evidence reads accept only an explicit bounded allowlist, use one
+canonical lexical path representation, descriptor-relative `O_NOFOLLOW`
+opens, and descriptor/path revalidation. They reject duplicate canonical files
+and aliases, unsafe parent components, absolute escapes, require distinct
+slice identities, and validate optional recent slice timestamps. Signal
+confirmation requires an exact positive structured evidence entry in at least
+two slices.
 
-Generated trees are staged and validated in full before installation. Updates
-copy the existing tree without following symlinks, preserve unrelated files
-and approved content, and restore the old tree if installation fails. Markdown
-links must be relative, and absolute or protocol-relative links are rejected.
+Before durable generation, the preference interaction must contain one or two
+questions with four to six options each, support multi-select where
+appropriate, identify a focused follow-up when present, and include a
+free-form response. Incomplete and declined responses are refused; only an
+accepted response matching the operation and skill name can authorize
+generation.
+
+Generated trees are staged and validated in full before installation. Output
+must be a direct `skills/<name>/` directory. Create publication reserves the
+destination with no-replace semantics, and an exclusive workspace lock
+serializes create/update read-merge-publication cycles. Updates copy the
+existing tree without following symlinks, preserve unrelated files and
+approved content, and restore the old tree if installation fails. Markdown
+links must be relative, absolute or protocol-relative links are rejected, and
+dangling discovery aliases are refused.

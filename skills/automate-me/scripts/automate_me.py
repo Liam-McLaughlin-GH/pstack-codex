@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -15,9 +16,11 @@ import tempfile
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import Callable, Iterable, Mapping, Sequence
+from pathlib import Path, PurePosixPath
+from typing import Callable, Iterable, Iterator, Mapping, Sequence
 from urllib.parse import unquote, urlparse
+
+import fcntl
 
 
 UPSTREAM_COMMIT = "53e579f1481697931fc44f5445171397cfa2b24b"
@@ -34,6 +37,9 @@ NAMED_RE = re.compile(
     r"\b(?:named|called)\s+([a-z][a-z0-9-]{0,62})(?![a-z0-9-])"
 )
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
+MARKDOWN_REFERENCE_LINK_RE = re.compile(
+    r"(?m)^\s{0,3}\[[^\]]+\]:\s*(?:<([^>]+)>|(\S+))"
+)
 FRONTMATTER_METADATA_RE = re.compile(
     r"^\s*(slice_id|captured_at|recorded_at):\s*([^#\n]+?)\s*$",
     re.IGNORECASE | re.MULTILINE,
@@ -53,6 +59,29 @@ NEGATED_VALUE_RE = re.compile(
 QUOTED_VALUE_RE = re.compile(r"^(?:[\"'`]).*(?:[\"'`])$")
 ACTION_WORDS = ("capture", "create", "new", "fresh", "record", "save", "start")
 UPDATE_WORDS = ("update", "refresh", "revise", "edit")
+NEGATION_PREFIX = r"(?:do\s+not|don't|dont|never|avoid|refuse\s+to|not)"
+NEGATED_ACTION_RE = re.compile(
+    r"\b"
+    + NEGATION_PREFIX
+    + r"\b[^\n.!?;]{0,96}?\b(?:"
+    + "|".join(re.escape(word) for word in ACTION_WORDS + UPDATE_WORDS)
+    + r")\b",
+    re.IGNORECASE,
+)
+AUTOMATE_ME_RE = re.compile(
+    r"\bautomate\b(?:[\s,;:!?()[\]{}\u2013\u2014]+)\bme\b", re.IGNORECASE
+)
+NEGATED_AUTOMATE_ME_RE = re.compile(
+    r"\b"
+    + NEGATION_PREFIX
+    + r"\b[^\n.!?;]{0,120}?\bautomate\b"
+    + r"(?:[\s,;:!?()[\]{}\u2013\u2014]+)\bme\b",
+    re.IGNORECASE,
+)
+NOFOLLOW_FLAGS = getattr(os, "O_NOFOLLOW", 0)
+DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_CLOEXEC
+if not NOFOLLOW_FLAGS:
+    raise RuntimeError("automate-me requires O_NOFOLLOW support")
 
 
 class AutomateMeError(ValueError):
@@ -142,6 +171,194 @@ class ExistingSkill:
 
 
 @dataclass(frozen=True)
+class PreferenceQuestion:
+    """One bounded structured question asked before durable generation."""
+
+    question_id: str
+    prompt: str
+    options: tuple[str, ...]
+    allow_multiple: bool = False
+    follow_up_for: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.question_id, str) or not re.fullmatch(
+            r"[a-z][a-z0-9_-]{0,63}", self.question_id
+        ):
+            raise ValidationError(f"invalid preference question id: {self.question_id!r}")
+        if not isinstance(self.prompt, str) or not self.prompt.strip():
+            raise ValidationError("preference question prompt is required")
+        if not isinstance(self.allow_multiple, bool):
+            raise ValidationError("preference allow_multiple must be a boolean")
+        if not isinstance(self.options, (list, tuple)) or not all(
+            isinstance(option, str) for option in self.options
+        ):
+            raise ValidationError("preference question options must be strings")
+        if not 4 <= len(self.options) <= 6:
+            raise ValidationError("each preference question needs 4 to 6 options")
+        normalized = [option.strip().casefold() for option in self.options]
+        if any(not option for option in normalized):
+            raise ValidationError("preference options must be non-empty")
+        if len(set(normalized)) != len(normalized):
+            raise ValidationError("preference options must be unique")
+        if self.follow_up_for is not None:
+            if not isinstance(self.follow_up_for, str) or not re.fullmatch(
+                r"[a-z][a-z0-9_-]{0,63}", self.follow_up_for
+            ):
+                raise ValidationError("invalid preference follow-up question id")
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> "PreferenceQuestion":
+        question_id = value.get("id", value.get("question_id"))
+        prompt = value.get("prompt")
+        options = value.get("options")
+        allow_multiple = value.get("allow_multiple", value.get("multi_select", False))
+        follow_up_for = value.get("follow_up_for")
+        if not isinstance(question_id, str) or not isinstance(prompt, str):
+            raise ValidationError("preference questions need string id and prompt")
+        if not isinstance(options, (list, tuple)) or not all(
+            isinstance(option, str) for option in options
+        ):
+            raise ValidationError("preference question options must be strings")
+        if not isinstance(allow_multiple, bool):
+            raise ValidationError("preference allow_multiple must be a boolean")
+        if follow_up_for is not None and not isinstance(follow_up_for, str):
+            raise ValidationError("preference follow_up_for must be a string")
+        return cls(
+            question_id=question_id,
+            prompt=prompt,
+            options=tuple(options),
+            allow_multiple=allow_multiple,
+            follow_up_for=follow_up_for,
+        )
+
+
+@dataclass(frozen=True)
+class PreferenceInteraction:
+    """The required small, structured preference interview."""
+
+    questions: tuple[PreferenceQuestion, ...]
+    free_form_prompt: str
+
+    def __post_init__(self) -> None:
+        if not 1 <= len(self.questions) <= 2:
+            raise ValidationError("preference interaction needs 1 or 2 questions")
+        if not all(isinstance(question, PreferenceQuestion) for question in self.questions):
+            raise ValidationError("preference interaction questions must be structured")
+        if len({question.question_id for question in self.questions}) != len(self.questions):
+            raise ValidationError("preference question ids must be unique")
+        if not isinstance(self.free_form_prompt, str) or not self.free_form_prompt.strip():
+            raise ValidationError("a free-form preference prompt is required")
+        if len(self.questions) == 1:
+            if self.questions[0].follow_up_for is not None:
+                raise ValidationError("a one-question interaction cannot have a follow-up")
+        else:
+            first, follow_up = self.questions
+            if first.follow_up_for is not None:
+                raise ValidationError("the first preference question cannot be a follow-up")
+            if follow_up.follow_up_for != first.question_id:
+                raise ValidationError(
+                    "the second preference question must be a focused follow-up"
+                )
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> "PreferenceInteraction":
+        questions = value.get("questions")
+        free_form_prompt = value.get("free_form_prompt", value.get("free_form"))
+        if not isinstance(questions, (list, tuple)):
+            raise ValidationError("preference interaction questions are required")
+        if not all(isinstance(question, Mapping) for question in questions):
+            raise ValidationError("preference interaction questions must be objects")
+        if not isinstance(free_form_prompt, str):
+            raise ValidationError("preference interaction free_form_prompt is required")
+        return cls(
+            questions=tuple(
+                PreferenceQuestion.from_mapping(question) for question in questions
+            ),
+            free_form_prompt=free_form_prompt,
+        )
+
+    def validate_response(self, response: "PreferenceResponse") -> tuple[str, ...]:
+        errors: list[str] = []
+        if response.status not in {"incomplete", "declined", "accepted"}:
+            errors.append("preference response status must be incomplete, declined, or accepted")
+            return tuple(errors)
+        if response.status != "accepted":
+            return tuple(errors)
+        expected_ids = {question.question_id for question in self.questions}
+        actual_ids = set(response.answers)
+        missing = expected_ids - actual_ids
+        extra = actual_ids - expected_ids
+        if missing:
+            errors.append("accepted preference response is missing question answers")
+        if extra:
+            errors.append("accepted preference response contains an unknown question")
+        for question in self.questions:
+            answer = response.answers.get(question.question_id, ())
+            if not isinstance(answer, (list, tuple)):
+                errors.append(f"answer for {question.question_id} must be a list")
+                continue
+            if not answer:
+                errors.append(f"answer for {question.question_id} is required")
+            if not question.allow_multiple and len(answer) > 1:
+                errors.append(f"answer for {question.question_id} must select one option")
+            allowed = {option.casefold() for option in question.options}
+            if any(not isinstance(option, str) for option in answer):
+                errors.append(f"answer for {question.question_id} must contain strings")
+            elif any(option.casefold() not in allowed for option in answer):
+                errors.append(f"answer for {question.question_id} contains an unknown option")
+        if not response.free_form.strip():
+            errors.append("accepted preference response needs a free-form response")
+        return tuple(errors)
+
+
+@dataclass(frozen=True)
+class PreferenceResponse:
+    """The user's response to a :class:`PreferenceInteraction`."""
+
+    status: str
+    answers: Mapping[str, tuple[str, ...]]
+    free_form: str = ""
+
+    def __post_init__(self) -> None:
+        if self.status not in {"incomplete", "declined", "accepted"}:
+            raise ValidationError(
+                "preference response status must be incomplete, declined, or accepted"
+            )
+        if not isinstance(self.answers, Mapping):
+            raise ValidationError("preference answers must be a mapping")
+        normalized: dict[str, tuple[str, ...]] = {}
+        for question_id, answer in self.answers.items():
+            if not isinstance(question_id, str):
+                raise ValidationError("preference answer ids must be strings")
+            if not isinstance(answer, (list, tuple)) or not all(
+                isinstance(option, str) for option in answer
+            ):
+                raise ValidationError("preference answers must be lists of strings")
+            normalized[question_id] = tuple(answer)
+        object.__setattr__(self, "answers", normalized)
+        if not isinstance(self.free_form, str):
+            raise ValidationError("preference free_form must be a string")
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, object]) -> "PreferenceResponse":
+        status = value.get("status")
+        answers = value.get("answers", {})
+        free_form = value.get("free_form", value.get("free_form_response", ""))
+        if not isinstance(status, str) or not isinstance(answers, Mapping):
+            raise ValidationError("preference response needs status and answers")
+        if not isinstance(free_form, str):
+            raise ValidationError("preference free_form must be a string")
+        converted: dict[str, tuple[str, ...]] = {}
+        for question_id, answer in answers.items():
+            if not isinstance(question_id, str) or not isinstance(answer, (list, tuple)):
+                raise ValidationError("preference answers must map ids to lists")
+            if not all(isinstance(option, str) for option in answer):
+                raise ValidationError("preference answers must contain strings")
+            converted[question_id] = tuple(answer)
+        return cls(status=status, answers=converted, free_form=free_form)
+
+
+@dataclass(frozen=True)
 class PreferenceApproval:
     """Structured human approval required before a skill tree is installed."""
 
@@ -150,6 +367,8 @@ class PreferenceApproval:
     skill_name: str
     signals: tuple[str, ...]
     artifact: str = "skill"
+    interaction: PreferenceInteraction | None = None
+    response: PreferenceResponse | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.approved, bool):
@@ -158,13 +377,33 @@ class PreferenceApproval:
             raise ValidationError("approval intent must be create or update")
         if self.artifact != "skill":
             raise ValidationError("approval artifact must be skill")
-        if not self.skill_name:
+        if not isinstance(self.skill_name, str) or not self.skill_name:
             raise ValidationError("approval must name the skill")
         _validate_skill_name(self.skill_name)
+        if not isinstance(self.signals, (list, tuple)) or not all(
+            isinstance(signal, str) for signal in self.signals
+        ):
+            raise ValidationError("approval signals must be strings")
         if not self.signals:
             raise ValidationError("approval must name at least one signal")
         if any(not signal.strip() for signal in self.signals):
             raise ValidationError("approval signals must be non-empty")
+        if self.interaction is not None and not isinstance(
+            self.interaction, PreferenceInteraction
+        ):
+            raise ValidationError("approval interaction must be structured")
+        if self.response is not None and not isinstance(self.response, PreferenceResponse):
+            raise ValidationError("approval response must be structured")
+        if self.interaction is not None and self.response is not None:
+            response_errors = self.interaction.validate_response(self.response)
+            if response_errors:
+                raise ValidationError("; ".join(response_errors))
+        if self.approved and (
+            self.interaction is None
+            or self.response is None
+            or self.response.status != "accepted"
+        ):
+            raise ValidationError("approved generation requires an accepted preference response")
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, object]) -> "PreferenceApproval":
@@ -179,18 +418,26 @@ class PreferenceApproval:
         intent = value.get("intent")
         skill_name = value.get("skill_name")
         artifact = value.get("artifact", "skill")
+        interaction_value = value.get("interaction")
+        response_value = value.get("response")
         if not isinstance(approved, bool):
             raise ValidationError("approval approved must be a boolean")
         if not isinstance(intent, str) or not isinstance(skill_name, str):
             raise ValidationError("approval intent and skill_name are required strings")
         if not isinstance(artifact, str):
             raise ValidationError("approval artifact must be a string")
+        if not isinstance(interaction_value, Mapping):
+            raise ValidationError("approval interaction is required")
+        if not isinstance(response_value, Mapping):
+            raise ValidationError("approval response is required")
         return cls(
             approved=approved,
             intent=intent,
             skill_name=skill_name,
             signals=tuple(signals),
             artifact=artifact,
+            interaction=PreferenceInteraction.from_mapping(interaction_value),
+            response=PreferenceResponse.from_mapping(response_value),
         )
 
 
@@ -204,14 +451,7 @@ def _without_quoted_text(text: str) -> str:
 
 def _positive_action_text(text: str) -> str:
     clean = _without_quoted_text(text)
-    negated = re.compile(
-        r"\b(?:do\s+not|don't|dont|never|avoid)\s+"
-        r"(?:[a-z0-9-]+\s+){0,2}(?:"
-        + "|".join(re.escape(word) for word in ACTION_WORDS + UPDATE_WORDS)
-        + r")\b",
-        re.IGNORECASE,
-    )
-    return negated.sub(" ", clean)
+    return NEGATED_ACTION_RE.sub(" ", clean)
 
 
 def _has_positive_action(text: str) -> bool:
@@ -220,15 +460,11 @@ def _has_positive_action(text: str) -> bool:
 
 def _has_negated_artifact_intent(text: str) -> bool:
     clean = _without_quoted_text(text)
-    negated_action = re.search(
-        r"\b(?:do\s+not|don't|dont|never|avoid)\s+"
-        r"(?:[a-z0-9-]+\s+){0,2}(?:"
-        + "|".join(re.escape(word) for word in ACTION_WORDS + UPDATE_WORDS)
-        + r")\b",
-        clean,
-        re.IGNORECASE,
+    negated_action = NEGATED_ACTION_RE.search(clean)
+    negated_automate = NEGATED_AUTOMATE_ME_RE.search(clean)
+    return (negated_action is not None or negated_automate is not None) and not _has_positive_action(
+        clean
     )
-    return negated_action is not None and not _has_positive_action(clean)
 
 
 def _operation_for(text: str) -> str:
@@ -259,6 +495,14 @@ def route_request(request: str) -> RouteDecision:
     if not text:
         raise RoutingError("request must not be empty")
     unquoted_text = _without_quoted_text(text)
+    if NEGATED_AUTOMATE_ME_RE.search(unquoted_text):
+        return RouteDecision(
+            artifact="none",
+            category="route-elsewhere",
+            operation="none",
+            target=None,
+            reason="negated automate-me intent is not an artifact request",
+        )
     if _has_negated_artifact_intent(text):
         return RouteDecision(
             artifact="none",
@@ -271,7 +515,7 @@ def route_request(request: str) -> RouteDecision:
     mode_match = MODE_RE.search(unquoted_text)
     has_action = _has_positive_action(text)
     personal_signal = (
-        "automate me" in unquoted_text
+        AUTOMATE_ME_RE.search(unquoted_text) is not None
         or (
             has_action
             and mode_match is not None
@@ -365,36 +609,277 @@ def route_request(request: str) -> RouteDecision:
 
 
 def _resolved_root(workspace_root: Path | str) -> Path:
-    root = Path(workspace_root).absolute().resolve()
-    if not root.is_dir():
+    root = Path(os.path.normpath(os.path.abspath(os.fspath(workspace_root))))
+    try:
+        root_info = root.lstat()
+    except FileNotFoundError as exc:
+        raise ScopeError(f"workspace root is not a directory: {root}") from exc
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
         raise ScopeError(f"workspace root is not a directory: {root}")
     return root
 
 
-def _lexical_path(root: Path, candidate: Path | str) -> Path:
-    raw = Path(candidate)
-    return raw if raw.is_absolute() else root / raw
+@dataclass(frozen=True)
+class _CanonicalPath:
+    """One normalized lexical path plus its root-relative components.
+
+    The lexical form is deliberately not resolved through symlinks. Resolution
+    happens only through descriptor-relative ``O_NOFOLLOW`` opens below.
+    """
+
+    root: Path
+    absolute: Path
+    relative_parts: tuple[str, ...]
+
+    @property
+    def relative(self) -> str:
+        return PurePosixPath(*self.relative_parts).as_posix()
 
 
-def _reject_symlink_components(root: Path, raw: Path) -> None:
-    absolute = raw.absolute()
-    if absolute == root or root not in absolute.parents:
-        return
-    relative = absolute.relative_to(root)
-    current = root
-    for part in relative.parts:
-        current /= part
-        if current.is_symlink():
-            raise ScopeError(f"symlink path component is not allowed: {raw}")
+def _canonical_path(
+    root: Path, candidate: Path | str, *, allow_root: bool = False
+) -> _CanonicalPath:
+    raw = os.fspath(candidate)
+    if "\x00" in raw:
+        raise ScopeError("path contains a NUL byte")
+    root_text = os.path.normpath(os.fspath(root))
+    candidate_text = (
+        raw if os.path.isabs(raw) else os.path.join(root_text, raw)
+    )
+    absolute_text = os.path.normpath(os.path.abspath(candidate_text))
+    try:
+        if os.path.commonpath((root_text, absolute_text)) != root_text:
+            raise ScopeError(f"path escapes the active workspace: {candidate}")
+    except ValueError as exc:
+        raise ScopeError(f"path escapes the active workspace: {candidate}") from exc
+    relative_text = os.path.relpath(absolute_text, root_text)
+    if relative_text == ".":
+        if allow_root:
+            return _CanonicalPath(root, Path(absolute_text), ())
+        raise ScopeError("path must identify an entry below the workspace root")
+    relative_parts = tuple(PurePosixPath(relative_text).parts)
+    if not relative_parts or any(part in {"", ".", ".."} for part in relative_parts):
+        raise ScopeError(f"path is not a normalized workspace-relative entry: {candidate}")
+    return _CanonicalPath(root, Path(absolute_text), relative_parts)
 
 
 def _scoped_path(root: Path, candidate: Path | str) -> Path:
-    raw = _lexical_path(root, candidate)
-    _reject_symlink_components(root, raw)
-    resolved = raw.resolve(strict=False)
-    if resolved == root or root not in resolved.parents:
-        raise ScopeError(f"path escapes the active workspace: {candidate}")
-    return resolved
+    """Return the canonical lexical absolute path without following aliases."""
+
+    return _canonical_path(root, candidate).absolute
+
+
+def _open_directory(path: Path, *, label: str) -> int:
+    try:
+        return os.open(
+            os.fspath(path), DIRECTORY_FLAGS | NOFOLLOW_FLAGS
+        )
+    except FileNotFoundError as exc:
+        raise ScopeError(f"{label} does not exist: {path}") from exc
+    except OSError as exc:
+        raise ScopeError(f"{label} is not a safe directory: {path}") from exc
+
+
+def _open_directory_at(parent_fd: int, name: str, *, label: str) -> int:
+    try:
+        return os.open(name, DIRECTORY_FLAGS | NOFOLLOW_FLAGS, dir_fd=parent_fd)
+    except FileNotFoundError as exc:
+        raise ScopeError(f"{label} does not exist: {name}") from exc
+    except OSError as exc:
+        raise ScopeError(f"{label} is not a safe directory: {name}") from exc
+
+
+def _open_directory_chain(
+    root_fd: int, parts: Sequence[str], *, create: bool = False
+) -> int:
+    current_fd = os.dup(root_fd)
+    try:
+        for part in parts:
+            try:
+                next_fd = _open_directory_at(current_fd, part, label="path component")
+            except ScopeError as exc:
+                if not create or "does not exist" not in str(exc):
+                    raise
+                try:
+                    os.mkdir(part, 0o755, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+                next_fd = _open_directory_at(current_fd, part, label="path component")
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+@contextmanager
+def _open_relative_file(
+    root: Path,
+    relative_parts: Sequence[str],
+    *,
+    flags: int,
+    label: str,
+    create_parent_dirs: bool = False,
+) -> Iterator[tuple[int, int, str]]:
+    if not relative_parts:
+        raise ScopeError(f"{label} must identify a file below the root")
+    root_fd = _open_directory(root, label="root")
+    parent_fd: int | None = None
+    leaf_fd: int | None = None
+    try:
+        parent_fd = _open_directory_chain(
+            root_fd, relative_parts[:-1], create=create_parent_dirs
+        )
+        leaf_name = relative_parts[-1]
+        try:
+            leaf_fd = os.open(
+                leaf_name,
+                flags | NOFOLLOW_FLAGS,
+                0o644,
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError as exc:
+            raise ScopeError(f"{label} does not exist: {PurePosixPath(*relative_parts)}") from exc
+        except OSError as exc:
+            raise ScopeError(f"{label} is not a safe file: {PurePosixPath(*relative_parts)}") from exc
+        yield leaf_fd, parent_fd, leaf_name
+    finally:
+        if leaf_fd is not None:
+            os.close(leaf_fd)
+        if parent_fd is not None:
+            os.close(parent_fd)
+        os.close(root_fd)
+
+
+def _stat_at(parent_fd: int, name: str) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ScopeError(f"unable to inspect output entry: {name}") from exc
+
+
+def _same_file_state(left: os.stat_result, right: os.stat_result) -> bool:
+    return (
+        left.st_dev,
+        left.st_ino,
+        stat.S_IFMT(left.st_mode),
+        left.st_size,
+        left.st_mtime_ns,
+        left.st_ctime_ns,
+    ) == (
+        right.st_dev,
+        right.st_ino,
+        stat.S_IFMT(right.st_mode),
+        right.st_size,
+        right.st_mtime_ns,
+        right.st_ctime_ns,
+    )
+
+
+def _read_relative_bytes(
+    root: Path,
+    relative_parts: Sequence[str],
+    *,
+    max_bytes: int | None,
+    label: str,
+) -> tuple[bytes, os.stat_result]:
+    with _open_relative_file(
+        root,
+        relative_parts,
+        flags=os.O_RDONLY | os.O_CLOEXEC,
+        label=label,
+    ) as (file_fd, parent_fd, leaf_name):
+        before_path = _stat_at(parent_fd, leaf_name)
+        if before_path is None or stat.S_ISLNK(before_path.st_mode):
+            raise ScopeError(f"{label} is not a stable regular file: {leaf_name}")
+        if not stat.S_ISREG(before_path.st_mode):
+            raise ScopeError(f"{label} is not a regular file: {leaf_name}")
+        before_fd = os.fstat(file_fd)
+        if not _same_file_state(before_path, before_fd):
+            raise ScopeError(f"{label} changed while it was opened: {leaf_name}")
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            read_size = 64 * 1024
+            if max_bytes is not None:
+                read_size = min(read_size, max_bytes + 1 - total)
+                if read_size <= 0:
+                    break
+            chunk = os.read(file_fd, read_size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+            if max_bytes is not None and total > max_bytes:
+                raise ScopeError(f"{label} is too large: {leaf_name}")
+        after_fd = os.fstat(file_fd)
+        after_path = _stat_at(parent_fd, leaf_name)
+        if (
+            after_path is None
+            or stat.S_ISLNK(after_path.st_mode)
+            or not _same_file_state(before_fd, after_fd)
+            or not _same_file_state(after_path, after_fd)
+        ):
+            raise ScopeError(f"{label} changed while it was read: {leaf_name}")
+        return b"".join(chunks), after_fd
+
+
+def _read_relative_text(
+    root: Path,
+    relative_parts: Sequence[str],
+    *,
+    max_bytes: int | None,
+    label: str,
+) -> tuple[str, os.stat_result]:
+    data, info = _read_relative_bytes(
+        root, relative_parts, max_bytes=max_bytes, label=label
+    )
+    try:
+        return data.decode("utf-8"), info
+    except UnicodeDecodeError as exc:
+        raise ScopeError(f"{label} is not UTF-8 text: {PurePosixPath(*relative_parts)}") from exc
+
+
+def _relative_regular_file_exists(
+    root: Path, relative_parts: Sequence[str], *, label: str
+) -> bool:
+    try:
+        with _open_relative_file(
+            root,
+            relative_parts,
+            flags=os.O_RDONLY | os.O_CLOEXEC,
+            label=label,
+        ) as (file_fd, parent_fd, leaf_name):
+            path_info = _stat_at(parent_fd, leaf_name)
+            fd_info = os.fstat(file_fd)
+            if (
+                path_info is None
+                or stat.S_ISLNK(path_info.st_mode)
+                or not stat.S_ISREG(path_info.st_mode)
+                or not _same_file_state(path_info, fd_info)
+            ):
+                raise ScopeError(f"{label} is not a stable regular file: {leaf_name}")
+            return True
+    except ScopeError as exc:
+        if "does not exist" in str(exc):
+            return False
+        raise
+
+
+@contextmanager
+def _workspace_write_lock(root: Path) -> Iterator[None]:
+    lock_fd = _open_directory(root, label="workspace root")
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
 
 
 def _validate_slice_id(slice_id: str) -> str:
@@ -514,15 +999,21 @@ def read_allowlisted_artifacts(
         raise ScopeError(f"history record count exceeds {max_records}")
 
     records: list[ArtifactRecord] = []
-    canonical_paths: set[Path] = set()
+    canonical_paths: set[str] = set()
     file_identities: set[tuple[int, int]] = set()
     total_bytes = 0
     for artifact_path in artifact_paths:
-        resolved = _scoped_path(root, artifact_path)
-        info = _regular_file_without_following(resolved, "allowlisted artifact")
-        if resolved in canonical_paths:
+        canonical = _canonical_path(root, artifact_path)
+        canonical_key = canonical.relative.casefold()
+        if canonical_key in canonical_paths:
             raise ScopeError(f"duplicate canonical history file: {artifact_path}")
-        canonical_paths.add(resolved)
+        canonical_paths.add(canonical_key)
+        text, info = _read_relative_text(
+            root,
+            canonical.relative_parts,
+            max_bytes=max_bytes,
+            label="allowlisted artifact",
+        )
         identity = (info.st_dev, info.st_ino)
         if identity in file_identities:
             raise ScopeError(f"duplicate history file alias: {artifact_path}")
@@ -533,15 +1024,10 @@ def read_allowlisted_artifacts(
         total_bytes += size
         if total_bytes > max_total_bytes:
             raise ScopeError("aggregate history size exceeds the bounded limit")
-        try:
-            text = resolved.read_bytes().decode("utf-8")
-        except UnicodeDecodeError as exc:
-            raise ScopeError(f"allowlisted artifact is not UTF-8 text: {artifact_path}") from exc
-        relative_path = resolved.relative_to(root).as_posix()
-        slice_id, captured_at = _slice_metadata(relative_path, text)
+        slice_id, captured_at = _slice_metadata(canonical.relative, text)
         records.append(
             ArtifactRecord(
-                path=relative_path,
+                path=canonical.relative,
                 text=text,
                 sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
                 line_count=len(text.splitlines()),
@@ -562,43 +1048,65 @@ def discover_existing_skills(
     root = _resolved_root(workspace_root)
     if name is not None:
         _validate_skill_name(name)
-    skills_root = _scoped_path(root, "skills")
-    if not skills_root.exists():
-        return ()
-    if not skills_root.is_dir():
-        raise ScopeError("workspace skills path is not a directory")
-
+    skills_path = _canonical_path(root, "skills")
     found: list[ExistingSkill] = []
-    canonical_files: set[Path] = set()
+    canonical_files: set[str] = set()
     file_identities: set[tuple[int, int]] = set()
-    with os.scandir(skills_root) as entries:
-        for entry in sorted(entries, key=lambda item: item.name):
-            if name is not None and entry.name != name:
-                continue
-            child = Path(entry.path)
-            if entry.is_symlink():
-                raise ScopeError(f"symlink skill alias is not allowed: {child}")
-            if not entry.is_dir(follow_symlinks=False):
-                continue
-            skill_file = child / "SKILL.md"
-            if not skill_file.exists():
-                continue
-            info = _regular_file_without_following(skill_file, "skill file")
-            canonical = skill_file.resolve(strict=True)
-            if canonical in canonical_files:
-                raise ScopeError(f"duplicate canonical skill file: {skill_file}")
-            canonical_files.add(canonical)
-            identity = (info.st_dev, info.st_ino)
-            if identity in file_identities:
-                raise ScopeError(f"duplicate skill file alias: {skill_file}")
-            file_identities.add(identity)
-            found.append(
-                ExistingSkill(
-                    name=entry.name,
-                    directory=child.relative_to(root).as_posix(),
-                    skill_file=skill_file.relative_to(root).as_posix(),
-                )
-            )
+    try:
+        root_fd = _open_directory(root, label="workspace root")
+        try:
+            skills_fd = _open_directory_chain(root_fd, skills_path.relative_parts)
+        finally:
+            os.close(root_fd)
+    except ScopeError as exc:
+        if "does not exist" in str(exc):
+            return ()
+        raise
+    try:
+        with os.scandir(skills_fd) as entries:
+            for entry in sorted(entries, key=lambda item: item.name):
+                child_info = entry.stat(follow_symlinks=False)
+                child = PurePosixPath("skills", entry.name)
+                if stat.S_ISLNK(child_info.st_mode):
+                    raise ScopeError(f"symlink skill alias is not allowed: {child}")
+                if not stat.S_ISDIR(child_info.st_mode):
+                    continue
+                try:
+                    _validate_skill_name(entry.name)
+                except ValidationError as exc:
+                    raise ScopeError(f"invalid direct skill directory: {child}") from exc
+                if name is not None and entry.name != name:
+                    continue
+                child_fd = _open_directory_at(skills_fd, entry.name, label="skill directory")
+                try:
+                    skill_info = _stat_at(child_fd, "SKILL.md")
+                    if skill_info is None:
+                        continue
+                    if stat.S_ISLNK(skill_info.st_mode):
+                        raise ScopeError(
+                            f"symlink or dangling skill discovery alias is not allowed: {child / 'SKILL.md'}"
+                        )
+                    if not stat.S_ISREG(skill_info.st_mode):
+                        raise ScopeError(f"skill file is not a regular file: {child / 'SKILL.md'}")
+                    canonical_name = (child / "SKILL.md").as_posix().casefold()
+                    if canonical_name in canonical_files:
+                        raise ScopeError(f"duplicate canonical skill file: {child / 'SKILL.md'}")
+                    canonical_files.add(canonical_name)
+                    identity = (skill_info.st_dev, skill_info.st_ino)
+                    if identity in file_identities:
+                        raise ScopeError(f"duplicate skill file alias: {child / 'SKILL.md'}")
+                    file_identities.add(identity)
+                    found.append(
+                        ExistingSkill(
+                            name=entry.name,
+                            directory=child.parent.as_posix() + "/" + entry.name,
+                            skill_file=(child / "SKILL.md").as_posix(),
+                        )
+                    )
+                finally:
+                    os.close(child_fd)
+    finally:
+        os.close(skills_fd)
     return tuple(found)
 
 
@@ -709,8 +1217,24 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
     return fields
 
 
-def _relative_link_target(skill_dir: Path, raw_target: str) -> Path | None:
+def _markdown_link_targets(text: str) -> Iterator[str]:
+    for match in MARKDOWN_LINK_RE.finditer(text):
+        target = match.group(1).strip()
+        if target.startswith("<") and ">" in target:
+            target = target[1 : target.find(">")]
+        else:
+            target = target.split(None, 1)[0]
+        yield target
+    for match in MARKDOWN_REFERENCE_LINK_RE.finditer(text):
+        yield (match.group(1) or match.group(2)).strip()
+
+
+def _relative_link_target(
+    skill_dir: Path, raw_target: str, source_dir: Path | None = None
+) -> Path | None:
     target = raw_target.strip()
+    if target.startswith("<") and target.endswith(">"):
+        target = target[1:-1].strip()
     parsed = urlparse(target)
     if target.startswith("#"):
         return None
@@ -721,49 +1245,109 @@ def _relative_link_target(skill_dir: Path, raw_target: str) -> Path | None:
         return None
     if Path(target).is_absolute():
         raise ValidationError(f"absolute reference link is not allowed: {raw_target}")
-    candidate = (skill_dir / unquote(target)).resolve(strict=False)
-    if candidate == skill_dir or skill_dir not in candidate.parents:
+    base = source_dir or skill_dir
+    candidate_text = os.path.normpath(os.path.join(os.fspath(base), unquote(target)))
+    try:
+        if os.path.commonpath((os.fspath(skill_dir), candidate_text)) != os.fspath(skill_dir):
+            raise ValidationError(f"reference link escapes skill directory: {raw_target}")
+    except ValueError as exc:
+        raise ValidationError(f"reference link escapes skill directory: {raw_target}") from exc
+    candidate = Path(candidate_text)
+    if candidate == skill_dir:
         raise ValidationError(f"reference link escapes skill directory: {raw_target}")
     return candidate
+
+
+def _scan_tree_entries(
+    root: Path,
+) -> tuple[list[tuple[str, ...]], list[tuple[str, ...]], list[str]]:
+    """List a tree through directory descriptors without following aliases."""
+
+    root_fd = _open_directory(root, label="skill directory")
+    directories: list[tuple[str, ...]] = [()]
+    files: list[tuple[str, ...]] = []
+    errors: list[str] = []
+    pending: list[tuple[int, tuple[str, ...]]] = [(root_fd, ())]
+    try:
+        while pending:
+            directory_fd, directory_parts = pending.pop()
+            try:
+                with os.scandir(directory_fd) as entries:
+                    for entry in entries:
+                        relative = directory_parts + (entry.name,)
+                        try:
+                            info = entry.stat(follow_symlinks=False)
+                        except OSError as exc:
+                            errors.append(f"unable to inspect tree entry {entry.name}: {exc}")
+                            continue
+                        display = PurePosixPath(*relative).as_posix()
+                        if stat.S_ISLNK(info.st_mode):
+                            errors.append(f"symlink output is not allowed: {display}")
+                        elif stat.S_ISDIR(info.st_mode):
+                            try:
+                                child_fd = _open_directory_at(
+                                    directory_fd, entry.name, label="skill directory"
+                                )
+                            except ScopeError as exc:
+                                errors.append(str(exc))
+                                continue
+                            directories.append(relative)
+                            pending.append((child_fd, relative))
+                        elif stat.S_ISREG(info.st_mode):
+                            files.append(relative)
+                        else:
+                            errors.append(f"unsupported skill output entry: {display}")
+            except OSError as exc:
+                errors.append(f"unable to inspect skill tree: {exc}")
+            finally:
+                os.close(directory_fd)
+    except BaseException:
+        for directory_fd, _ in pending:
+            os.close(directory_fd)
+        raise
+    return directories, files, errors
 
 
 def validate_skill_tree(
     skill_dir: Path | str, *, require_provenance: bool = True
 ) -> tuple[str, ...]:
-    """Validate frontmatter, local Markdown links, and retained provenance."""
+    """Validate every bundled Markdown file and its local links safely."""
 
-    raw_root = Path(skill_dir).absolute()
+    raw_root = Path(os.path.normpath(os.path.abspath(os.fspath(skill_dir))))
     if raw_root.is_symlink():
         return ("skill directory must not be a symlink",)
-    root = raw_root.resolve(strict=False)
+    root = _resolved_root(raw_root)
     errors: list[str] = []
-    if not root.is_dir():
-        return ("skill directory not found",)
     try:
         _validate_skill_name(root.name)
     except ValidationError as exc:
         errors.append(str(exc))
     try:
-        with os.scandir(root) as entries:
-            pending = [Path(entry.path) for entry in entries]
-        while pending:
-            candidate = pending.pop()
-            if candidate.is_symlink():
-                errors.append(f"symlink output is not allowed: {candidate}")
-                continue
-            if candidate.is_dir():
-                with os.scandir(candidate) as entries:
-                    pending.extend(Path(entry.path) for entry in entries)
-    except OSError as exc:
-        errors.append(f"unable to inspect skill tree: {exc}")
-    skill_md = root / "SKILL.md"
-    try:
-        _regular_file_without_following(skill_md, "SKILL.md")
+        _, files, scan_errors = _scan_tree_entries(root)
+        errors.extend(scan_errors)
     except ScopeError as exc:
         errors.append(str(exc))
         return tuple(errors)
 
-    text = skill_md.read_text(encoding="utf-8")
+    markdown_files = [relative for relative in files if relative[-1].casefold().endswith(".md")]
+    markdown_text: dict[tuple[str, ...], str] = {}
+    for relative in markdown_files:
+        try:
+            markdown_text[relative], _ = _read_relative_text(
+                root,
+                relative,
+                max_bytes=MAX_ARTIFACT_BYTES,
+                label="bundled Markdown file",
+            )
+        except ScopeError as exc:
+            errors.append(str(exc))
+
+    skill_relative = ("SKILL.md",)
+    text = markdown_text.get(skill_relative)
+    if text is None:
+        errors.append("SKILL.md not found or is not a safe regular file")
+        return tuple(errors)
+
     try:
         frontmatter = _parse_frontmatter(text)
         name = frontmatter.get("name", "")
@@ -784,27 +1368,32 @@ def validate_skill_tree(
     except ValidationError as exc:
         errors.append(str(exc))
 
-    linked_files: list[Path] = []
-    for raw_target in MARKDOWN_LINK_RE.findall(text):
-        try:
-            target = _relative_link_target(root, raw_target)
-        except ValidationError as exc:
-            errors.append(str(exc))
-            continue
-        if target is None:
-            continue
-        if target.is_symlink():
-            errors.append(f"symlink reference target is not allowed: {raw_target}")
-        elif not target.is_file():
-            errors.append(f"missing reference link target: {raw_target}")
-        else:
-            linked_files.append(target)
+    linked_text: dict[tuple[str, ...], str] = {}
+    for source_relative, source_text in markdown_text.items():
+        source_dir = root / PurePosixPath(*source_relative).parent
+        for raw_target in _markdown_link_targets(source_text):
+            try:
+                target = _relative_link_target(root, raw_target, source_dir)
+            except ValidationError as exc:
+                errors.append(str(exc))
+                continue
+            if target is None:
+                continue
+            try:
+                target_path = _canonical_path(root, target)
+                target_text, _ = _read_relative_text(
+                    root,
+                    target_path.relative_parts,
+                    max_bytes=MAX_ARTIFACT_BYTES,
+                    label="reference link target",
+                )
+            except (ScopeError, ValidationError) as exc:
+                errors.append(f"invalid reference link {raw_target}: {exc}")
+                continue
+            linked_text[target_path.relative_parts] = target_text
 
     if require_provenance:
-        provenance_text = "\n".join(
-            [text]
-            + [path.read_text(encoding="utf-8") for path in linked_files]
-        )
+        provenance_text = "\n".join(markdown_text.values())
         if UPSTREAM_COMMIT not in provenance_text:
             errors.append("upstream source commit is missing from the skill")
         if UPSTREAM_COPYRIGHT not in provenance_text:
@@ -816,10 +1405,31 @@ def validate_skill_tree(
 
 def validate_skill_discoverability(skill_dir: Path | str) -> tuple[str, ...]:
     errors = list(validate_skill_tree(skill_dir))
-    root = Path(skill_dir).absolute()
-    interface = root / "agents" / "openai.yaml"
+    raw_root = Path(os.path.normpath(os.path.abspath(os.fspath(skill_dir))))
     try:
-        _regular_file_without_following(interface, "skill discovery interface")
+        root = _resolved_root(raw_root)
+    except ScopeError as exc:
+        errors.append(str(exc))
+        return tuple(errors)
+    if raw_root.parent.name != "skills":
+        errors.append("skill output must be a direct skills/<name>/ directory")
+    try:
+        parent_info = raw_root.parent.lstat()
+    except FileNotFoundError:
+        parent_info = None
+    if parent_info is not None and stat.S_ISLNK(parent_info.st_mode):
+        errors.append("skill discovery parent must not be a symlink alias")
+    try:
+        _validate_skill_name(root.name)
+    except ValidationError as exc:
+        errors.append(str(exc))
+    try:
+        _read_relative_bytes(
+            root,
+            ("agents", "openai.yaml"),
+            max_bytes=MAX_ARTIFACT_BYTES,
+            label="skill discovery interface",
+        )
     except ScopeError as exc:
         errors.append(str(exc))
     return tuple(errors)
@@ -939,41 +1549,109 @@ workflow adapts pstack's `automate-me` source at commit `{UPSTREAM_COMMIT}`.
     }
 
 
-def _write_text_atomically(path: Path, content: str) -> None:
-    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+def _write_relative_bytes(root: Path, relative_parts: Sequence[str], data: bytes) -> None:
+    canonical_root = _resolved_root(root)
+    canonical = _canonical_path(canonical_root, PurePosixPath(*relative_parts))
+    parts = canonical.relative_parts
+    root_fd = _open_directory(canonical_root, label="write root")
+    parent_fd: int | None = None
+    temporary_name = f".{parts[-1]}.{uuid.uuid4().hex}.tmp"
+    temporary_fd: int | None = None
     try:
-        temporary.write_text(content, encoding="utf-8")
-        os.replace(temporary, path)
+        parent_fd = _open_directory_chain(
+            root_fd, parts[:-1], create=True
+        )
+        temporary_fd = os.open(
+            temporary_name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | NOFOLLOW_FLAGS,
+            0o644,
+            dir_fd=parent_fd,
+        )
+        offset = 0
+        while offset < len(data):
+            offset += os.write(temporary_fd, data[offset:])
+        os.fsync(temporary_fd)
+        os.close(temporary_fd)
+        temporary_fd = None
+        os.rename(
+            temporary_name,
+            parts[-1],
+            src_dir_fd=parent_fd,
+            dst_dir_fd=parent_fd,
+        )
+        info = _stat_at(parent_fd, parts[-1])
+        if info is None or stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ScopeError(f"written output is not a regular file: {parts[-1]}")
     finally:
-        if temporary.exists():
-            temporary.unlink()
+        if temporary_fd is not None:
+            os.close(temporary_fd)
+        if parent_fd is not None:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            os.close(parent_fd)
+        os.close(root_fd)
+
+
+def _write_relative_text(root: Path, relative: str, content: str) -> None:
+    canonical = _canonical_path(_resolved_root(root), relative)
+    _write_relative_bytes(
+        root,
+        canonical.relative_parts,
+        content.encode("utf-8"),
+    )
+
+
+def _ensure_relative_directory(root: Path, relative_parts: Sequence[str]) -> None:
+    canonical_root = _resolved_root(root)
+    canonical = _canonical_path(canonical_root, PurePosixPath(*relative_parts))
+    root_fd = _open_directory(canonical_root, label="directory root")
+    try:
+        directory_fd = _open_directory_chain(
+            root_fd, canonical.relative_parts, create=True
+        )
+        os.close(directory_fd)
+    finally:
+        os.close(root_fd)
 
 
 def _copy_tree_without_symlinks(source: Path, destination: Path) -> None:
     source_info = source.lstat()
     if stat.S_ISLNK(source_info.st_mode) or not stat.S_ISDIR(source_info.st_mode):
         raise ScopeError(f"skill output must be a real directory: {source}")
+    try:
+        destination_info = destination.lstat()
+    except FileNotFoundError:
+        destination_info = None
+    if destination_info is not None and (
+        stat.S_ISLNK(destination_info.st_mode)
+        or not stat.S_ISDIR(destination_info.st_mode)
+    ):
+        raise ScopeError(f"skill output must be a real directory: {destination}")
     destination.mkdir(parents=True, exist_ok=True)
-    with os.scandir(source) as entries:
-        for entry in entries:
-            source_path = Path(entry.path)
-            destination_path = destination / entry.name
-            if entry.is_symlink():
-                raise ScopeError(f"symlink output is not allowed: {source_path}")
-            if entry.is_dir(follow_symlinks=False):
-                _copy_tree_without_symlinks(source_path, destination_path)
-            elif entry.is_file(follow_symlinks=False):
-                shutil.copy2(source_path, destination_path, follow_symlinks=False)
-            else:
-                raise ScopeError(f"unsupported skill output entry: {source_path}")
+    source_root = _resolved_root(source)
+    destination_root = _resolved_root(destination)
+    directories, files, errors = _scan_tree_entries(source_root)
+    if errors:
+        raise ScopeError("; ".join(errors))
+    for relative in directories:
+        if not relative:
+            continue
+        _ensure_relative_directory(destination_root, relative)
+    for relative in files:
+        data, _ = _read_relative_bytes(
+            source_root,
+            relative,
+            max_bytes=None,
+            label="existing skill output",
+        )
+        _write_relative_bytes(destination_root, relative, data)
 
 
 def _write_relative_files(root: Path, files: dict[str, str]) -> None:
     for relative, content in files.items():
-        destination = _scoped_path(root, relative)
-        if destination.parent != root:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-        _write_text_atomically(destination, content)
+        _write_relative_text(root, relative, content)
 
 
 def _merge_working_rules(body: str, rules: Sequence[str]) -> str:
@@ -1027,23 +1705,40 @@ def _has_complete_provenance(text: str) -> bool:
 def _prepare_update_tree(
     staged_root: Path, generated_files: dict[str, str], draft: SkillDraft
 ) -> None:
-    skill_path = staged_root / "SKILL.md"
-    existing_skill = skill_path.read_text(encoding="utf-8")
+    existing_skill, _ = _read_relative_text(
+        staged_root,
+        ("SKILL.md",),
+        max_bytes=MAX_ARTIFACT_BYTES,
+        label="existing SKILL.md",
+    )
     generated_files = dict(generated_files)
     generated_files["SKILL.md"] = _merge_existing_skill(
         existing_skill, generated_files["SKILL.md"], draft
     )
-    provenance_path = staged_root / "references" / "provenance.md"
-    if provenance_path.is_file():
-        provenance = provenance_path.read_text(encoding="utf-8")
+    try:
+        provenance, _ = _read_relative_text(
+            staged_root,
+            ("references", "provenance.md"),
+            max_bytes=MAX_ARTIFACT_BYTES,
+            label="existing provenance reference",
+        )
+    except ScopeError as exc:
+        if "does not exist" not in str(exc):
+            raise
+    else:
         if _has_complete_provenance(provenance):
             generated_files.pop("references/provenance.md", None)
         else:
             generated_files["references/provenance.md"] = (
                 provenance.rstrip() + "\n\n" + generated_files["references/provenance.md"]
             )
-    for relative in ("references/working-style.md", "agents/openai.yaml"):
-        if (staged_root / relative).is_file():
+    for relative, parts in (
+        ("references/working-style.md", ("references", "working-style.md")),
+        ("agents/openai.yaml", ("agents", "openai.yaml")),
+    ):
+        if _relative_regular_file_exists(
+            staged_root, parts, label="existing generated reference"
+        ):
             generated_files.pop(relative, None)
     _write_relative_files(staged_root, generated_files)
 
@@ -1060,7 +1755,8 @@ def _new_stage(target: Path) -> tuple[Path, Path]:
 def _remove_tree_or_file(path: Path) -> None:
     if not os.path.lexists(path):
         return
-    if path.is_dir() and not path.is_symlink():
+    info = path.lstat()
+    if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
         shutil.rmtree(path)
     else:
         path.unlink()
@@ -1071,30 +1767,91 @@ def _install_staged_tree(
     target: Path,
     operation: str,
     failure_injector: Callable[[str], None] | None,
+    target_parent_fd: int,
+    validate_installed: Callable[[], None],
 ) -> None:
     if failure_injector:
         failure_injector("before_install")
+    stage_parent_fd = _open_directory(stage_root.parent, label="stage parent")
     if operation == "create":
-        os.replace(stage_root, target)
-        if failure_injector:
-            failure_injector("after_install")
+        target_fd: int | None = None
+        stage_fd: int | None = None
+        try:
+            try:
+                os.mkdir(target.name, 0o755, dir_fd=target_parent_fd)
+            except FileExistsError as exc:
+                raise CollisionError(f"create refused existing output: {target}") from exc
+            target_fd = _open_directory_at(
+                target_parent_fd, target.name, label="new skill output"
+            )
+            stage_fd = _open_directory(stage_root, label="staged skill output")
+            with os.scandir(stage_fd) as entries:
+                for entry in entries:
+                    info = entry.stat(follow_symlinks=False)
+                    if stat.S_ISLNK(info.st_mode):
+                        raise ScopeError(f"symlink output is not allowed: {entry.name}")
+                    if not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode):
+                        raise ScopeError(f"unsupported staged output entry: {entry.name}")
+                    os.rename(
+                        entry.name,
+                        entry.name,
+                        src_dir_fd=stage_fd,
+                        dst_dir_fd=target_fd,
+                    )
+            validate_installed()
+            if failure_injector:
+                failure_injector("after_install")
+        except BaseException:
+            _remove_tree_or_file(target)
+            raise
+        finally:
+            if stage_fd is not None:
+                os.close(stage_fd)
+            if target_fd is not None:
+                os.close(target_fd)
+            os.close(stage_parent_fd)
         return
 
-    backup = target.with_name(f".{target.name}.backup-{uuid.uuid4().hex}")
-    os.replace(target, backup)
+    backup_name = f".{target.name}.backup-{uuid.uuid4().hex}"
+    backup = target.with_name(backup_name)
+    stage_fd: int | None = None
     try:
+        os.rename(
+            target.name,
+            backup_name,
+            src_dir_fd=target_parent_fd,
+            dst_dir_fd=target_parent_fd,
+        )
         if failure_injector:
             failure_injector("after_backup")
-        os.replace(stage_root, target)
+        if _stat_at(target_parent_fd, target.name) is not None:
+            raise CollisionError(f"update target appeared during publication: {target}")
+        stage_fd = _open_directory(stage_root.parent, label="stage parent")
+        os.rename(
+            stage_root.name,
+            target.name,
+            src_dir_fd=stage_fd,
+            dst_dir_fd=target_parent_fd,
+        )
+        validate_installed()
         if failure_injector:
             failure_injector("after_install")
     except BaseException:
         _remove_tree_or_file(target)
-        if os.path.lexists(backup):
-            os.replace(backup, target)
+        if _stat_at(target_parent_fd, backup_name) is not None:
+            os.rename(
+                backup_name,
+                target.name,
+                src_dir_fd=target_parent_fd,
+                dst_dir_fd=target_parent_fd,
+            )
         raise
     else:
         _remove_tree_or_file(backup)
+    finally:
+        if stage_fd is not None:
+            os.close(stage_fd)
+        os.close(stage_parent_fd)
 
 
 def write_generated_skill(
@@ -1111,8 +1868,13 @@ def write_generated_skill(
     if operation not in {"create", "update"}:
         raise AutomateMeError("write operation must be explicitly create or update")
     workspace = _resolved_root(workspace_root)
-    target = _scoped_path(workspace, skill_dir)
+    canonical_target = _canonical_path(workspace, skill_dir)
+    target = canonical_target.absolute
     files = render_skill_files(draft)
+    if canonical_target.relative_parts[:1] != ("skills",) or len(
+        canonical_target.relative_parts
+    ) != 2:
+        raise ValidationError("generated skills must be direct skills/<name>/ outputs")
     if target.name != draft.name:
         raise ValidationError(
             f"skill directory basename {target.name!r} does not match draft name {draft.name!r}"
@@ -1120,7 +1882,16 @@ def write_generated_skill(
     if approval is None:
         raise ValidationError("durable generation requires structured preference approval")
     if not approval.approved:
+        if approval.response is not None and approval.response.status == "declined":
+            raise ValidationError("preference interaction was declined")
         raise ValidationError("durable generation requires explicit approval")
+    if approval.interaction is None or approval.response is None:
+        raise ValidationError("durable generation requires a structured preference interaction")
+    response_errors = approval.interaction.validate_response(approval.response)
+    if response_errors:
+        raise ValidationError("; ".join(response_errors))
+    if approval.response.status != "accepted":
+        raise ValidationError("durable generation requires an accepted preference response")
     if approval.intent != operation:
         raise ValidationError("approval intent does not match the write operation")
     if approval.skill_name != draft.name:
@@ -1135,38 +1906,79 @@ def write_generated_skill(
     if {signal.casefold() for signal in approval.signals} - confirmed:
         raise ValidationError("approval signals lack positive structured evidence")
 
-    if operation == "create":
-        if os.path.lexists(target):
-            raise CollisionError(f"create refused existing output: {target}")
-    else:
-        if not target.is_dir() or target.is_symlink():
-            raise ScopeError(f"update target is not an existing directory: {target}")
-        existing_errors = validate_skill_tree(target, require_provenance=False)
-        if existing_errors:
-            if any("symlink" in error for error in existing_errors):
-                raise ScopeError("existing skill tree contains a symlink output")
-            raise ValidationError(
-                "update requires a structurally valid existing skill: "
-                + "; ".join(existing_errors)
+    with _workspace_write_lock(workspace):
+        root_fd = _open_directory(workspace, label="workspace root")
+        parent_fd: int | None = None
+        stage_parent: Path | None = None
+        stage_root: Path | None = None
+        try:
+            parent_fd = _open_directory_chain(
+                root_fd, canonical_target.relative_parts[:-1], create=True
             )
+            existing_info = _stat_at(parent_fd, canonical_target.relative_parts[-1])
+            if operation == "create":
+                if existing_info is not None:
+                    raise CollisionError(f"create refused existing output: {target}")
+            else:
+                if (
+                    existing_info is None
+                    or stat.S_ISLNK(existing_info.st_mode)
+                    or not stat.S_ISDIR(existing_info.st_mode)
+                ):
+                    raise ScopeError(f"update target is not an existing directory: {target}")
+                existing_fd = _open_directory_at(
+                    parent_fd, canonical_target.relative_parts[-1], label="update target"
+                )
+                try:
+                    current_info = os.fstat(existing_fd)
+                    if not _same_file_state(existing_info, current_info):
+                        raise ScopeError(f"update target changed while it was opened: {target}")
+                finally:
+                    os.close(existing_fd)
+                existing_errors = validate_skill_tree(target, require_provenance=False)
+                if existing_errors:
+                    if any("symlink" in error for error in existing_errors):
+                        raise ScopeError("existing skill tree contains a symlink output")
+                    raise ValidationError(
+                        "update requires a structurally valid existing skill: "
+                        + "; ".join(existing_errors)
+                    )
 
-    target.parent.mkdir(parents=True, exist_ok=True)
-    stage_parent, stage_root = _new_stage(target)
-    try:
-        if operation == "update":
-            _copy_tree_without_symlinks(target, stage_root)
-            _prepare_update_tree(stage_root, files, draft)
-        else:
-            _write_relative_files(stage_root, files)
-        errors = validate_skill_tree(stage_root)
-        if errors:
-            raise ValidationError("generated skill failed validation: " + "; ".join(errors))
-        _install_staged_tree(stage_root, target, operation, failure_injector)
-    finally:
-        _remove_tree_or_file(stage_parent)
+            stage_parent, stage_root = _new_stage(target)
+            if operation == "update":
+                _copy_tree_without_symlinks(target, stage_root)
+                _prepare_update_tree(stage_root, files, draft)
+            else:
+                _write_relative_files(stage_root, files)
+            errors = validate_skill_tree(stage_root)
+            if errors:
+                raise ValidationError("generated skill failed validation: " + "; ".join(errors))
+
+            def validate_installed() -> None:
+                installed_errors = validate_skill_discoverability(target)
+                if installed_errors:
+                    raise ValidationError(
+                        "installed skill is not directly discoverable: "
+                        + "; ".join(installed_errors)
+                    )
+
+            _install_staged_tree(
+                stage_root,
+                target,
+                operation,
+                failure_injector,
+                parent_fd,
+                validate_installed,
+            )
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
+            os.close(root_fd)
+            if stage_parent is not None:
+                _remove_tree_or_file(stage_parent)
     return WriteResult(
         operation=operation,
-        target=target.relative_to(workspace).as_posix(),
+        target=canonical_target.relative,
         files=tuple(sorted(files)),
     )
 
