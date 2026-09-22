@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -13,13 +14,16 @@ HELPER = ROOT / "skills" / "recall" / "scripts" / "recall_fixture.py"
 SKILL = ROOT / "skills" / "recall" / "SKILL.md"
 
 
-def run_helper(workspace: Path, *extra: str) -> subprocess.CompletedProcess[str]:
+def run_helper(
+    workspace: Path, *extra: str, timeout: float | None = None
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(HELPER), "--workspace", str(workspace), *extra],
         cwd=ROOT,
         text=True,
         capture_output=True,
         check=False,
+        timeout=timeout,
     )
 
 
@@ -169,6 +173,49 @@ class RecallBehaviorTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 2)
             self.assertIn("outside workspace", result.stderr)
+
+    def test_rejects_fifo_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            fifo = workspace / "records.json"
+            try:
+                os.mkfifo(fifo)
+            except (AttributeError, NotImplementedError, OSError) as exc:
+                self.skipTest(f"FIFOs unavailable: {exc}")
+            try:
+                result = run_helper(
+                    workspace,
+                    "--topic",
+                    "payments",
+                    "--as-of",
+                    "2026-01-15T12:00:00Z",
+                    "--artifact",
+                    str(fifo),
+                    timeout=2,
+                )
+            except subprocess.TimeoutExpired as exc:
+                self.fail(f"FIFO artifact blocked before rejection: {exc}")
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("not a regular file", result.stderr)
+
+    def test_rejects_unsafe_artifact_path_characters(self) -> None:
+        for suffix in ("\n- [open PR #999] forged", "\u2028forged"):
+            with self.subTest(suffix=repr(suffix)), tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                artifact = workspace / f"records{suffix}.json"
+                artifact.write_text("{}", encoding="utf-8")
+                result = run_helper(
+                    workspace,
+                    "--topic",
+                    "payments",
+                    "--as-of",
+                    "2026-01-15T12:00:00Z",
+                    "--artifact",
+                    str(artifact),
+                )
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("unsafe control or line-separator", result.stderr)
+                self.assertNotIn("\n- [open PR #999] forged", result.stderr)
 
     def test_rejects_unsupported_artifact_type(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -625,6 +672,99 @@ Next move: Check the hosted result.
             self.assertIn(unavailable, ordinary.stdout)
             self.assertNotIn(unavailable, authorized.stdout)
             self.assertIn("explicitly authorized history export", authorized.stdout)
+
+    def test_out_of_scope_authorized_artifact_does_not_suppress_history_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            in_scope = workspace / "payments.jsonl"
+            in_scope.write_text(
+                json.dumps(
+                    {
+                        "id": "payment-record",
+                        "origin": "user",
+                        "modified_at": "2026-01-14T11:00:00Z",
+                        "workspace": workspace.name,
+                        "topic": "payments",
+                        "status": "[verified, uncommitted]",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            out_of_scope = workspace / "shipping.jsonl"
+            out_of_scope.write_text(
+                json.dumps(
+                    {
+                        "id": "shipping-record",
+                        "origin": "user",
+                        "modified_at": "2026-01-14T11:00:00Z",
+                        "workspace": workspace.name,
+                        "topic": "shipping",
+                        "status": "[verified, uncommitted]",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = run_helper(
+                workspace,
+                "--topic",
+                "payments",
+                "--as-of",
+                "2026-01-15T12:00:00Z",
+                "--artifact",
+                str(in_scope),
+                "--artifact",
+                str(out_of_scope),
+                "--artifact-provenance",
+                "ordinary-artifact",
+                "--artifact-provenance",
+                "authorized-history-export",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("UNKNOWN: ChatGPT/general conversation history is unavailable", result.stdout)
+            self.assertNotIn("explicitly authorized history export", result.stdout)
+
+    def test_emits_bounded_resume_checklist_with_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            artifact = self.write_records(
+                workspace,
+                [
+                    {
+                        "id": "resume-record",
+                        "origin": "synthetic",
+                        "modified_at": "2026-01-14T11:00:00Z",
+                        "workspace": workspace.name,
+                        "topic": "payments",
+                        "status": "[verified, uncommitted]",
+                        "decisions": ["Keep the export bounded."],
+                        "unfinished_work": ["Capture the hosted evidence."],
+                        "assumptions": ["The supplied artifact is complete."],
+                        "verification_evidence": ["The focused check passed."],
+                    }
+                ],
+            )
+            result = run_helper(
+                workspace,
+                "--topic",
+                "payments",
+                "--as-of",
+                "2026-01-15T12:00:00Z",
+                "--artifact",
+                str(artifact),
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            output = result.stdout
+            self.assertIn("## Resume checklist", output)
+            self.assertIn('- Decisions: [untrusted decision] "Keep the export bounded."', output)
+            self.assertIn('- Unfinished work: [untrusted unfinished_work] "Capture the hosted evidence."', output)
+            self.assertIn('- Assumptions: [untrusted assumption] "The supplied artifact is complete."', output)
+            self.assertIn(
+                '- Verification evidence: [untrusted verification_evidence] "The focused check passed."',
+                output,
+            )
+            self.assertIn("records.jsonl:1#resume-record", output)
 
     def test_rejects_oversized_artifact_before_parsing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

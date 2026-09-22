@@ -10,7 +10,7 @@ The recall helper reads only paths passed with `--artifact`. It does not walk a 
 | `.jsonl` | One JSON record per non-empty line |
 | `.md`, `.txt`, `.log` | Read as opaque data unless bounded Codex export fields are present; only the fields below are extracted |
 
-Other suffixes are rejected. The resolved regular file must remain inside the canonical workspace root and fit the helper's size and artifact-count limits. A symlink is accepted only when its resolved target remains inside that root.
+Other suffixes are rejected. Artifact path names containing control or Unicode line/paragraph-separator characters are rejected so path metadata cannot create output structure. The resolved regular file must remain inside the canonical workspace root and fit the helper's size and artifact-count limits. Explicit special files are rejected without waiting for a reader or device. A symlink is accepted only when its resolved target remains inside that root.
 
 ## Bounded text export
 
@@ -36,6 +36,10 @@ Each JSON record should contain:
   "inferences": ["The remaining failure may be provider-side."],
   "unknowns": ["No hosted log was supplied."],
   "problems": ["The provider response is missing."],
+  "decisions": ["Keep the provider check bounded."],
+  "unfinished_work": ["Capture the provider response."],
+  "assumptions": ["The supplied fixture is complete."],
+  "verification_evidence": ["The targeted check passed."],
   "next_move": "Capture the provider response.",
   "claims": [
     {"key": "rollout", "value": "green", "text": "The rollout is green."}
@@ -52,4 +56,6 @@ All strings taken from records or bounded text exports are quoted and labeled as
 
 `facts`, `inferences`, `unknowns`, and `problems` are lists of strings (a single string is also accepted). `claims` is optional. A claim has a stable `key`, a `value`, and optional `text` and `kind` (`fact`, `inference`, or `unknown`). Different values for the same key are reported as a contradiction with both sources preserved.
 
-The helper emits the six-part brief in this order: Capsule, Threads, Evidence, Problems, and Next move. It always reports the unavailable ChatGPT/general-history boundary when no authorized history artifact is supplied. Artifact bodies are never evaluated as Python, shell, or another executable language.
+`decisions`, `unfinished_work`, `assumptions`, and `verification_evidence` are optional string lists used for the bounded resume checklist. The line-oriented `Decision`, `Open work`/`Unfinished work`, `Assumption`, `Verified`/`Verification`, and `Evidence` labels populate the same four fields. Every rendered artifact-relative source reference is a quoted untrusted value.
+
+The helper emits the bounded brief in this order: Capsule, Threads, Evidence, Resume checklist, Problems, and Next move. The resume checklist always maps Decisions, Unfinished work, Assumptions, and Verification evidence, using at most five entries per category. It always reports the unavailable ChatGPT/general-history boundary when no authorized history artifact contributes an in-scope record. Artifact bodies are never evaluated as Python, shell, or another executable language.

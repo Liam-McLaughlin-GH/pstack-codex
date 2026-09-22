@@ -52,6 +52,8 @@ MAX_ARTIFACTS = 32
 MAX_FILE_BYTES = 1_000_000
 MAX_WINDOW_DAYS = 31
 MAX_TEXT_LENGTH = 600
+UNSAFE_PATH_CATEGORIES = {"Cc", "Cf", "Cs", "Co", "Cn", "Zl", "Zp"}
+RESUME_CHECKLIST_LIMIT = 5
 
 
 class RecallError(ValueError):
@@ -83,6 +85,16 @@ def quote_data(value: str) -> str:
     return json.dumps(value, ensure_ascii=True)
 
 
+def quote_path(value: Any) -> str:
+    """Quote path metadata so it cannot create output structure."""
+
+    return json.dumps(str(value), ensure_ascii=True)
+
+
+def has_unsafe_path_characters(value: str) -> bool:
+    return any(unicodedata.category(char) in UNSAFE_PATH_CATEGORIES for char in value)
+
+
 def untrusted_value(label: str, value: str) -> str:
     return f"[untrusted {label}] {quote_data(value)}"
 
@@ -111,31 +123,44 @@ def canonical_workspace(raw_workspace: str) -> Path:
     try:
         resolved = workspace.resolve(strict=True)
     except OSError as exc:
-        raise RecallError(f"workspace cannot be resolved: {raw_workspace}") from exc
+        raise RecallError(f"workspace cannot be resolved: {quote_path(raw_workspace)}") from exc
     if not resolved.is_dir():
-        raise RecallError(f"workspace is not a directory: {raw_workspace}")
+        raise RecallError(f"workspace is not a directory: {quote_path(raw_workspace)}")
     return resolved
 
 
 def resolve_artifact(workspace: Path, raw_artifact: str) -> Path:
     if not raw_artifact or "\x00" in raw_artifact:
         raise RecallError("artifact path must be non-empty and contain no NUL bytes")
+    if has_unsafe_path_characters(raw_artifact):
+        raise RecallError(
+            "artifact path contains unsafe control or line-separator characters: "
+            f"{quote_path(raw_artifact)}"
+        )
     candidate = Path(raw_artifact).expanduser()
     if not candidate.is_absolute():
         candidate = workspace / candidate
     try:
         resolved = candidate.resolve(strict=True)
     except OSError as exc:
-        raise RecallError(f"artifact cannot be resolved: {raw_artifact}") from exc
+        raise RecallError(f"artifact cannot be resolved: {quote_path(raw_artifact)}") from exc
     try:
         resolved.relative_to(workspace)
     except ValueError as exc:
         raise RecallError(
-            f"artifact is outside workspace after canonical resolution: {raw_artifact}"
+            "artifact is outside workspace after canonical resolution: "
+            f"{quote_path(raw_artifact)}"
         ) from exc
+    relative = resolved.relative_to(workspace)
+    if has_unsafe_path_characters(str(relative)):
+        raise RecallError(
+            "artifact path contains unsafe control or line-separator characters after "
+            f"resolution: {quote_path(relative)}"
+        )
     if resolved.suffix.lower() not in ALLOWED_SUFFIXES:
         raise RecallError(
-            f"unsupported artifact type {resolved.suffix or '<none>'!r}: {raw_artifact}"
+            f"unsupported artifact type {resolved.suffix or '<none>'!r}: "
+            f"{quote_path(raw_artifact)}"
         )
     return resolved
 
@@ -152,10 +177,11 @@ def open_checked_artifact(workspace: Path, resolved: Path) -> int:
     no_follow = getattr(os, "O_NOFOLLOW", 0)
     close_on_exec = getattr(os, "O_CLOEXEC", 0)
     directory_flag = getattr(os, "O_DIRECTORY", 0)
-    if not no_follow or not directory_flag:
+    nonblocking = getattr(os, "O_NONBLOCK", 0)
+    if not no_follow or not directory_flag or not nonblocking:
         raise RecallError("safe descriptor-based artifact reads are unavailable")
-    directory_flags = os.O_RDONLY | close_on_exec | no_follow | directory_flag
-    file_flags = os.O_RDONLY | close_on_exec | no_follow
+    directory_flags = os.O_RDONLY | close_on_exec | no_follow | directory_flag | nonblocking
+    file_flags = os.O_RDONLY | close_on_exec | no_follow | nonblocking
     parent_fd: int | None = None
     try:
         parent_fd = os.open(str(workspace), directory_flags)
@@ -163,10 +189,15 @@ def open_checked_artifact(workspace: Path, resolved: Path) -> int:
             child_fd = os.open(component, directory_flags, dir_fd=parent_fd)
             os.close(parent_fd)
             parent_fd = child_fd
+        target_stat = os.stat(relative.parts[-1], dir_fd=parent_fd, follow_symlinks=False)
+        if not stat.S_ISREG(target_stat.st_mode):
+            raise RecallError(f"artifact is not a regular file: {quote_path(resolved)}")
         artifact_fd = os.open(relative.parts[-1], file_flags, dir_fd=parent_fd)
         return artifact_fd
     except (OSError, ValueError) as exc:
-        raise RecallError(f"artifact cannot be opened safely: {resolved}") from exc
+        if isinstance(exc, RecallError):
+            raise
+        raise RecallError(f"artifact cannot be opened safely: {quote_path(resolved)}") from exc
     finally:
         if parent_fd is not None:
             try:
@@ -185,9 +216,9 @@ def read_checked_artifact(workspace: Path, resolved: Path) -> str:
     try:
         before = os.fstat(artifact_fd)
         if not stat.S_ISREG(before.st_mode):
-            raise RecallError(f"artifact is not a regular file: {resolved}")
+            raise RecallError(f"artifact is not a regular file: {quote_path(resolved)}")
         if before.st_size > MAX_FILE_BYTES:
-            raise RecallError(f"artifact exceeds {MAX_FILE_BYTES} bytes: {resolved}")
+            raise RecallError(f"artifact exceeds {MAX_FILE_BYTES} bytes: {quote_path(resolved)}")
 
         chunks: list[bytes] = []
         total = 0
@@ -198,7 +229,7 @@ def read_checked_artifact(workspace: Path, resolved: Path) -> str:
             chunks.append(chunk)
             total += len(chunk)
             if total > MAX_FILE_BYTES:
-                raise RecallError(f"artifact exceeds {MAX_FILE_BYTES} bytes: {resolved}")
+                raise RecallError(f"artifact exceeds {MAX_FILE_BYTES} bytes: {quote_path(resolved)}")
 
         after = os.fstat(artifact_fd)
         if (
@@ -206,13 +237,13 @@ def read_checked_artifact(workspace: Path, resolved: Path) -> str:
             or after.st_mtime_ns != before.st_mtime_ns
             or after.st_ctime_ns != before.st_ctime_ns
         ):
-            raise RecallError(f"artifact changed while it was being read: {resolved}")
+            raise RecallError(f"artifact changed while it was being read: {quote_path(resolved)}")
         try:
             return b"".join(chunks).decode("utf-8")
         except UnicodeDecodeError as exc:
-            raise RecallError(f"artifact is not valid UTF-8: {resolved}") from exc
+            raise RecallError(f"artifact is not valid UTF-8: {quote_path(resolved)}") from exc
     except OSError as exc:
-        raise RecallError(f"cannot read artifact {resolved}: {exc}") from exc
+        raise RecallError(f"cannot read artifact {quote_path(resolved)}: {exc}") from exc
     finally:
         try:
             os.close(artifact_fd)
@@ -342,6 +373,26 @@ def normalize_record(
             }
         )
 
+    facts = scalar_list(raw, "facts")
+    inferences = scalar_list(raw, "inferences")
+    unknowns = scalar_list(raw, "unknowns")
+    problems = scalar_list(raw, "problems")
+    decisions = scalar_list(raw, "decisions")
+    unfinished_work = scalar_list(raw, "unfinished_work")
+    assumptions = scalar_list(raw, "assumptions")
+    verification_evidence = scalar_list(raw, "verification_evidence")
+    for fact in facts:
+        if fact.startswith("Decision: "):
+            decisions.append(fact.removeprefix("Decision: "))
+        elif fact.startswith(("Verification: ", "Evidence: ")):
+            verification_evidence.append(fact.split(": ", 1)[1])
+    for inference in inferences:
+        if inference.startswith("Assumption: "):
+            assumptions.append(inference.removeprefix("Assumption: "))
+    for problem in problems:
+        if problem.startswith(("Open work: ", "Unfinished work: ", "TODO: ", "Blocker: ")):
+            unfinished_work.append(problem.split(": ", 1)[1])
+
     return {
         "id": clean_text(record_id),
         "origin": origin,
@@ -351,13 +402,17 @@ def normalize_record(
         "status": status,
         "thread": clean_text(thread),
         "summary": clean_text(summary),
-        "facts": scalar_list(raw, "facts"),
-        "inferences": scalar_list(raw, "inferences"),
-        "unknowns": scalar_list(raw, "unknowns"),
-        "problems": scalar_list(raw, "problems"),
+        "facts": facts,
+        "inferences": inferences,
+        "unknowns": unknowns,
+        "problems": problems,
         "next_move": clean_text(next_move),
         "next_moves": [clean_text(item) for item in next_moves],
         "claims": claims,
+        "decisions": unique(decisions),
+        "unfinished_work": unique(unfinished_work),
+        "assumptions": unique(assumptions),
+        "verification_evidence": unique(verification_evidence),
         "body_present": bool(body),
         "source": source,
     }
@@ -461,6 +516,10 @@ def parse_text_artifact(
         "inferences": [],
         "unknowns": [],
         "problems": [],
+        "decisions": [],
+        "unfinished_work": [],
+        "assumptions": [],
+        "verification_evidence": [],
         "claims": [],
         "next_moves": [],
         "body": text,
@@ -481,7 +540,9 @@ def parse_text_artifact(
         label, value = field
         if label == "codex_recall_export":
             if value not in {"1", "v1", "1.0"}:
-                raise RecallError(f"{path}: unsupported Codex recall export version {value!r}")
+                raise RecallError(
+                    f"{quote_path(path)}: unsupported Codex recall export version {value!r}"
+                )
             recognized = True
         elif label in {"workspace", "topic", "status", "thread", "summary", "id", "origin"}:
             raw[label] = value
@@ -504,9 +565,15 @@ def parse_text_artifact(
                 "evidence": "Evidence",
             }.get(label)
             raw["facts"].append(f"{prefix}: {value}" if prefix else value)
+            if label == "decision":
+                raw["decisions"].append(value)
+            elif label in {"verified", "verification", "evidence"}:
+                raw["verification_evidence"].append(value)
             recognized = True
         elif label in {"assumption", "inference"}:
             raw["inferences"].append(f"Assumption: {value}" if label == "assumption" else value)
+            if label == "assumption":
+                raw["assumptions"].append(value)
             recognized = True
         elif label in {"unknown", "missing"}:
             raw["unknowns"].append(f"Missing: {value}" if label == "missing" else value)
@@ -520,6 +587,8 @@ def parse_text_artifact(
                 "unfinished_work": "Unfinished work",
             }.get(label)
             raw["problems"].append(f"{prefix}: {value}" if prefix else value)
+            if label in {"blocker", "todo", "open_work", "open_items", "unfinished_work"}:
+                raw["unfinished_work"].append(value)
             recognized = True
         elif label in {"next", "next_move"}:
             if value:
@@ -562,7 +631,7 @@ def parse_json_artifact(
     try:
         payload = json.loads(text)
     except json.JSONDecodeError as exc:
-        raise RecallError(f"cannot parse JSON artifact {path}: {exc}") from exc
+        raise RecallError(f"cannot parse JSON artifact {quote_path(path)}: {exc}") from exc
     if isinstance(payload, dict) and isinstance(payload.get("records"), list):
         raw_records: Iterable[Any] = payload["records"]
     elif isinstance(payload, list):
@@ -603,7 +672,7 @@ def parse_jsonl_artifact(
         try:
             raw = json.loads(line)
         except json.JSONDecodeError as exc:
-            raise RecallError(f"cannot parse {source}: {exc}") from exc
+            raise RecallError(f"cannot parse {quote_path(source)}: {exc}") from exc
         normalized = normalize_scoped_record(
             raw,
             source=source,
@@ -674,9 +743,9 @@ def read_artifacts(
     for raw_path, default_origin, provenance in zip(artifacts, defaults, provenance_defaults):
         path = resolve_artifact(workspace, raw_path)
         resolved_paths.append(path)
-        authorized_history_export = authorized_history_export or provenance == AUTHORIZED_HISTORY_EXPORT
         text = read_checked_artifact(workspace, path)
         suffix = path.suffix.lower()
+        artifact_contributed = False
         if suffix in OPAQUE_SUFFIXES:
             parsed = parse_text_artifact(
                 path,
@@ -699,36 +768,40 @@ def read_artifacts(
                     )
                     if normalized is not None:
                         records.append(normalized)
+                        artifact_contributed = True
             else:
                 if default_origin not in ALLOWED_ORIGINS:
                     raise RecallError(
-                        f"{path}: opaque documents require --artifact-origin synthetic or user"
+                        f"{quote_path(path)}: opaque documents require "
+                        "--artifact-origin synthetic or user"
                     )
                 opaque.append(str(path))
         elif suffix == ".jsonl":
-            records.extend(
-                parse_jsonl_artifact(
-                    path,
-                    text,
-                    default_origin=default_origin,
-                    workspace_id=workspace_id,
-                    topic=topic,
-                    start=start,
-                    as_of=as_of,
-                )
+            parsed_records = parse_jsonl_artifact(
+                path,
+                text,
+                default_origin=default_origin,
+                workspace_id=workspace_id,
+                topic=topic,
+                start=start,
+                as_of=as_of,
             )
+            records.extend(parsed_records)
+            artifact_contributed = bool(parsed_records)
         else:
-            records.extend(
-                parse_json_artifact(
-                    path,
-                    text,
-                    default_origin=default_origin,
-                    workspace_id=workspace_id,
-                    topic=topic,
-                    start=start,
-                    as_of=as_of,
-                )
+            parsed_records = parse_json_artifact(
+                path,
+                text,
+                default_origin=default_origin,
+                workspace_id=workspace_id,
+                topic=topic,
+                start=start,
+                as_of=as_of,
             )
+            records.extend(parsed_records)
+            artifact_contributed = bool(parsed_records)
+        if provenance == AUTHORIZED_HISTORY_EXPORT and artifact_contributed:
+            authorized_history_export = True
     return records, opaque, resolved_paths, authorized_history_export
 
 
@@ -740,9 +813,7 @@ def source_ref(record: dict[str, Any], workspace: Path) -> str:
     except ValueError:
         relative = path.name
     record_id = record["id"]
-    if not re.fullmatch(r"[A-Za-z0-9._/@:-]+", record_id):
-        record_id = quote_data(record_id)
-    return f"{relative}#{record_id}"
+    return quote_path(f"{relative}#{record_id}")
 
 
 def unique(values: Iterable[str]) -> list[str]:
@@ -830,6 +901,32 @@ def collect_evidence(records: list[dict[str, Any]], workspace: Path) -> dict[str
     return evidence
 
 
+def collect_resume_checklist(
+    records: list[dict[str, Any]], workspace: Path
+) -> dict[str, list[str]]:
+    checklist: dict[str, list[str]] = {
+        "decisions": [],
+        "unfinished_work": [],
+        "assumptions": [],
+        "verification_evidence": [],
+    }
+    labels = {
+        "decisions": "decision",
+        "unfinished_work": "unfinished_work",
+        "assumptions": "assumption",
+        "verification_evidence": "verification_evidence",
+    }
+    for record in records:
+        reference = source_ref(record, workspace)
+        for field, label in labels.items():
+            for value in record[field]:
+                checklist[field].append(sourced_value(label, value, reference))
+    return {
+        field: unique(values)[:RESUME_CHECKLIST_LIMIT]
+        for field, values in checklist.items()
+    }
+
+
 def render_brief(
     *,
     workspace: Path,
@@ -856,6 +953,7 @@ def render_brief(
         and start <= record["modified_at"] <= as_of
     ]
     evidence = collect_evidence(in_scope, workspace)
+    resume_checklist = collect_resume_checklist(in_scope, workspace)
 
     latest_summary_record = next(
         (record for record in in_scope if record["summary"]),
@@ -913,7 +1011,10 @@ def render_brief(
             relative = Path(path).relative_to(workspace)
         except ValueError:
             relative = Path(path).name
-        unknowns.append(f"{relative} was read as an opaque body; no structured claims were accepted.")
+        unknowns.append(
+            f"{untrusted_value('artifact_path', str(relative))} was read as an opaque body; "
+            "no structured claims were accepted."
+        )
     if not in_scope:
         unknowns.append("No structured record matched the requested workspace, topic, and time window.")
     unknowns = unique(unknowns)
@@ -963,6 +1064,16 @@ def render_brief(
     lines.extend(f"- {item}" for item in unknowns)
     lines.extend(["", "### Contradictions"])
     lines.extend(f"- {item}" for item in evidence["contradictions"] or ["None detected in structured claims."])
+    lines.extend(["", "## Resume checklist"])
+    checklist_labels = (
+        ("decisions", "Decisions"),
+        ("unfinished_work", "Unfinished work"),
+        ("assumptions", "Assumptions"),
+        ("verification_evidence", "Verification evidence"),
+    )
+    for field, label in checklist_labels:
+        values = "; ".join(resume_checklist[field]) or "None supplied."
+        lines.append(f"- {label}: {values}")
     lines.extend(["", "## Problems"])
     lines.extend(f"- {item}" for item in problems or ["None recorded in the supplied artifacts."])
     lines.extend(["", "## Next move", next_move, ""])
