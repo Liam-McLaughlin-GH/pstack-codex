@@ -25,7 +25,7 @@ The following 30 upstream skills are active in this repo without changing their 
 
 These skills carry over the parts of pstack that do not depend on Cursor APIs. They cover design principles, root-cause debugging, behavior-focused verification, plain explanations, TypeScript modeling, and clean writing.
 
-The following 9 skills are present as Codex-native rewrites.
+The following 10 skills are present as Codex-native rewrites.
 
 | Skill | Codex port |
 | --- | --- |
@@ -38,6 +38,7 @@ The following 9 skills are present as Codex-native rewrites.
 | `interrogate` | Runs an adversarial review of a design or diff. |
 | `show-me-your-work` | Keeps an optional append-only decision trail. |
 | `no-comments` | Provides a Codex-compatible review pass for stale or misleading comments. |
+| `repo-best-practices` | Routes Showpass repository work using source-backed ownership, safe command boundaries, and explicit drift limits. |
 
 The port preserves the names of these workflows where possible. In Codex, invoke them as skills such as `$poteto-mode`, `$how`, `$architect`, or `$tdd`.
 
@@ -62,7 +63,7 @@ The upstream agent and runtime pieces are also not ported.
 
 - `agents/poteto-agent.md` is not converted to a Codex agent configuration.
 - `agents/comment-sicko.md` is not converted to a Codex agent configuration.
-- The 21 pstack scripts are not copied. This includes the PR watcher, worktree audit, plan checker, and orchestration helper.
+- The 20 pstack scripts are not copied. This includes the PR watcher, worktree audit, plan checker, and orchestration helper.
 - `automations/benny/` is not copied. It is a Cursor automation pack with Cursor UI adapters.
 - Cursor model names and model-specific routing are not preserved.
 - Cursor transcript paths under `~/.cursor/projects/.../agent-transcripts` are not preserved.
@@ -95,18 +96,18 @@ git status --short
 
 When you are ready to activate it, link the skill folders into your local Codex skill directory after checking for name collisions.
 
-The repository remains the source of truth. The entries under `~/.codex/skills` are only discoverability links for the local Codex runtime.
+The repository remains the source of truth. The entries under `~/.agents/skills` are only discoverability links for the local Codex runtime.
 
 ```sh
 REPO=/Users/liammclaughlin/PycharmProjects/pstack-codex
-mkdir -p "$HOME/.codex/skills"
+mkdir -p "$HOME/.agents/skills"
 for skill_dir in "$REPO"/skills/*; do
   skill_name=$(basename "$skill_dir")
-  [ -e "$HOME/.codex/skills/$skill_name" ] && {
+  [ -e "$HOME/.agents/skills/$skill_name" ] && {
     printf 'Skipping existing skill %s\n' "$skill_name"
     continue
   }
-  ln -s "$skill_dir" "$HOME/.codex/skills/$skill_name"
+  ln -s "$skill_dir" "$HOME/.agents/skills/$skill_name"
 done
 ```
 
