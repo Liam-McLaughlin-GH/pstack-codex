@@ -16,7 +16,11 @@ Use the current Codex surfaces documented in the [skill guide](https://developer
 - A custom agent can set `model` and `model_reasoning_effort`. Omitting either field lets the parent session supply it.
 - A skill does not grant permission, change the parent sandbox, or authorize external actions.
 
-The upstream pstack skill at commit `53e579f1481697931fc44f5445171397cfa2b24b` writes an always-applied Cursor rule and routes work through Cursor controls. Cursor's `~/.cursor/rules/pstack-models.mdc` target is unsupported here; never write it. Cursor `Task` calls and `AskQuestion` are unsupported here; use the parent Codex session, explicit prompt input, or a documented manual fallback. Preserve this provenance and the repository [MIT license](../../LICENSE).
+The upstream pstack skill at commit `53e579f1481697931fc44f5445171397cfa2b24b` writes an always-applied Cursor rule and routes work through Cursor controls. Cursor's `~/.cursor/rules/pstack-models.mdc` target is unsupported here; never write it. Cursor `Task` calls and `AskQuestion` are unsupported here; use the parent Codex session, explicit prompt input, or a documented manual fallback. <!-- UNSUPPORTED-SEAM: Cursor path; Cursor Task; AskQuestion --> Preserve this provenance and the repository [MIT license](../../LICENSE).
+
+## Role boundary
+
+This port generates the two upstream `reflect` records as dormant configuration placeholders: `reflect-tooling` and `reflect-judgment` have no active Codex `reflect` consumer in this repository, so their files do not route work or create a missing workflow. The upstream `divergent` and `synthesizer` mappings are not generated; requesting either role is rejected until a Codex consumer exists. This is a deliberate boundary, not full upstream role parity.
 
 ## Discover models
 
@@ -47,7 +51,7 @@ Use `--role ROLE=MODEL_ID` for a role-specific choice. Panel roles accept one mo
 
 Show the full preview and obtain user confirmation before running the same command with `apply`. The helper refuses an unreported model, a broken or valid symlink, and an existing agent file with different contents. Re-running an unchanged plan is a no-op. A changed generated file is replaced only when the reviewed apply includes `--replace`; the complete staged set is then published with rollback on failure.
 
-Use [scripts/configure.py](scripts/configure.py) for model discovery and agent configuration. Use [scripts/install.py](scripts/install.py) only to install this skill into an explicit Codex discovery directory. It defaults to preview, rejects all source symlinks, stages copies before atomic publication, leaves collisions untouched, and cleans staged or partially created paths on failure. Run its self-check for isolated repeat, existing-directory, broken-symlink, and rollback coverage:
+Use [scripts/configure.py](scripts/configure.py) for model discovery and agent configuration. Use [scripts/install.py](scripts/install.py) only to install this skill into an explicit Codex discovery directory. It defaults to preview, rejects all source symlinks, snapshots source bytes through no-follow handles, stages copies before atomic directory publication, leaves collisions untouched, and cleans staged or partially created paths on failure. Configuration replacement stages the complete agents directory and swaps generations while holding its directory transaction lock, so readers see one generation rather than a mixed set. Run its self-check for isolated repeat, existing-directory, broken-symlink, and rollback coverage:
 
 ```sh
 python3 scripts/install.py --self-test

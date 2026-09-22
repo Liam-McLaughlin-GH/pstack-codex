@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -14,6 +14,29 @@ import tomllib
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+if str(SCRIPT_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIRECTORY))
+
+from safe_fs import (  # noqa: E402
+    SafeFilesystemError,
+    TreeSnapshot,
+    canonical_path,
+    cleanup_created_directories,
+    close_created_directories,
+    create_unique_directory,
+    directory_lock,
+    lstat_at,
+    open_child_directory,
+    open_directory,
+    remove_tree_at,
+    snapshot_tree,
+    sync_directory,
+    unique_entry_name,
+    write_regular_file_at,
+    write_snapshot,
+)
 
 
 EFFORT_RANK = {"low": 0, "medium": 1, "high": 2, "xhigh": 3, "max": 4, "ultra": 5}
@@ -71,8 +94,8 @@ ROLE_SPECS = (
     RoleSpec("how-explainer", "how explanations"),
     RoleSpec("why-investigators", "why investigation"),
     RoleSpec("why-synthesizer", "why synthesis"),
-    RoleSpec("reflect-tooling", "reflect tooling review"),
-    RoleSpec("reflect-judgment", "reflect judgment review"),
+    RoleSpec("reflect-tooling", "dormant reflect tooling review"),
+    RoleSpec("reflect-judgment", "dormant reflect judgment review"),
     RoleSpec("arena-runners", "arena candidate runs", fanout=4),
     RoleSpec("arena-cross-judge-pool", "arena cross-judging", fanout=4),
     RoleSpec("swarm-workers", "swarm work units"),
@@ -80,17 +103,15 @@ ROLE_SPECS = (
     RoleSpec("interrogate-reviewers", "interrogate reviews", fanout=4),
 )
 ROLE_BY_NAME = {spec.role: spec for spec in ROLE_SPECS}
+UNCONSUMED_UPSTREAM_ROLES = {
+    "divergent": "the upstream role has no active Codex consumer in this port",
+    "synthesizer": "the upstream role has no active Codex consumer in this port",
+}
+UNCONSUMED_CODEX_ROLES = {
+    "reflect-tooling": "no active Codex reflect skill consumes this generated agent",
+    "reflect-judgment": "no active Codex reflect skill consumes this generated agent",
+}
 NO_INFERRED_DEFAULT = object()
-
-
-def _is_trusted_system_symlink(path: Path) -> bool:
-    if path not in {Path("/var"), Path("/tmp")}:
-        return False
-    try:
-        resolved = path.resolve(strict=True)
-    except OSError:
-        return False
-    return resolved in {Path("/private/var"), Path("/private/tmp")}
 
 
 def _catalog_entries(payload: object) -> list[dict[str, object]]:
@@ -195,6 +216,8 @@ def _parse_role_values(values: list[str]) -> dict[str, str]:
         if "=" not in value:
             raise ConfigurationError(f"role choice must use ROLE=MODEL: {value!r}")
         role, model = value.split("=", 1)
+        if role in UNCONSUMED_UPSTREAM_ROLES:
+            raise ConfigurationError(f"cannot configure upstream role {role!r}: {UNCONSUMED_UPSTREAM_ROLES[role]}")
         if role not in ROLE_BY_NAME:
             raise ConfigurationError(f"unknown pstack role: {role}")
         if not model:
@@ -205,36 +228,51 @@ def _parse_role_values(values: list[str]) -> dict[str, str]:
     return choices
 
 
-def _validate_agents_root(agents_root: Path) -> None:
-    """Reject an existing symlink or non-directory in the write path."""
+def _agents_snapshot(agents_root: Path) -> TreeSnapshot:
+    agents_root = canonical_path(agents_root)
+    try:
+        handle = open_directory(agents_root)
+    except FileNotFoundError:
+        return TreeSnapshot((), {}, {})
+    except (OSError, SafeFilesystemError) as exc:
+        raise ConfigurationError(f"agents root is not a real no-follow directory: {agents_root}: {exc}") from exc
+    try:
+        return snapshot_tree(handle.fd)
+    except (OSError, SafeFilesystemError) as exc:
+        raise ConfigurationError(f"could not read agents root safely: {agents_root}: {exc}") from exc
+    finally:
+        os.close(handle.fd)
+        close_created_directories(handle.created)
 
-    agents_root = agents_root.expanduser().absolute()
-    current = Path(agents_root.anchor)
-    for component in agents_root.parts[1:]:
-        current /= component
-        if current.is_symlink() and not _is_trusted_system_symlink(current):
-            raise ConfigurationError(f"agents root path contains a symlink: {current}")
-        if current.exists():
-            if not current.is_dir():
-                raise ConfigurationError(f"agents root path is not a directory: {current}")
+
+def _validate_agents_snapshot(snapshot: TreeSnapshot, agents_root: Path) -> None:
+    generated_names = {
+        relative
+        for relative in (*snapshot.files.keys(), *snapshot.symlinks.keys(), *snapshot.directories)
+        if "/" not in relative and relative.startswith("pstack-") and relative.endswith(".toml")
+    }
+    for name in generated_names:
+        if name in snapshot.symlinks:
+            raise ConfigurationError(f"existing agent path is a symlink: {agents_root / name}")
+        if name in snapshot.directories:
+            raise ConfigurationError(f"existing agent path is not a regular file: {agents_root / name}")
 
 
 def _existing_agents(agents_root: Path) -> dict[str, tuple[str | None, str | None]]:
+    agents_root = canonical_path(agents_root)
+    snapshot = _agents_snapshot(agents_root)
+    _validate_agents_snapshot(snapshot, agents_root)
     existing: dict[str, tuple[str | None, str | None]] = {}
-    _validate_agents_root(agents_root)
-    if not agents_root.exists():
-        return existing
-    if not agents_root.is_dir() or agents_root.is_symlink():
-        raise ConfigurationError(f"agents root is not a real directory: {agents_root}")
-    for path in sorted(agents_root.glob("pstack-*.toml")):
-        if path.is_symlink() or not path.is_file():
-            raise ConfigurationError(f"existing agent path is not a regular file: {path}")
+    for name, raw in sorted(snapshot.files.items()):
+        if "/" in name or not name.startswith("pstack-") or not name.endswith(".toml"):
+            continue
+        path = agents_root / name
         try:
-            data = tomllib.loads(path.read_text(encoding="utf-8"))
-        except (OSError, tomllib.TOMLDecodeError) as exc:
+            data = tomllib.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
             raise ConfigurationError(f"cannot parse existing agent {path}: {exc}") from exc
-        name = data.get("name")
-        if not isinstance(name, str) or not name.startswith("pstack-"):
+        agent_name = data.get("name")
+        if not isinstance(agent_name, str) or not agent_name.startswith("pstack-"):
             raise ConfigurationError(f"existing pstack agent has invalid name: {path}")
         model = data.get("model")
         effort = data.get("model_reasoning_effort")
@@ -242,7 +280,7 @@ def _existing_agents(agents_root: Path) -> dict[str, tuple[str | None, str | Non
             raise ConfigurationError(f"existing pstack model is not a string: {path}")
         if effort is not None and not isinstance(effort, str):
             raise ConfigurationError(f"existing pstack effort is not a string: {path}")
-        existing[name] = (model, effort)
+        existing[agent_name] = (model, effort)
     return existing
 
 
@@ -262,13 +300,7 @@ def _existing_selection(spec: RoleSpec, existing: dict[str, tuple[str | None, st
 
 
 def _inferred_default_model(existing: dict[str, tuple[str | None, str | None]]) -> str | None | object:
-    """Infer the previous default from the generated singleton roles.
-
-    Generated files do not record whether a choice came from the default or a
-    role override. The most common singleton-role model is the only durable
-    signal available, while panel lists retain their shape when they differ
-    from that inferred default.
-    """
+    """Infer the previous default from the generated singleton roles."""
 
     values = [
         existing[_agent_name(spec, 1)][0]
@@ -315,8 +347,16 @@ def _render_agent(role: str, name: str, description: str, model: str | None, eff
         "Use the relevant pstack skill, stay within the parent's permission envelope, "
         "and report evidence and unsupported boundaries instead of inventing capabilities."
     )
+    if role in UNCONSUMED_CODEX_ROLES:
+        instructions += f" This generated role is dormant: {UNCONSUMED_CODEX_ROLES[role]}."
     lines.append(f"developer_instructions = {json.dumps(instructions)}")
     return "\n".join(lines) + "\n"
+
+
+def _agent_contents(agents_root: Path) -> dict[str, bytes]:
+    snapshot = _agents_snapshot(agents_root)
+    _validate_agents_snapshot(snapshot, canonical_path(agents_root))
+    return {name: content for name, content in snapshot.files.items() if "/" not in name}
 
 
 def build_plan(
@@ -327,6 +367,7 @@ def build_plan(
     default_model: str | None = None,
     role_values: list[str] | None = None,
 ) -> list[AgentPlan]:
+    agents_root = canonical_path(agents_root)
     if budget is not None and budget not in BUDGET_TARGET:
         raise ConfigurationError(f"unknown budget: {budget}")
     choices = _parse_role_values(role_values or [])
@@ -338,12 +379,16 @@ def build_plan(
                 raise ConfigurationError(f"model was not reported by Codex: {model_name}")
 
     existing = _existing_agents(agents_root)
+    contents = _agent_contents(agents_root)
     inferred_default = _inferred_default_model(existing)
     default_is_explicit = default_model is not None
+    default_is_parent_alias = default_model in {"inherit-parent", "auto"}
     plan: list[AgentPlan] = []
     for spec in ROLE_SPECS:
         if spec.role in choices:
             selected = _selected_models(spec, choices[spec.role])
+        elif default_is_parent_alias:
+            selected = _selected_models(spec, default_model)
         elif not default_is_explicit:
             selected = _existing_selection(spec, existing)
         elif _preserve_existing_selection(spec, existing, inferred_default):
@@ -374,71 +419,91 @@ def build_plan(
                     raise ConfigurationError(f"choose a budget before configuring {name}")
             content = _render_agent(spec.role, name, spec.description, selected_model, effort)
             path = agents_root / f"{name}.toml"
-            if path.is_symlink():
-                raise ConfigurationError(f"refusing to overwrite agent symlink: {path}")
-            if path.exists() and not path.is_file():
-                raise ConfigurationError(f"refusing to overwrite non-file agent path: {path}")
-            status = "create" if not path.exists() else "unchanged" if path.read_text(encoding="utf-8") == content else "update"
+            raw = contents.get(path.name)
+            status = "create" if raw is None else "unchanged" if raw.decode("utf-8") == content else "update"
             plan.append(AgentPlan(spec.role, name, path, content, selected_model, effort, status))
     return plan
 
 
-def _missing_directories(path: Path) -> list[Path]:
-    missing: list[Path] = []
-    current = path
-    while not current.exists():
-        missing.append(current)
-        parent = current.parent
-        if parent == current:
-            break
-        current = parent
-    return missing
-
-
-def _cleanup_empty_directories(paths: list[Path]) -> None:
-    for path in sorted(set(paths), key=lambda item: len(item.parts), reverse=True):
-        try:
-            path.rmdir()
-        except OSError:
-            pass
-
-
-def _validate_plan_targets(plan: list[AgentPlan], agents_root: Path) -> None:
+def _validate_plan_snapshot(plan: list[AgentPlan], agents_root: Path, snapshot: TreeSnapshot) -> None:
+    agents_root = canonical_path(agents_root)
+    directories = set(snapshot.directories)
     for item in plan:
         if item.status == "unchanged":
             continue
         if item.path.parent != agents_root:
             raise ConfigurationError(f"agent path is outside the configured root: {item.path}")
-        if item.path.is_symlink():
-            raise ConfigurationError(f"refusing to overwrite agent symlink: {item.path}")
-        if item.path.exists() and not item.path.is_file():
-            raise ConfigurationError(f"refusing to overwrite non-file agent path: {item.path}")
-        if item.status == "create" and item.path.exists():
+        name = item.path.name
+        if name in snapshot.symlinks or name in directories:
+            raise ConfigurationError(f"refusing to overwrite non-regular agent path: {item.path}")
+        exists = name in snapshot.files
+        if item.status == "create" and exists:
             raise ConfigurationError(f"agent appeared during configuration: {item.path}")
-        if item.status == "update" and not item.path.exists():
+        if item.status == "update" and not exists:
             raise ConfigurationError(f"agent disappeared during configuration: {item.path}")
 
 
-def _rollback_published(
-    applied: list[tuple[AgentPlan, Path | None, bool]],
-) -> list[str]:
-    errors: list[str] = []
-    for item, backup, existed in reversed(applied):
+def _open_agents_root_at(parent_fd: int, name: str) -> tuple[int | None, TreeSnapshot, os.stat_result | None]:
+    try:
+        metadata = lstat_at(parent_fd, name)
+    except FileNotFoundError:
+        return None, TreeSnapshot((), {}, {}), None
+    if stat.S_ISLNK(metadata.st_mode):
+        raise ConfigurationError(f"agents root is a symlink: {name}")
+    if not stat.S_ISDIR(metadata.st_mode):
+        raise ConfigurationError(f"agents root is not a directory: {name}")
+    try:
+        root_fd = open_child_directory(parent_fd, name)
+        snapshot = snapshot_tree(root_fd)
+    except (OSError, SafeFilesystemError) as exc:
+        if "root_fd" in locals():
+            os.close(root_fd)
+        raise ConfigurationError(f"could not open agents root without following a link: {name}: {exc}") from exc
+    return root_fd, snapshot, metadata
+
+
+def _publish_generation(
+    parent_fd: int,
+    root_name: str,
+    staging_name: str,
+    root_metadata: os.stat_result | None,
+) -> None:
+    backup_name: str | None = None
+    root_moved = False
+    try:
+        if root_metadata is not None:
+            current = lstat_at(parent_fd, root_name)
+            if (current.st_dev, current.st_ino) != (root_metadata.st_dev, root_metadata.st_ino):
+                raise ConfigurationError("agents root changed during configuration")
+            backup_name = unique_entry_name(parent_fd, ".pstack-agents-old-")
+            os.rename(root_name, backup_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            root_moved = True
+        else:
+            try:
+                lstat_at(parent_fd, root_name)
+            except FileNotFoundError:
+                pass
+            else:
+                raise ConfigurationError(f"agents root appeared during configuration: {root_name}")
         try:
-            if existed:
-                if backup is None:
-                    raise OSError("missing transaction backup")
-                os.replace(backup, item.path)
-            elif item.path.is_symlink():
-                errors.append(f"preserved concurrent symlink at {item.path}")
-            elif item.path.exists():
-                if item.path.read_text(encoding="utf-8") == item.content:
-                    item.path.unlink()
-                else:
-                    errors.append(f"preserved changed file at {item.path}")
-        except OSError as exc:
-            errors.append(f"could not restore {item.path}: {exc}")
-    return errors
+            os.rename(staging_name, root_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+        except BaseException:
+            if root_moved and backup_name is not None:
+                os.rename(backup_name, root_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+                root_moved = False
+            raise
+        staging_name = ""
+        if backup_name is not None:
+            try:
+                remove_tree_at(parent_fd, backup_name)
+            except OSError as exc:
+                raise ConfigurationError(f"configuration published but old generation cleanup failed: {exc}") from exc
+    finally:
+        if root_moved and backup_name is not None:
+            try:
+                lstat_at(parent_fd, root_name)
+            except FileNotFoundError:
+                os.rename(backup_name, root_name, src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
 
 
 def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool = False) -> None:
@@ -446,70 +511,62 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
     if conflicts and not allow_replace:
         joined = ", ".join(str(path) for path in conflicts)
         raise ConfigurationError(f"existing agent files differ; preview and review before replacing, then pass --replace: {joined}")
-    agents_root = agents_root.expanduser().absolute()
-    _validate_agents_root(agents_root)
+    agents_root = canonical_path(agents_root)
     changed = [item for item in plan if item.status in {"create", "update"}]
     if not changed:
         return
-    parent_directories: list[Path] = []
-    staging: Path | None = None
-    root_was_existing = agents_root.exists()
+
+    parent_handle = open_directory(agents_root.parent, create=True)
+    staging_name: str | None = None
+    staging_fd: int | None = None
+    root_fd: int | None = None
     completed = False
     try:
-        parent_directories = _missing_directories(agents_root.parent)
-        for directory in reversed(parent_directories):
-            directory.mkdir()
-        if not agents_root.exists():
-            staging = Path(tempfile.mkdtemp(prefix=".pstack-agents-", dir=agents_root.parent))
-            for item in changed:
-                (staging / item.path.name).write_text(item.content, encoding="utf-8")
-            if os.path.lexists(agents_root):
-                raise ConfigurationError(f"agents root appeared during configuration: {agents_root}")
-            os.rename(staging, agents_root)
-            staging = None
-            completed = True
-            return
-
-        _validate_agents_root(agents_root)
-        _validate_plan_targets(plan, agents_root)
-        staging = Path(tempfile.mkdtemp(prefix=".pstack-agents-", dir=agents_root.parent))
-        backup_directory = staging / ".backups"
-        backup_directory.mkdir()
-        records: list[tuple[AgentPlan, Path, Path | None, bool]] = []
-        for index, item in enumerate(changed):
-            staged = staging / item.path.name
-            staged.write_text(item.content, encoding="utf-8")
-            backup: Path | None = None
-            existed = item.path.exists()
-            if existed:
-                backup = backup_directory / f"{index}.bak"
-                shutil.copy2(item.path, backup)
-            records.append((item, staged, backup, existed))
-        _validate_plan_targets(plan, agents_root)
-
-        applied: list[tuple[AgentPlan, Path | None, bool]] = []
-        try:
-            for item, staged, backup, existed in records:
-                if existed:
-                    os.replace(staged, item.path)
-                else:
-                    os.link(staged, item.path)
-                    staged.unlink()
-                applied.append((item, backup, existed))
-        except OSError as exc:
-            rollback_errors = _rollback_published(applied)
-            if rollback_errors:
-                detail = "; ".join(rollback_errors)
-                raise ConfigurationError(f"configuration failed and rollback was incomplete: {detail}") from exc
-            raise ConfigurationError(f"configuration failed and was rolled back: {exc}") from exc
-        completed = True
-    except OSError as exc:
-        raise ConfigurationError(f"configuration failed before publication: {exc}") from exc
+        with directory_lock(parent_handle.fd):
+            root_fd, current_snapshot, root_metadata = _open_agents_root_at(parent_handle.fd, agents_root.name)
+            try:
+                _validate_agents_snapshot(current_snapshot, agents_root)
+                _validate_plan_snapshot(plan, agents_root, current_snapshot)
+                staging_name, staging_fd = create_unique_directory(parent_handle.fd, ".pstack-agents-")
+                write_snapshot(staging_fd, current_snapshot)
+                for item in changed:
+                    write_regular_file_at(
+                        staging_fd,
+                        item.path.name,
+                        item.content.encode("utf-8"),
+                        replace=True,
+                    )
+                sync_directory(staging_fd)
+                os.close(staging_fd)
+                staging_fd = None
+                _publish_generation(parent_handle.fd, agents_root.name, staging_name, root_metadata)
+                staging_name = None
+                sync_directory(parent_handle.fd)
+                completed = True
+            finally:
+                if root_fd is not None:
+                    os.close(root_fd)
+                    root_fd = None
+    except ConfigurationError:
+        raise
+    except (OSError, SafeFilesystemError) as exc:
+        raise ConfigurationError(f"configuration failed and was rolled back: {exc}") from exc
     finally:
-        if staging is not None:
-            shutil.rmtree(staging, ignore_errors=True)
-        if not root_was_existing and not completed:
-            _cleanup_empty_directories(parent_directories)
+        if staging_fd is not None:
+            os.close(staging_fd)
+        if staging_name is not None:
+            try:
+                remove_tree_at(parent_handle.fd, staging_name)
+            except OSError:
+                pass
+        if not completed:
+            try:
+                cleanup_created_directories(parent_handle.created)
+            except OSError:
+                pass
+        else:
+            close_created_directories(parent_handle.created)
+        os.close(parent_handle.fd)
 
 
 def _self_test() -> None:
@@ -536,6 +593,8 @@ def _self_test() -> None:
         apply_plan(plan, agents_root)
         repeat = build_plan(models, agents_root)
         assert all(item.status == "unchanged" for item in repeat)
+        reset = build_plan(models, agents_root, budget="medium", default_model="inherit-parent")
+        assert all(item.model is None and item.effort is None for item in reset)
         try:
             build_plan(models, agents_root, default_model="not-reported", budget="medium")
         except ConfigurationError:
@@ -583,19 +642,19 @@ def main(argv: list[str] | None = None) -> int:
         models = load_catalog(args.catalog)
         plan = build_plan(
             models,
-            args.agents_root.expanduser().absolute(),
+            args.agents_root,
             budget=args.budget,
             default_model=args.default_model,
             role_values=args.role,
         )
         if args.command == "apply":
-            apply_plan(plan, args.agents_root.expanduser().absolute(), allow_replace=args.replace)
+            apply_plan(plan, args.agents_root, allow_replace=args.replace)
         elif args.replace:
             raise ConfigurationError("--replace is only valid with apply")
         result = {"action": args.command, "agents": [item.as_dict() for item in plan]}
         print(json.dumps(result, indent=2 if args.json else None, sort_keys=True))
         return 0
-    except ConfigurationError as exc:
+    except (ConfigurationError, OSError, SafeFilesystemError) as exc:
         print(f"setup-pstack configuration failed: {exc}", file=sys.stderr)
         return 1
 

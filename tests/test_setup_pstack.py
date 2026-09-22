@@ -208,7 +208,7 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             destination = root / "new-root" / ".agents" / "skills"
             original_rename = module.os.rename
 
-            def fail_publication(source_path: Path, target_path: Path) -> None:
+            def fail_publication(source_path: Path, target_path: Path, **kwargs: object) -> None:
                 raise OSError("injected publication failure")
 
             module.os.rename = fail_publication
@@ -218,6 +218,128 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             finally:
                 module.os.rename = original_rename
             self.assertFalse((root / "new-root").exists())
+
+    def test_installer_keeps_writes_on_open_directory_and_rejects_source_swap(self) -> None:
+        module = load_module(INSTALLER, "install_for_race_test")
+        safe_fs = sys.modules["safe_fs"]
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-install-race-test-") as temporary:
+            root = Path(temporary)
+            source = root / "source" / "setup-pstack"
+            write_skill(source)
+            source_file = source / "payload.txt"
+            source_file.write_text("safe\n", encoding="utf-8")
+            outside = root / "outside"
+            outside.mkdir()
+            (outside / "payload.txt").write_text("SECRET\n", encoding="utf-8")
+
+            destination_parent = root / "requested"
+            destination = destination_parent / ".agents" / "skills"
+            destination.mkdir(parents=True)
+            redirected = root / "redirected"
+            redirected.mkdir()
+            original_target_plan = module._target_plan
+            switched = False
+
+            def replace_ancestor(*args: object, **kwargs: object):
+                nonlocal switched
+                if not switched:
+                    switched = True
+                    os.rename(destination_parent, root / "requested-original")
+                    os.symlink(redirected, destination_parent, target_is_directory=True)
+                return original_target_plan(*args, **kwargs)
+
+            module._target_plan = replace_ancestor
+            try:
+                installed = module.apply_install(source, destination)
+            finally:
+                module._target_plan = original_target_plan
+            self.assertEqual(installed.status, "create")
+            self.assertFalse((redirected / ".agents" / "skills" / "setup-pstack").exists())
+            self.assertTrue((root / "requested-original" / ".agents" / "skills" / "setup-pstack" / "SKILL.md").is_file())
+
+            original_read = safe_fs.read_regular_file_at
+
+            def swap_source_file(directory_fd: int, name: str) -> bytes:
+                if name == "payload.txt":
+                    source_file.unlink()
+                    os.symlink(outside / "payload.txt", source_file)
+                try:
+                    return original_read(directory_fd, name)
+                finally:
+                    if source_file.is_symlink():
+                        source_file.unlink()
+                    source_file.write_text("safe\n", encoding="utf-8")
+
+            safe_fs.read_regular_file_at = swap_source_file
+            try:
+                with self.assertRaises(module.InstallError):
+                    module.apply_install(source, root / "source-swap-destination")
+            finally:
+                safe_fs.read_regular_file_at = original_read
+            self.assertFalse((root / "source-swap-destination").exists())
+
+    def test_configuration_keeps_writes_on_open_directory_and_swaps_generations(self) -> None:
+        module = load_module(CONFIGURER, "configure_for_race_test")
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-config-race-test-") as temporary:
+            root = Path(temporary)
+            models = {"codex-test": module.Model("codex-test", ("low", "medium", "high", "xhigh"))}
+            requested = root / "requested"
+            agents = requested / ".codex" / "agents"
+            initial = module.build_plan(models, agents, budget="medium", default_model="codex-test")
+            module.apply_plan(initial, agents)
+            replacement = module.build_plan(models, agents, budget="large")
+
+            redirected = root / "redirected"
+            redirected.mkdir()
+            original_open_root = module._open_agents_root_at
+            switched = False
+
+            def replace_ancestor(parent_fd: int, name: str):
+                nonlocal switched
+                if not switched:
+                    switched = True
+                    os.rename(requested, root / "requested-original")
+                    os.symlink(redirected, requested, target_is_directory=True)
+                return original_open_root(parent_fd, name)
+
+            module._open_agents_root_at = replace_ancestor
+            try:
+                module.apply_plan(replacement, agents, allow_replace=True)
+            finally:
+                module._open_agents_root_at = original_open_root
+            self.assertIn(
+                'model_reasoning_effort = "xhigh"',
+                (root / "requested-original" / ".codex" / "agents" / "pstack-feature.toml").read_text(encoding="utf-8"),
+            )
+            self.assertFalse((redirected / ".codex" / "agents").exists())
+
+            requested = root / "atomic-requested"
+            agents = requested / ".codex" / "agents"
+            initial = module.build_plan(models, agents, budget="medium", default_model="codex-test")
+            module.apply_plan(initial, agents)
+            replacement = module.build_plan(models, agents, budget="large")
+            observed: list[tuple[str, int]] = []
+            original_rename = module.os.rename
+
+            def observe_publication(source: Path, target: Path, **kwargs: object) -> None:
+                original_rename(source, target, **kwargs)
+                if target == agents.name or str(target).startswith(".pstack-agents-old-"):
+                    files = list(agents.glob("pstack-*.toml")) if agents.exists() else []
+                    efforts = {
+                        path.read_text(encoding="utf-8").count('model_reasoning_effort = "xhigh"')
+                        for path in files
+                    }
+                    observed.append(("present" if files else "absent", len(files) if efforts else 0))
+
+            module.os.rename = observe_publication
+            try:
+                module.apply_plan(replacement, agents, allow_replace=True)
+            finally:
+                module.os.rename = original_rename
+            self.assertIn(("absent", 0), observed)
+            self.assertIn(("present", 30), observed)
+            self.assertNotIn(("present", 1), observed)
+            self.assertEqual(list(agents.parent.glob(".pstack-agents-old-*")), [])
 
     def test_configuration_updates_budget_and_default_without_losing_reviewed_choices(self) -> None:
         with tempfile.TemporaryDirectory(prefix="setup-pstack-config-cli-test-") as temporary:
@@ -254,6 +376,9 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertTrue(result["agents"])
             self.assertEqual({item["effort"] for item in result["agents"]}, {"high"})
             self.assertIn('model = "codex-test"', (agents / "pstack-feature.toml").read_text(encoding="utf-8"))
+            unrelated = agents / "operator-notes.txt"
+            unrelated.parent.mkdir(parents=True, exist_ok=True)
+            unrelated.write_text("keep this file\n", encoding="utf-8")
 
             repeated = run_script(CONFIGURER, "preview", *apply_args[1:])
             self.assertEqual(repeated.returncode, 0, repeated.stderr)
@@ -276,6 +401,7 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             )
             self.assertEqual(applied_budget.returncode, 0, applied_budget.stderr)
             self.assertEqual({item["effort"] for item in json.loads(applied_budget.stdout)["agents"]}, {"xhigh"})
+            self.assertEqual(unrelated.read_text(encoding="utf-8"), "keep this file\n")
 
             role_override = run_script(
                 CONFIGURER,
@@ -362,6 +488,49 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertNotIn("model =", alias_contents)
             self.assertNotIn("model_reasoning_effort =", alias_contents)
 
+            reset = run_script(
+                CONFIGURER,
+                "preview",
+                *apply_args[1:-1],
+                "--budget",
+                "medium",
+                "--default-model",
+                "inherit-parent",
+                "--json",
+            )
+            self.assertEqual(reset.returncode, 0, reset.stderr)
+            reset_agents = json.loads(reset.stdout)["agents"]
+            self.assertEqual({item["status"] for item in reset_agents}, {"update", "unchanged"})
+            self.assertGreater(sum(item["status"] == "update" for item in reset_agents), 0)
+            self.assertEqual({item["model"] for item in reset_agents}, {None})
+            self.assertEqual({item["effort"] for item in reset_agents}, {None})
+            applied_reset = run_script(
+                CONFIGURER,
+                "apply",
+                *apply_args[1:-1],
+                "--budget",
+                "medium",
+                "--default-model",
+                "inherit-parent",
+                "--replace",
+                "--json",
+            )
+            self.assertEqual(applied_reset.returncode, 0, applied_reset.stderr)
+            self.assertNotIn("model =", (agents / "pstack-feature.toml").read_text(encoding="utf-8"))
+            self.assertNotIn("model_reasoning_effort =", (agents / "pstack-feature.toml").read_text(encoding="utf-8"))
+
+            rejected_upstream_role = run_script(
+                CONFIGURER,
+                "preview",
+                *apply_args[1:-1],
+                "--budget",
+                "medium",
+                "--role",
+                "divergent=codex-test",
+            )
+            self.assertNotEqual(rejected_upstream_role.returncode, 0)
+            self.assertIn("no active Codex consumer", rejected_upstream_role.stderr)
+
             invalid = run_script(
                 CONFIGURER,
                 "preview",
@@ -423,22 +592,22 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             replacement = module.build_plan(models, agents, budget="large")
             self.assertTrue(all(item.status == "update" for item in replacement))
 
-            original_replace = module.os.replace
+            original_rename = module.os.rename
             calls = 0
 
-            def fail_on_second_replace(source: Path, target: Path) -> None:
+            def fail_on_second_publish(source: Path, target: Path, **kwargs: object) -> None:
                 nonlocal calls
                 calls += 1
                 if calls == 2:
                     raise OSError("injected publish failure")
-                original_replace(source, target)
+                original_rename(source, target, **kwargs)
 
-            module.os.replace = fail_on_second_replace
+            module.os.rename = fail_on_second_publish
             try:
                 with self.assertRaises(module.ConfigurationError):
                     module.apply_plan(replacement, agents, allow_replace=True)
             finally:
-                module.os.replace = original_replace
+                module.os.rename = original_rename
             self.assertEqual({path.name: path.read_bytes() for path in agents.glob("pstack-*.toml")}, before)
 
     def test_verifier_allows_documented_unsupported_boundary_and_rejects_active_seam(self) -> None:
@@ -450,7 +619,7 @@ class SetupPstackBehaviorTests(unittest.TestCase):
 
             skill_file.write_text(
                 "---\nname: fixture\ndescription: fixture\n---\n\n"
-                "The Cursor ~/.cursor/rules target is unsupported; never write it.\n"
+                "The Cursor ~/.cursor/rules target is unsupported; never write it. <!-- UNSUPPORTED-SEAM: Cursor path -->\n"
                 "[reference](reference.md)\n"
                 "[reference][runtime-doc]\n\n"
                 "[runtime-doc]: reference.md\n",
@@ -497,6 +666,38 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             helper.write_text("Call the Cursor Task tool for this work.\n", encoding="utf-8")
             helper_errors = module.verify_port(root, run_helpers=False)
             self.assertTrue(any("Cursor Task call" in error for error in helper_errors))
+
+            skill_file.write_text(
+                "---\nname: fixture\ndescription: \"bad\\q\"\n---\n",
+                encoding="utf-8",
+            )
+            invalid_escape_errors = module.verify_port(root, run_helpers=False)
+            self.assertTrue(any("invalid YAML escape" in error for error in invalid_escape_errors))
+
+            skill_file.write_text(
+                "---\nname: fixture\ndescription: fixture\n---\n\n[empty]()\n",
+                encoding="utf-8",
+            )
+            empty_link_errors = module.verify_port(root, run_helpers=False)
+            self.assertTrue(any("empty destination" in error for error in empty_link_errors))
+
+            skill_file.write_text(
+                "---\nname: fixture\ndescription: fixture\n---\n",
+                encoding="utf-8",
+            )
+            helper.write_text("run_in_background = true\n", encoding="utf-8")
+            mjs_helper = skill / "scripts" / "worker.mjs"
+            mjs_helper.write_text("run_in_background = true\n", encoding="utf-8")
+            extensionless_helper = skill / "scripts" / "worker"
+            extensionless_helper.write_text("unsupported capability\nrun_in_background = true\n", encoding="utf-8")
+            format_errors = module.verify_port(root, run_helpers=False)
+            background_errors = [error for error in format_errors if "background-agent setting" in error]
+            self.assertGreaterEqual(len(background_errors), 3)
+
+            helper.write_text("run_in_background = true # UNSUPPORTED-SEAM: background-agent setting\n", encoding="utf-8")
+            mjs_helper.write_text("run_in_background = true // UNSUPPORTED-SEAM: background-agent setting\n", encoding="utf-8")
+            extensionless_helper.write_text("run_in_background = true # UNSUPPORTED-SEAM: background-agent setting\n", encoding="utf-8")
+            self.assertEqual(module.verify_port(root, run_helpers=False), [])
 
     @unittest.skipUnless(shutil.which("codex"), "Codex CLI is not installed")
     def test_installed_skill_is_visible_to_isolated_codex_prompt_input(self) -> None:

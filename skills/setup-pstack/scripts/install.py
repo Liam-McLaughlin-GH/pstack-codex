@@ -11,25 +11,36 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
+import stat
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+SCRIPT_DIRECTORY = Path(__file__).resolve().parent
+if str(SCRIPT_DIRECTORY) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIRECTORY))
+
+from safe_fs import (  # noqa: E402
+    SafeFilesystemError,
+    TreeSnapshot,
+    cleanup_created_directories,
+    close_created_directories,
+    create_unique_directory,
+    directory_lock,
+    lstat_at,
+    open_child_directory,
+    open_directory,
+    remove_tree_at,
+    snapshot_tree,
+    sync_directory,
+    write_snapshot,
+    canonical_path,
+)
+
 
 class InstallError(RuntimeError):
     """Raised when a skill cannot be installed without risking a collision."""
-
-
-def _is_trusted_system_symlink(path: Path) -> bool:
-    if path not in {Path("/var"), Path("/tmp")}:
-        return False
-    try:
-        resolved = path.resolve(strict=True)
-    except OSError:
-        return False
-    return resolved in {Path("/private/var"), Path("/private/tmp")}
 
 
 @dataclass(frozen=True)
@@ -59,112 +70,78 @@ def _validate_skill_name(name: str) -> None:
         raise InstallError(f"invalid skill directory name: {name!r}")
 
 
-def _validate_source(source: Path) -> tuple[str, ...]:
-    source = source.expanduser().absolute()
-    if source.is_symlink():
-        raise InstallError(f"skill source is a symlink: {source}")
-    if not source.is_dir():
-        raise InstallError(f"skill source is not a directory: {source}")
-    if not (source / "SKILL.md").is_file():
+def _source_snapshot(source: Path) -> TreeSnapshot:
+    source = canonical_path(source)
+    try:
+        handle = open_directory(source)
+    except (OSError, SafeFilesystemError) as exc:
+        raise InstallError(f"skill source is not a real no-follow directory: {source}: {exc}") from exc
+    try:
+        snapshot = snapshot_tree(handle.fd, reject_symlinks=True)
+    except (OSError, SafeFilesystemError) as exc:
+        raise InstallError(f"skill source contains an unsafe entry: {source}: {exc}") from exc
+    finally:
+        os.close(handle.fd)
+        close_created_directories(handle.created)
+    if "SKILL.md" not in snapshot.files:
         raise InstallError(f"skill source is missing SKILL.md: {source}")
-
-    files: list[str] = []
-    for current, directories, filenames in os.walk(source, followlinks=False):
-        current_path = Path(current)
-        directories.sort()
-        filenames.sort()
-        for directory in directories:
-            candidate = current_path / directory
-            if candidate.is_symlink():
-                raise InstallError(f"source contains a symlink: {candidate}")
-        for filename in filenames:
-            candidate = current_path / filename
-            relative = candidate.relative_to(source).as_posix()
-            if candidate.is_symlink():
-                raise InstallError(f"source contains a symlink: {candidate}")
-            elif not candidate.is_file():
-                raise InstallError(f"source contains a non-file entry: {candidate}")
-            files.append(relative)
-    return tuple(files)
+    return snapshot
 
 
-def _validate_destination(destination: Path) -> None:
-    """Reject an existing symlink anywhere in the destination path."""
-
-    destination = destination.expanduser().absolute()
-    current = Path(destination.anchor)
-    for component in destination.parts[1:]:
-        current /= component
-        if current.is_symlink() and not _is_trusted_system_symlink(current):
-            raise InstallError(f"destination path contains a symlink: {current}")
-        if current.exists():
-            if not current.is_dir():
-                raise InstallError(f"destination path is not a directory: {current}")
+def _validate_source(source: Path) -> tuple[str, ...]:
+    return tuple(sorted(_source_snapshot(source).files))
 
 
-def _read_tree(root: Path) -> dict[str, bytes]:
-    """Read regular files without following destination directory links."""
-
-    values: dict[str, bytes] = {}
-    for current, directories, filenames in os.walk(root, followlinks=False):
-        current_path = Path(current)
-        directories.sort()
-        filenames.sort()
-        if any((current_path / directory).is_symlink() for directory in directories):
-            raise InstallError(f"destination contains a directory symlink: {current_path}")
-        for filename in filenames:
-            candidate = current_path / filename
-            relative = candidate.relative_to(root).as_posix()
-            if candidate.is_symlink():
-                raise InstallError(f"destination contains a file symlink: {candidate}")
-            if not candidate.is_file():
-                raise InstallError(f"destination contains a non-file entry: {candidate}")
-            values[relative] = candidate.read_bytes()
-    return values
+def _read_tree(root: Path) -> TreeSnapshot:
+    root = canonical_path(root)
+    try:
+        handle = open_directory(root)
+        try:
+            return snapshot_tree(handle.fd, reject_symlinks=True)
+        finally:
+            os.close(handle.fd)
+            close_created_directories(handle.created)
+    except (OSError, SafeFilesystemError) as exc:
+        raise InstallError(f"could not read no-follow tree {root}: {exc}") from exc
 
 
 def _same_contents(source: Path, target: Path) -> bool:
     try:
-        source_files = _read_tree(source)
-        target_files = _read_tree(target)
+        source_tree = _source_snapshot(source)
+        target_tree = _read_tree(target)
     except InstallError:
         return False
-    return source_files == target_files
+    return (
+        source_tree.directories == target_tree.directories
+        and source_tree.files == target_tree.files
+        and not target_tree.symlinks
+    )
 
 
-def _missing_directories(path: Path) -> list[Path]:
-    missing: list[Path] = []
-    current = path
-    while not current.exists():
-        missing.append(current)
-        parent = current.parent
-        if parent == current:
-            break
-        current = parent
-    return missing
+def _validate_destination(destination: Path) -> None:
+    destination = canonical_path(destination)
+    try:
+        handle = open_directory(destination)
+    except FileNotFoundError:
+        return
+    except (OSError, SafeFilesystemError) as exc:
+        raise InstallError(f"destination path is not a real no-follow directory: {destination}: {exc}") from exc
+    else:
+        os.close(handle.fd)
+        close_created_directories(handle.created)
 
 
-def _cleanup_empty_directories(paths: list[Path]) -> None:
-    for path in sorted(set(paths), key=lambda item: len(item.parts), reverse=True):
-        try:
-            path.rmdir()
-        except OSError:
-            pass
-
-
-def preview_install(source: Path, destination: Path) -> InstallPlan:
-    """Build an install plan without creating or changing a path."""
-
-    source = source.expanduser().absolute()
-    destination = destination.expanduser().absolute()
-    _validate_destination(destination)
-    files = _validate_source(source)
+def _target_plan(source: Path, destination: Path, destination_fd: int, snapshot: TreeSnapshot) -> InstallPlan:
     target = destination / source.name
-    _validate_skill_name(source.name)
+    try:
+        metadata = lstat_at(destination_fd, source.name)
+    except FileNotFoundError:
+        return InstallPlan(source, destination, target, "create", tuple(sorted(snapshot.files)))
+    except OSError as exc:
+        raise InstallError(f"could not inspect install target {target}: {exc}") from exc
 
-    if not os.path.lexists(target):
-        return InstallPlan(source, destination, target, "create", files)
-    if target.is_symlink():
+    files = tuple(sorted(snapshot.files))
+    if stat.S_ISLNK(metadata.st_mode):
         return InstallPlan(
             source,
             destination,
@@ -173,9 +150,28 @@ def preview_install(source: Path, destination: Path) -> InstallPlan:
             files,
             "target already exists as a symlink; broken symlinks are retained",
         )
-    if not target.is_dir():
+    if not stat.S_ISDIR(metadata.st_mode):
         return InstallPlan(source, destination, target, "conflict", files, "target is not a directory")
-    if _same_contents(source, target):
+    try:
+        target_fd = open_child_directory(destination_fd, source.name)
+        try:
+            target_tree = snapshot_tree(target_fd, reject_symlinks=True)
+        finally:
+            os.close(target_fd)
+    except (OSError, SafeFilesystemError):
+        return InstallPlan(
+            source,
+            destination,
+            target,
+            "conflict",
+            files,
+            "target directory contains an unsafe entry",
+        )
+    if (
+        snapshot.directories == target_tree.directories
+        and snapshot.files == target_tree.files
+        and not target_tree.symlinks
+    ):
         return InstallPlan(source, destination, target, "unchanged", files)
     return InstallPlan(
         source,
@@ -187,41 +183,96 @@ def preview_install(source: Path, destination: Path) -> InstallPlan:
     )
 
 
+def preview_install(source: Path, destination: Path) -> InstallPlan:
+    """Build an install plan without creating or changing a path."""
+
+    source = canonical_path(source)
+    destination = canonical_path(destination)
+    _validate_skill_name(source.name)
+    snapshot = _source_snapshot(source)
+    _validate_destination(destination)
+    try:
+        handle = open_directory(destination)
+    except FileNotFoundError:
+        return InstallPlan(source, destination, destination / source.name, "create", tuple(sorted(snapshot.files)))
+    except (OSError, SafeFilesystemError) as exc:
+        raise InstallError(f"could not open destination {destination}: {exc}") from exc
+    try:
+        return _target_plan(source, destination, handle.fd, snapshot)
+    finally:
+        os.close(handle.fd)
+        close_created_directories(handle.created)
+
+
+def _destination_target_is_absent(destination_fd: int, name: str) -> None:
+    try:
+        lstat_at(destination_fd, name)
+    except FileNotFoundError:
+        return
+    raise InstallError(f"target appeared during install: {name}")
+
+
 def apply_install(source: Path, destination: Path) -> InstallPlan:
-    """Install a skill with atomic staged publication and cleanup on failure."""
+    """Install a skill from a stable snapshot with atomic directory publication."""
 
-    plan = preview_install(source, destination)
-    if plan.status != "create":
-        if plan.status == "unchanged":
-            return plan
-        raise InstallError(plan.reason or f"cannot install into {plan.target}")
+    source = canonical_path(source)
+    destination = canonical_path(destination)
+    _validate_skill_name(source.name)
+    snapshot = _source_snapshot(source)
+    try:
+        destination_handle = open_directory(destination, create=True)
+    except (OSError, SafeFilesystemError) as exc:
+        raise InstallError(f"could not open destination without following a link: {destination}: {exc}") from exc
 
-    destination = plan.destination
-    created_directories: list[Path] = []
-    staging: Path | None = None
+    staging_name: str | None = None
+    staging_fd: int | None = None
     completed = False
     try:
-        created_directories = _missing_directories(destination)
-        for directory in reversed(created_directories):
-            directory.mkdir()
-        _validate_destination(destination)
-        staging = Path(tempfile.mkdtemp(prefix=f".{plan.source.name}.install-", dir=destination))
-        _validate_source(plan.source)
-        shutil.copytree(plan.source, staging, symlinks=False, dirs_exist_ok=True)
-        _validate_source(plan.source)
-        if os.path.lexists(plan.target):
-            raise InstallError(f"target appeared during install: {plan.target}")
-        os.rename(staging, plan.target)
-        staging = None
-        completed = True
-        return plan
-    except (OSError, shutil.Error) as exc:
+        with directory_lock(destination_handle.fd):
+            plan = _target_plan(source, destination, destination_handle.fd, snapshot)
+            if plan.status == "unchanged":
+                completed = True
+                return plan
+            if plan.status != "create":
+                raise InstallError(plan.reason or f"cannot install into {plan.target}")
+
+            staging_name, staging_fd = create_unique_directory(destination_handle.fd, ".setup-pstack-install-")
+            write_snapshot(
+                staging_fd,
+                TreeSnapshot(snapshot.directories, snapshot.files, {}),
+            )
+            sync_directory(staging_fd)
+            _destination_target_is_absent(destination_handle.fd, source.name)
+            os.rename(
+                staging_name,
+                source.name,
+                src_dir_fd=destination_handle.fd,
+                dst_dir_fd=destination_handle.fd,
+            )
+            staging_name = None
+            os.close(staging_fd)
+            staging_fd = None
+            sync_directory(destination_handle.fd)
+            completed = True
+            return plan
+    except (OSError, SafeFilesystemError) as exc:
         raise InstallError(f"install failed and was rolled back: {exc}") from exc
     finally:
-        if staging is not None:
-            shutil.rmtree(staging, ignore_errors=True)
+        if staging_fd is not None:
+            os.close(staging_fd)
+        if staging_name is not None:
+            try:
+                remove_tree_at(destination_handle.fd, staging_name)
+            except OSError:
+                pass
         if not completed:
-            _cleanup_empty_directories(created_directories)
+            try:
+                cleanup_created_directories(destination_handle.created)
+            except OSError:
+                pass
+        else:
+            close_created_directories(destination_handle.created)
+        os.close(destination_handle.fd)
 
 
 def _format_result(plan: InstallPlan, as_json: bool) -> str:
@@ -284,7 +335,7 @@ def _self_test() -> None:
         else:
             raise AssertionError("broken source did not fail")
         assert not (rollback_destination / "setup-pstack").exists()
-        assert not list(rollback_destination.glob(".setup-pstack.install-*")) if rollback_destination.exists() else True
+        assert not rollback_destination.exists()
 
     print("setup-pstack installer self-check passed")
 

@@ -30,12 +30,19 @@ ACTIVE_SEAMS = (
     ),
     ("create-skill call", re.compile(r"(?:/create-skill\b|\bcreate-skill\s+(?:tool|command)\b)", re.IGNORECASE)),
 )
-BOUNDARY_WORDS = re.compile(
-    r"\b(?:unsupported|not supported|does not|do not|don't|never|cannot|can't|unavailable|fallback|boundary|not ported|not copied)\b",
-    re.IGNORECASE,
-)
+BOUNDARY_ANNOTATION = re.compile(r"\bUNSUPPORTED[-_ ]SEAM\s*:\s*(?P<detail>[^\n]+)", re.IGNORECASE)
+SEAM_ANNOTATION_ALIASES = {
+    "Cursor path": ("cursor path", "cursor rules", "cursor target"),
+    "Cursor Task call": ("cursor task",),
+    "subagent_type": ("subagent_type",),
+    "background-agent setting": ("background-agent", "run_in_background"),
+    "transcript path": ("transcript path", "agent-transcripts"),
+    "Cursor team kit": ("cursor team kit",),
+    "AskQuestion call": ("askquestion",),
+    "create-skill call": ("create-skill",),
+}
 TOP_LEVEL_FIELD = re.compile(r"^(?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]*(?P<value>.*))?$")
-MARKDOWN_LINK = re.compile(r"(?<!!)\[[^\]]*\]\((?:<(?P<bracket>[^>]+)>|(?P<plain>[^)\s]+))[^)]*\)")
+INLINE_LINK = re.compile(r"(?<!!)\[[^\]\n]*\]\((?P<body>[^)\n]*)\)")
 REFERENCE_DEFINITION = re.compile(
     r"^[ \t]{0,3}\[(?P<label>[^\]]+)\]:[ \t]*(?:<(?P<bracket>[^>]+)>|(?P<plain>\S+))(?:[ \t]+.*)?$"
 )
@@ -43,7 +50,6 @@ REFERENCE_DEFINITION_PREFIX = re.compile(r"^[ \t]{0,3}\[(?P<label>[^\]]+)\]:")
 REFERENCE_USE = re.compile(r"(?<!!)\[(?P<text>[^\]]+)\]\[(?P<label>[^\]]*)\]")
 FENCE = re.compile(r"^\s*(```|~~~)")
 CODE_SPAN = re.compile(r"`[^`]*`")
-TEXT_SUFFIXES = {".md", ".py", ".sh", ".toml", ".ts", ".js", ".json", ".yaml", ".yml"}
 
 
 class ValidationError(ValueError):
@@ -66,7 +72,53 @@ def _scalar(value: str, field: str) -> str:
             raise ValidationError(f"frontmatter field {field!r} has an unterminated quote")
         if quote == "'":
             return value[1:-1].replace("''", "'")
-        return value[1:-1].replace('\\"', '"').replace("\\n", "\n").replace("\\\\", "\\")
+        escaped = value[1:-1]
+        decoded: list[str] = []
+        index = 0
+        simple_escapes = {
+            "0": "\0",
+            "a": "\a",
+            "b": "\b",
+            "t": "\t",
+            "n": "\n",
+            "v": "\v",
+            "f": "\f",
+            "r": "\r",
+            "e": "\x1b",
+            " ": " ",
+            '"': '"',
+            "/": "/",
+            "\\": "\\",
+            "N": "\u0085",
+            "_": "\u00a0",
+            "L": "\u2028",
+            "P": "\u2029",
+        }
+        while index < len(escaped):
+            character = escaped[index]
+            if character != "\\":
+                decoded.append(character)
+                index += 1
+                continue
+            if index + 1 >= len(escaped):
+                raise ValidationError(f"frontmatter field {field!r} has a dangling YAML escape")
+            escape = escaped[index + 1]
+            if escape in simple_escapes:
+                decoded.append(simple_escapes[escape])
+                index += 2
+                continue
+            width = {"x": 2, "u": 4, "U": 8}.get(escape)
+            if width is None:
+                raise ValidationError(f"frontmatter field {field!r} has invalid YAML escape: \\{escape}")
+            digits = escaped[index + 2 : index + 2 + width]
+            if len(digits) != width or not re.fullmatch(rf"[0-9A-Fa-f]{{{width}}}", digits):
+                raise ValidationError(f"frontmatter field {field!r} has invalid YAML escape: \\{escape}{digits}")
+            try:
+                decoded.append(chr(int(digits, 16)))
+            except ValueError as exc:
+                raise ValidationError(f"frontmatter field {field!r} has invalid YAML code point") from exc
+            index += 2 + width
+        return "".join(decoded)
     if value.startswith(("[", "{", "&", "*", "!")):
         raise ValidationError(f"frontmatter field {field!r} is not a scalar")
     return value
@@ -148,10 +200,20 @@ def _check_links(root: Path, path: Path, text: str, errors: list[str]) -> None:
             _check_link_target(root, path, line_number, target, errors)
 
     for line_number, line in lines:
-        for match in MARKDOWN_LINK.finditer(line):
-            target = match.groupdict().get("bracket") or match.groupdict().get("plain")
-            if target:
-                _check_link_target(root, path, line_number, target, errors)
+        for match in INLINE_LINK.finditer(line):
+            body = match.group("body").strip()
+            if not body:
+                errors.append(f"{path.relative_to(root)}:{line_number} has a malformed Markdown link with an empty destination")
+                continue
+            if body.startswith("<"):
+                end = body.find(">")
+                if end <= 1:
+                    errors.append(f"{path.relative_to(root)}:{line_number} has a malformed Markdown link destination")
+                    continue
+                target = body[1:end]
+            else:
+                target = body.split(None, 1)[0]
+            _check_link_target(root, path, line_number, target, errors)
         for match in REFERENCE_USE.finditer(line):
             label = _reference_label(match.group("label") or match.group("text"))
             if label not in definitions:
@@ -164,11 +226,12 @@ def _check_boundary_mentions(root: Path, path: Path, text: str, errors: list[str
         for marker, pattern in ACTIVE_SEAMS:
             if not pattern.search(line):
                 continue
-            context = "\n".join(lines[max(0, line_number - 2) : min(len(lines), line_number + 3)])
-            if not BOUNDARY_WORDS.search(context):
+            annotations = [match.group("detail").casefold() for match in BOUNDARY_ANNOTATION.finditer(line)]
+            aliases = SEAM_ANNOTATION_ALIASES[marker]
+            if not any(alias in detail for detail in annotations for alias in aliases):
                 errors.append(
                     f"{path.relative_to(root)}:{line_number + 1} contains an active unsupported seam {marker!r}; "
-                    "document the boundary or use a Codex surface"
+                    "add an explicit same-line UNSUPPORTED-SEAM annotation or use a Codex surface"
                 )
 
 
@@ -246,12 +309,13 @@ def verify_port(root: Path, *, run_helpers: bool = True) -> list[str]:
             errors.append(f"{relative} has invalid frontmatter: {exc}")
             text = ""
 
-        for document in sorted(
-            path for path in skill_dir.rglob("*") if path.is_file() and path.suffix.lower() in TEXT_SUFFIXES
-        ):
+        for document in sorted(path for path in skill_dir.rglob("*") if path.is_file() and not path.is_symlink()):
             try:
-                document_text = document.read_text(encoding="utf-8")
-            except OSError as exc:
+                raw = document.read_bytes()
+                if b"\x00" in raw:
+                    continue
+                document_text = raw.decode("utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
                 errors.append(f"{document.relative_to(root)} cannot be read: {exc}")
                 continue
             if document.suffix.lower() == ".md":
