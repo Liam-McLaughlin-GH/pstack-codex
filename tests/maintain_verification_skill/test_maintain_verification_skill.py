@@ -164,6 +164,16 @@ def create_project(root: Path, *, stale: bool) -> dict[str, Path | str | dict[st
             "session_id": "tiny-run-1",
             "owned": True,
             "healthy": True,
+            "target": "tiny-cli",
+            "build": "fixture-v1",
+            "endpoint": "cli",
+            "auth": "not-required",
+            "disposable": True,
+        },
+        "run": {
+            "run_id": "tiny-run-1",
+            "session_id": "tiny-run-1",
+            "phase": "baseline",
         },
         "features": [
             {
@@ -270,6 +280,21 @@ class MaintainVerificationSkillBehaviorTests(unittest.TestCase):
             self.assertIn("check passed: ready", command_result.stdout)
             fixture["check_evidence"].write_text(command_result.stdout, encoding="utf-8")
 
+            fixture["live"]["run"] = {
+                "run_id": applied_payload["run_id"],
+                "session_id": applied_payload["session_id"],
+                "phase": "post-apply",
+                "apply_id": applied_payload["apply_id"],
+            }
+            fixture["live"]["doctor"]["session_id"] = applied_payload["session_id"]
+            fixture["live"]["features"][0]["post_apply"] = {
+                "redriven": True,
+                "apply_id": applied_payload["apply_id"],
+                "run_id": applied_payload["run_id"],
+                "session_id": applied_payload["session_id"],
+            }
+            live_path.write_text(json.dumps(fixture["live"]), encoding="utf-8")
+
             change_log = root / "change-log.json"
             change_log.write_text(json.dumps(applied_payload), encoding="utf-8")
             audit_after = run_helper(
@@ -303,6 +328,7 @@ class MaintainVerificationSkillBehaviorTests(unittest.TestCase):
                 "route": "check command",
                 "observed": "the real command returned exit code 1",
                 "evidence": [str(fixture["check_evidence"])],
+                "evidence_survives_cleanup": True,
             }
             product_live = root / "product-live.json"
             product_live.write_text(json.dumps(live), encoding="utf-8")
@@ -344,6 +370,312 @@ class MaintainVerificationSkillBehaviorTests(unittest.TestCase):
             self.assertEqual(harness.returncode, 1)
             self.assertTrue(any(item["kind"] == "harness-gap" for item in json_output(harness)["findings"]))
 
+    def test_changed_requires_post_apply_identity_and_affected_redrive(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-receipt-") as temporary:
+            root = Path(temporary)
+            fixture = create_project(root, stale=True)
+            patch_plan = root / "patches.json"
+            patch_plan.write_text(
+                json.dumps(
+                    {
+                        "changes": [
+                            {
+                                "path": "features/check-state.md",
+                                "kind": "doc-drift",
+                                "old": "--expected stale",
+                                "new": "--expected ready",
+                                "reason": "source changed",
+                                "source": "app.py:1-40",
+                            },
+                            {
+                                "path": "features/check-state.md",
+                                "kind": "doc-drift",
+                                "old": "stdout contains check failed",
+                                "new": "stdout contains check passed",
+                                "reason": "source changed",
+                                "source": "app.py:1-40",
+                            },
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            applied = run_helper(
+                "apply",
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--patch-plan",
+                str(patch_plan),
+                "--json",
+            )
+            self.assertEqual(applied.returncode, 0, applied.stderr)
+            receipt = json_output(applied)
+            change_log = root / "change-log.json"
+            change_log.write_text(json.dumps(receipt), encoding="utf-8")
+
+            stale_live = run_helper(
+                "audit",
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--project-root",
+                str(fixture["project"]),
+                "--reader-report",
+                str(fixture["reader_path"]),
+                "--live-report",
+                str(fixture["live_path"]),
+                "--change-log",
+                str(change_log),
+                "--json",
+            )
+            self.assertEqual(stale_live.returncode, 1, stale_live.stderr)
+            stale_payload = json_output(stale_live)
+            self.assertEqual(stale_payload["outcome"], "blocked")
+            self.assertTrue(any(item["kind"] == "evidence-failure" for item in stale_payload["findings"]))
+
+            post_live = fixture["live"]
+            post_live["run"] = {
+                "run_id": receipt["run_id"],
+                "session_id": receipt["session_id"],
+                "phase": "post-apply",
+                "apply_id": receipt["apply_id"],
+            }
+            post_live["doctor"]["session_id"] = receipt["session_id"]
+            post_path = root / "post-live.json"
+            post_path.write_text(json.dumps(post_live), encoding="utf-8")
+            missing_redrive = run_helper(
+                "audit",
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--project-root",
+                str(fixture["project"]),
+                "--reader-report",
+                str(fixture["reader_path"]),
+                "--live-report",
+                str(post_path),
+                "--change-log",
+                str(change_log),
+                "--json",
+            )
+            self.assertEqual(missing_redrive.returncode, 1, missing_redrive.stderr)
+            missing_payload = json_output(missing_redrive)
+            self.assertEqual(missing_payload["outcome"], "blocked")
+            self.assertTrue(any(item["kind"] == "evidence-failure" for item in missing_payload["findings"]))
+
+    def test_audit_and_doctor_use_the_same_strict_doctor_contract(self) -> None:
+        required = ("target", "build", "endpoint", "auth", "disposable")
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-doctor-") as temporary:
+            root = Path(temporary)
+            fixture = create_project(root, stale=False)
+            for field in required:
+                report = dict(fixture["live"]["doctor"])
+                report.pop(field)
+                report_path = root / f"doctor-{field}.json"
+                report_path.write_text(json.dumps(report), encoding="utf-8")
+                doctor_result = run_helper(
+                    "doctor",
+                    "--skill-root",
+                    str(fixture["skill_root"]),
+                    "--report",
+                    str(report_path),
+                    "--json",
+                )
+                self.assertEqual(doctor_result.returncode, 1, field)
+                self.assertEqual(json_output(doctor_result)["status"], "fail")
+
+                live = json.loads(json.dumps(fixture["live"]))
+                live["doctor"] = report
+                live_path = root / f"live-{field}.json"
+                live_path.write_text(json.dumps(live), encoding="utf-8")
+                audit_result = run_helper(
+                    "audit",
+                    "--skill-root",
+                    str(fixture["skill_root"]),
+                    "--project-root",
+                    str(fixture["project"]),
+                    "--reader-report",
+                    str(fixture["reader_path"]),
+                    "--live-report",
+                    str(live_path),
+                    "--json",
+                )
+                self.assertEqual(audit_result.returncode, 1, field)
+                findings = json_output(audit_result)["findings"]
+                self.assertTrue(any(item["kind"] == "doctor-failure" for item in findings), field)
+                self.assertFalse(any(item["kind"] == "doc-drift" for item in findings), field)
+
+    def test_cleanup_preflights_all_targets_and_rejects_product_roots(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-cleanup-") as temporary:
+            root = Path(temporary)
+            fixture = create_project(root, stale=False)
+            project = fixture["project"]
+            product = project / "product.txt"
+            product.write_text("keep me\n", encoding="utf-8")
+            safe = root / "safe.txt"
+            safe.write_text("scratch\n", encoding="utf-8")
+            manifest = root / "cleanup.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "owned_paths": ["safe.txt", "project/product.txt"],
+                        "evidence_paths": [str(fixture["check_evidence"])],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            result = run_helper(
+                "cleanup",
+                "--run-root",
+                str(root),
+                "--manifest",
+                str(manifest),
+                "--project-root",
+                str(project),
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--json",
+            )
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertTrue(safe.exists(), "preflight must prevent partial cleanup")
+            self.assertEqual(product.read_text(encoding="utf-8"), "keep me\n")
+
+            mis_scoped = project / "run"
+            mis_scoped.mkdir()
+            mis_manifest = mis_scoped / "cleanup.json"
+            mis_manifest.write_text(
+                json.dumps({"owned_paths": ["product.txt"], "evidence_paths": [str(fixture["check_evidence"])]}),
+                encoding="utf-8",
+            )
+            mis_result = run_helper(
+                "cleanup",
+                "--run-root",
+                str(mis_scoped),
+                "--manifest",
+                str(mis_manifest),
+                "--project-root",
+                str(project),
+                "--json",
+            )
+            self.assertEqual(mis_result.returncode, 2, mis_result.stderr)
+            self.assertEqual(product.read_text(encoding="utf-8"), "keep me\n")
+
+    def test_feature_actions_are_validated_individually_and_in_order(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-actions-") as temporary:
+            root = Path(temporary)
+            fixture = create_project(root, stale=False)
+            feature_path = fixture["skill_root"] / "features" / "check-state.md"
+            text = feature_path.read_text(encoding="utf-8")
+            text = text.replace(
+                "  - Actors: operator\n"
+                f"  - Fixtures: state file containing ready at {fixture['state']}\n",
+                f"  - Fixtures: state file containing ready at {fixture['state']}\n"
+                "  - Actors: operator\n",
+                1,
+            )
+            feature_path.write_text(text, encoding="utf-8")
+            result = run_helper(
+                "audit",
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--project-root",
+                str(fixture["project"]),
+                "--reader-report",
+                str(fixture["reader_path"]),
+                "--live-report",
+                str(fixture["live_path"]),
+                "--json",
+            )
+            self.assertEqual(result.returncode, 1)
+            findings = json_output(result)["findings"]
+            self.assertTrue(any(item["kind"] == "doc-drift" for item in findings))
+
+    def test_source_entries_need_citations_and_regular_files(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-sources-") as temporary:
+            root = Path(temporary)
+            fixture = create_project(root, stale=False)
+            readers = json.loads(fixture["reader_path"].read_text(encoding="utf-8"))
+            readers["readers"][0]["source_entries"] = [{"path": "scratch", "lines": "1"}]
+            directory_path = root / "directory-reader.json"
+            directory_path.write_text(json.dumps(readers), encoding="utf-8")
+            directory_result = run_helper(
+                "audit",
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--project-root",
+                str(fixture["project"]),
+                "--reader-report",
+                str(directory_path),
+                "--live-report",
+                str(fixture["live_path"]),
+                "--json",
+            )
+            self.assertEqual(directory_result.returncode, 1)
+            self.assertTrue(any(item["kind"] == "blocked" for item in json_output(directory_result)["findings"]))
+
+            readers["readers"][0]["source_entries"] = [{"path": "app.py"}]
+            no_citation_path = root / "no-citation-reader.json"
+            no_citation_path.write_text(json.dumps(readers), encoding="utf-8")
+            no_citation_result = run_helper(
+                "audit",
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--project-root",
+                str(fixture["project"]),
+                "--reader-report",
+                str(no_citation_path),
+                "--live-report",
+                str(fixture["live_path"]),
+                "--json",
+            )
+            self.assertEqual(no_citation_result.returncode, 2)
+            self.assertIn("citation", no_citation_result.stderr)
+
+    def test_doctor_harness_and_evidence_failures_are_not_doc_drift(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-classification-") as temporary:
+            root = Path(temporary)
+            fixture = create_project(root, stale=False)
+
+            missing_evidence = json.loads(json.dumps(fixture["live"]))
+            missing_evidence["features"][0]["evidence"] = [str(root / "missing.txt")]
+            missing_path = root / "missing-evidence.json"
+            missing_path.write_text(json.dumps(missing_evidence), encoding="utf-8")
+            result = run_helper(
+                "audit",
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--project-root",
+                str(fixture["project"]),
+                "--reader-report",
+                str(fixture["reader_path"]),
+                "--live-report",
+                str(missing_path),
+                "--json",
+            )
+            self.assertEqual(result.returncode, 1)
+            findings = json_output(result)["findings"]
+            self.assertTrue(any(item["kind"] == "evidence-failure" for item in findings))
+            self.assertFalse(any(item["kind"] == "doc-drift" for item in findings))
+
+            no_source_match = json.loads(json.dumps(fixture["live"]))
+            no_source_match["features"][0]["source_match"] = False
+            no_source_match_path = root / "no-source-match.json"
+            no_source_match_path.write_text(json.dumps(no_source_match), encoding="utf-8")
+            result = run_helper(
+                "audit",
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--project-root",
+                str(fixture["project"]),
+                "--reader-report",
+                str(fixture["reader_path"]),
+                "--live-report",
+                str(no_source_match_path),
+                "--json",
+            )
+            self.assertEqual(result.returncode, 1)
+            findings = json_output(result)["findings"]
+            self.assertTrue(any(item["kind"] == "evidence-failure" for item in findings))
+            self.assertFalse(any(item["kind"] == "doc-drift" for item in findings))
+
     def test_doctor_cleanup_and_edit_boundary_are_guarded(self) -> None:
         with tempfile.TemporaryDirectory(prefix="maintain-verification-boundaries-") as temporary:
             root = Path(temporary)
@@ -360,6 +692,11 @@ class MaintainVerificationSkillBehaviorTests(unittest.TestCase):
                         "session_id": "tiny-run-1",
                         "owned": True,
                         "healthy": True,
+                        "target": "tiny-cli",
+                        "build": "fixture-v1",
+                        "endpoint": "cli",
+                        "auth": "not-required",
+                        "disposable": True,
                     }
                 ),
                 encoding="utf-8",
@@ -397,7 +734,7 @@ class MaintainVerificationSkillBehaviorTests(unittest.TestCase):
             self.assertEqual(outside_result.returncode, 2)
             self.assertEqual(product_file.read_text(encoding="utf-8"), "must remain untouched\n")
 
-            run_root = project / "run"
+            run_root = root / "run"
             owned = run_root / "state"
             owned.mkdir(parents=True)
             (owned / "attempt.json").write_text("scratch\n", encoding="utf-8")

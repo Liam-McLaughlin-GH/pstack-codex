@@ -33,7 +33,7 @@ product failure a documentation fix.
 3. Read the target `SKILL.md`, `features/README.md`, and every linked feature
    file. Use the issue #2 feature-map contract: each feature keeps the four
    ordered H2 sections and each action records `Actors`, `Fixtures`, `Action`,
-   `Expected result`, and `Evidence`. Read
+   `Expected result`, and `Evidence` in that order. Read
    [the maintenance receipt schema](references/maintenance-report-schema.md)
    before collecting reports.
 4. Treat the verification directory as the complete write boundary. Product
@@ -55,7 +55,8 @@ feature file, the relevant product source, and the current repository
 instructions. A reader must return:
 
 - the feature summary in user language;
-- exact source paths and line or symbol citations;
+- exact regular-file source paths and a non-empty line or symbol citation for
+  every source entry;
 - authoritative entry points, commands, selectors, fixtures, and expected
   results, with empty lists where a category does not apply;
 - one concise live recipe with its actor, fixture, action, expected result, and
@@ -86,19 +87,31 @@ python3 skills/maintain-verification-skill/scripts/maintain.py audit \
 ```
 
 The audit checks the feature index, dead or duplicate links, the feature-file
-shape, frontmatter, required Launch/Doctor/Drive/Evidence/Cleanup/Helpers
+shape, ordered action fields, frontmatter, required Launch/Doctor/Drive/Evidence/Cleanup/Helpers
 sections, source citations, authoritative map values, Doctor receipt, live
 coverage, and retained evidence. It returns exit code `0` for `clean` or
 `changed`, and `1` for `blocked`; malformed input or unsafe paths return `2`.
+
+`apply` emits a versioned correction receipt. Keep it as the change log passed
+to the final audit. A `changed` result requires that receipt's apply, run, and
+session IDs to match a post-apply live report, and every affected feature must
+carry a matching re-drive receipt. A copied baseline live report cannot prove
+`changed`.
 
 Use these classifications:
 
 - `doc-drift`: the user-facing recipe, index, selector, command, fixture, or
   expected result disagrees with current source. Propose the smallest edit
-  supported by a cited source path.
+  supported by a cited source path. The source/map mismatch must be visible in
+  the cited section or action; a missing proof field is not doc drift.
 - `harness-gap`: source confirms the feature, but the target skill cannot
   reach or observe it. Repair only a target-owned helper or recipe, then run
   the same feature live again.
+- `doctor-failure`: the Doctor receipt is not for this skill, run, session, or
+  healthy owned instance, or it omits target, build, endpoint, auth, or
+  disposable-state metadata.
+- `evidence-failure`: an evidence artifact is missing, lost during cleanup, or
+  is not bound to the correction run. These failures do not become doc drift.
 - `product-gap`: the source and map agree, Doctor is healthy, and the real
   user path fails. Record the observed result and evidence for the user. Do
   not edit product code or disguise this as map drift.
@@ -119,7 +132,7 @@ The coordinator owns all driving. Follow the target skill's Launch model:
   requires it.
 - Run the target skill's read-only Doctor before the first drive, on every
   fresh session, and after any failed drive. Doctor must identify the expected
-  build or endpoint, the instance owned by this run, required auth, and the
+  skill root, owned session, target, build, endpoint, auth state, and
   disposable state. A healthy process that is wedged in an unobservable UI
   state must be reset or relaunched.
 - Exercise every feature at least once. A `verified-unreachable` result is
@@ -144,8 +157,8 @@ python3 skills/maintain-verification-skill/scripts/maintain.py doctor \
   --json
 ```
 
-This helper validates the receipt. It does not pretend to inspect the running
-app itself.
+This helper validates the same strict receipt contract used by `audit`. It does
+not pretend to inspect the running app itself.
 
 ## Safe corrections and cleanup
 
@@ -163,8 +176,9 @@ python3 skills/maintain-verification-skill/scripts/maintain.py apply \
 The helper preflights every replacement, requires each old span exactly once,
 writes only existing regular files below the target, and rolls back files it
 already wrote if a later write fails. Re-read every changed file, rerun the
-map audit, and re-drive every affected feature before reporting `changed`.
-Never apply a `product-gap` patch.
+map audit, and re-drive every affected feature in the apply receipt before
+reporting `changed`. Save the apply output unchanged as the change log. Never
+apply a `product-gap` patch.
 
 Record owned scratch paths and evidence separately. Remove only the paths in
 the manifest and prove the evidence remains:
@@ -174,12 +188,16 @@ python3 skills/maintain-verification-skill/scripts/maintain.py cleanup \
   --run-root /absolute/scratch/run-123 \
   --manifest /absolute/scratch/run-123/cleanup.json \
   --project-root /absolute/project \
+  --skill-root /absolute/project/.agents/skills/verify-app \
   --json
 ```
 
-The cleanup helper rejects traversal, symlinked run roots, and manifests that
+The cleanup helper requires a real disposable run root outside the project and
+verification roots. It preflights every target before deleting any of them,
+rejects traversal, symlinked targets, overlapping targets, and manifests that
 would remove an evidence artifact. It does not remove the run root by
-default, and it never deletes product files or proof artifacts.
+default, and it never deletes product or source files when a run root is
+mis-scoped.
 
 ## Ship or stop
 

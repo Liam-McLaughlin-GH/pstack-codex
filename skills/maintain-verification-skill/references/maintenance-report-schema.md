@@ -16,7 +16,8 @@ The top-level object contains one `readers` entry for every feature file:
       "status": "complete",
       "summary": "An operator checks the current state from a terminal.",
       "source_entries": [
-        {"path": "src/cli.py", "lines": "12-39"}
+        {"path": "src/cli.py", "lines": "12-39"},
+        {"path": "src/commands.py", "symbol": "check_state"}
       ],
       "authoritative": {
         "entry_points": ["Run the check command from a terminal."],
@@ -39,10 +40,12 @@ The top-level object contains one `readers` entry for every feature file:
 ```
 
 `status` may be `blocked` instead. A blocked reader supplies `reason` and
-does not claim source coverage. A source entry is a repository-relative path;
-the helper checks that it exists below `project-root`. `authoritative` keeps
-the exact user-facing strings that the feature recipe must contain. Use an
-empty list for a category that does not apply. A missing harness uses
+does not claim source coverage. Each source entry is an object with a
+repository-relative path and a non-empty `lines` or `symbol` citation. The
+helper checks that the path exists below `project-root` as a regular file; a
+directory is not source evidence. `authoritative` keeps the exact user-facing
+strings that the matching feature section or action must contain. Use an empty
+list for a category that does not apply. A missing harness uses
 `{"status": "missing", "reason": "..."}` and becomes a `harness-gap`.
 
 ## Live-pass report
@@ -56,7 +59,17 @@ The top-level object contains one `doctor` receipt and one result per feature:
     "skill_root": "/project/.agents/skills/verify-tiny",
     "session_id": "run-17",
     "owned": true,
-    "healthy": true
+    "healthy": true,
+    "target": "tiny-cli",
+    "build": "git:cafebabe",
+    "endpoint": "cli",
+    "auth": "not-required",
+    "disposable": true
+  },
+  "run": {
+    "run_id": "run-17",
+    "session_id": "run-17",
+    "phase": "baseline"
   },
   "features": [
     {
@@ -84,7 +97,9 @@ Use these live statuses:
 - `not-run` requires a reason and keeps the overall pass blocked.
 
 The helper checks evidence paths as read-only files. It does not create,
-move, or execute them.
+move, or execute them. Doctor is strict in both `audit` and `doctor`: the
+skill root, owned healthy session, target, build, endpoint, auth state, and
+`disposable: true` must all be present.
 
 ## Safe patch plan
 
@@ -108,8 +123,28 @@ An apply plan contains explicit replacements:
 `path` is relative to the target verification directory. `kind` is
 `doc-drift` or `harness-gap`; a `product-gap` cannot be applied. Every `old`
 span must occur exactly once, every target must be an existing regular file,
-and all targets must remain inside the verification directory. The helper
-preflights the complete plan before writing.
+and all targets must remain inside the verification directory. Feature-file
+changes derive their affected feature from the path. Harness changes must set
+`feature_ids` on the change or `affected_features` on the plan. The helper
+preflights the complete plan before writing and emits a version-2 receipt with
+`apply_id`, `run_id`, `session_id`, `affected_features`, and SHA-256 digests of
+the changed files. Save that output as the change log.
+
+For a post-correction live report, set `run.phase` to `post-apply` and copy
+the apply receipt's `run_id`, `session_id`, and `apply_id` into the run object.
+Every affected feature result also carries a `post_apply` object:
+
+```json
+{
+  "redriven": true,
+  "apply_id": "apply-...",
+  "run_id": "run-17",
+  "session_id": "run-17"
+}
+```
+
+The final audit compares those identities and the file digests before it can
+return `changed`.
 
 ## Cleanup manifest
 
@@ -122,9 +157,11 @@ Cleanup is allowlisted rather than recursive by default:
 }
 ```
 
-`owned_paths` are simple relative paths below the run root. Evidence is
-checked before and after removal. If an owned path contains evidence, the
-helper rejects the manifest before changing anything.
+`owned_paths` are simple relative paths below a real disposable run root. The
+run root must be outside the project and verification roots. Evidence is
+checked before and after removal. Every owned target is preflighted before the
+first deletion. If an owned path contains evidence, product/source roots, or
+the manifest, the helper rejects the manifest before changing anything.
 
 ## Classification
 
@@ -134,7 +171,10 @@ The audit reports one of the three terminal outcomes:
 - `changed` means no blocking finding and at least one applied correction,
   followed by live proof.
 - `blocked` means any missing source or live coverage, failed Doctor, lost
-  evidence, unresolved map drift, harness failure, or product gap remains.
+  evidence, unresolved map drift, harness failure, invalid apply receipt, or
+  product gap remains. `doc-drift` is reserved for a demonstrated source/map
+  mismatch. Doctor, harness, and evidence failures retain their own finding
+  kinds.
 
 The finding kind identifies the boundary: `doc-drift`, `harness-gap`,
 `product-gap`, `doctor-failure`, `verified-unreachable`, or `blocked`.

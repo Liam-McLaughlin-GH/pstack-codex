@@ -9,12 +9,14 @@ patch requires an explicit plan and a path inside the verification skill.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -27,6 +29,13 @@ REQUIRED_FEATURE_SECTIONS = (
     "Driving it with",
     "Gotchas",
 )
+ACTION_FIELDS = ("Actors", "Fixtures", "Action", "Expected result", "Evidence")
+ACTION_HEADING_PATTERN = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)\*\*(.+?)\*\*\s*$")
+ACTION_FIELD_PATTERN = re.compile(
+    r"^\s*(?:(?:[-*+]\s+)|(?:\d+[.)]\s+))?(?:\*\*)?"
+    r"(Actors|Fixtures|Action|Expected result|Evidence):"
+    r"(?:\*\*)?\s*(.*?)\s*$"
+)
 AUTHORITATIVE_FIELDS = (
     "entry_points",
     "commands",
@@ -36,6 +45,8 @@ AUTHORITATIVE_FIELDS = (
 )
 LIVE_STATUSES = {"pass", "fail", "verified-unreachable", "harness-gap", "not-run"}
 PATCH_KINDS = {"doc-drift", "harness-gap"}
+RECEIPT_VERSION = 2
+DOCTOR_METADATA_FIELDS = ("target", "build", "endpoint", "auth", "disposable")
 
 
 class MaintainError(ValueError):
@@ -94,6 +105,8 @@ def _real_directory(path: Path, label: str) -> Path:
 def _safe_path(root: Path, raw: str, label: str, *, require_exists: bool = False) -> Path:
     """Resolve a path and require it to stay below root without symlink hops."""
 
+    if Path(raw).is_absolute():
+        raise MaintainError(f"{label} must be relative: {raw}")
     root = _resolved(root)
     candidate = _resolved(root / raw)
     if not _is_relative_to(candidate, root) or candidate == root:
@@ -118,6 +131,26 @@ def _external_existing(raw: str, label: str, project_root: Path | None = None) -
     if not path.is_file():
         raise MaintainError(f"{label} does not exist as a file: {raw}")
     return path
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _new_id(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex}"
+
+
+def _metadata_present(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, dict):
+        return bool(value)
+    return False
 
 
 def _finding(
@@ -163,8 +196,101 @@ def _feature_sections(lines: Iterable[str]) -> list[str]:
     return [line[3:].strip() for line in lines if line.startswith("## ")]
 
 
-def _has_label(lines: Iterable[str], label: str) -> bool:
-    return any(line.strip().lstrip("- ").startswith(label) for line in lines)
+def _h2_ranges(lines: list[str]) -> list[tuple[str, int, int]]:
+    headings = [(index, line[3:].strip()) for index, line in enumerate(lines) if line.startswith("## ")]
+    ranges: list[tuple[str, int, int]] = []
+    for position, (start, title) in enumerate(headings):
+        end = headings[position + 1][0] if position + 1 < len(headings) else len(lines)
+        ranges.append((title, start, end))
+    return ranges
+
+
+def _action_blocks(lines: list[str]) -> tuple[list[str], list[tuple[str, list[str]]]]:
+    """Return the driving preamble and bold action blocks from one feature."""
+
+    driving = next((item for item in _h2_ranges(lines) if item[0].startswith("Driving it with")), None)
+    if driving is None:
+        return [], []
+    _, start, end = driving
+    section_lines = lines[start + 1 : end]
+    action_starts = [
+        (index, match.group(1).strip())
+        for index, line in enumerate(section_lines)
+        if (match := ACTION_HEADING_PATTERN.match(line))
+    ]
+    if not action_starts:
+        return section_lines, []
+    preamble = section_lines[: action_starts[0][0]]
+    actions: list[tuple[str, list[str]]] = []
+    for position, (action_start, title) in enumerate(action_starts):
+        action_end = action_starts[position + 1][0] if position + 1 < len(action_starts) else len(section_lines)
+        actions.append((title, section_lines[action_start + 1 : action_end]))
+    return preamble, actions
+
+
+def _validate_action_blocks(
+    lines: list[str], feature_id: str, path: str
+) -> list[dict[str, Any]]:
+    preamble, actions = _action_blocks(lines)
+    findings: list[dict[str, Any]] = []
+    if not any(line.strip() == "Preconditions:" for line in preamble):
+        findings.append(
+            _finding(
+                "doc-drift",
+                "feature driving section must start with Preconditions:",
+                feature_id=feature_id,
+                path=path,
+            )
+        )
+    if not actions:
+        findings.append(
+            _finding(
+                "doc-drift",
+                "feature driving section must contain at least one named action",
+                feature_id=feature_id,
+                path=path,
+            )
+        )
+        return findings
+
+    for title, block in actions:
+        fields: list[tuple[str, str]] = []
+        for line in block:
+            match = ACTION_FIELD_PATTERN.match(line)
+            if match:
+                fields.append((match.group(1), match.group(2).strip()))
+        names = [name for name, _ in fields]
+        if names != list(ACTION_FIELDS):
+            findings.append(
+                _finding(
+                    "doc-drift",
+                    f"action {title!r} must contain {', '.join(ACTION_FIELDS)} in that order",
+                    feature_id=feature_id,
+                    path=path,
+                )
+            )
+            continue
+        for name, value in fields:
+            if not value:
+                findings.append(
+                    _finding(
+                        "doc-drift",
+                        f"action {title!r} has an empty {name} field",
+                        feature_id=feature_id,
+                        path=path,
+                    )
+                )
+    return findings
+
+
+def _feature_regions(lines: list[str]) -> dict[str, str]:
+    ranges = _h2_ranges(lines)
+    regions: dict[str, str] = {}
+    for title, start, end in ranges:
+        regions[title] = "\n".join(lines[start + 1 : end])
+    _, actions = _action_blocks(lines)
+    regions["__actions__"] = "\n".join("\n".join(block) for _, block in actions)
+    return regions
 
 
 def validate_feature_map(skill_root: Path) -> tuple[list[str], list[dict[str, Any]]]:
@@ -234,6 +360,9 @@ def validate_feature_map(skill_root: Path) -> tuple[list[str], list[dict[str, An
         if path.is_symlink():
             findings.append(_finding("doc-drift", "feature file must not be a symlink", feature_id=path.stem, path=relative))
             continue
+        if not path.is_file():
+            findings.append(_finding("doc-drift", "feature entry must be a regular file", feature_id=path.stem, path=relative))
+            continue
         lines = path.read_text(encoding="utf-8").splitlines()
         h1 = [line for line in lines if line.startswith("# ")]
         if len(h1) != 1:
@@ -241,11 +370,7 @@ def validate_feature_map(skill_root: Path) -> tuple[list[str], list[dict[str, An
         sections = _feature_sections(lines)
         if len(sections) != 4 or sections[:2] != list(REQUIRED_FEATURE_SECTIONS[:2]) or not sections[2].startswith(REQUIRED_FEATURE_SECTIONS[2]) or sections[3] != REQUIRED_FEATURE_SECTIONS[3]:
             findings.append(_finding("doc-drift", "feature file has the wrong four-section contract", feature_id=path.stem, path=relative))
-        if "Preconditions:" not in lines:
-            findings.append(_finding("doc-drift", "feature driving section must start with Preconditions:", feature_id=path.stem, path=relative))
-        for label in ("Actors:", "Fixtures:", "Action:", "Expected result:", "Evidence:"):
-            if not _has_label(lines, label):
-                findings.append(_finding("doc-drift", f"feature file is missing {label}", feature_id=path.stem, path=relative))
+        findings.extend(_validate_action_blocks(lines, path.stem, relative))
 
     return feature_ids, findings
 
@@ -256,17 +381,27 @@ def _source_entries(reader: dict[str, Any], label: str) -> list[dict[str, str]]:
         raise MaintainError(f"{label}.source_entries must contain at least one entry")
     entries: list[dict[str, str]] = []
     for index, raw in enumerate(raw_entries):
-        if isinstance(raw, str):
-            entries.append({"path": _text(raw, f"{label}.source_entries[{index}]")})
-            continue
         entry = _mapping(raw, f"{label}.source_entries[{index}]")
-        entries.append(
-            {
-                "path": _text(entry.get("path"), f"{label}.source_entries[{index}].path"),
-                "lines": _text(entry.get("lines", ""), f"{label}.source_entries[{index}].lines", allow_empty=True),
-            }
-        )
+        entry_label = f"{label}.source_entries[{index}]"
+        path = _text(entry.get("path"), f"{entry_label}.path")
+        lines = entry.get("lines", "")
+        symbol = entry.get("symbol", "")
+        if lines is None:
+            lines = ""
+        if symbol is None:
+            symbol = ""
+        lines = _text(lines, f"{entry_label}.lines", allow_empty=True)
+        symbol = _text(symbol, f"{entry_label}.symbol", allow_empty=True)
+        if not lines.strip() and not symbol.strip():
+            raise MaintainError(f"{entry_label} must include a non-empty lines or symbol citation")
+        normalized = {"path": path, "lines": lines, "symbol": symbol}
+        entries.append(normalized)
     return entries
+
+
+def _source_reference(entry: dict[str, str]) -> str:
+    citation = entry.get("lines", "").strip() or entry.get("symbol", "").strip()
+    return f"{entry['path']}:{citation}"
 
 
 def _validate_reader_report(
@@ -302,9 +437,14 @@ def _validate_reader_report(
         reader["source_entries"] = entries
         for entry in entries:
             try:
-                _safe_path(project_root, entry["path"], "source entry", require_exists=True)
+                source_parts = Path(entry["path"]).parts
+                if any(part in {"", ".", ".."} for part in source_parts):
+                    raise MaintainError(f"source entry must be a repository-relative path: {entry['path']}")
+                source_path = _safe_path(project_root, entry["path"], "source entry", require_exists=True)
+                if not source_path.is_file() or source_path.is_symlink():
+                    raise MaintainError(f"source entry must be a regular file: {entry['path']}")
             except MaintainError as exc:
-                findings.append(_finding("blocked", str(exc), feature_id=feature_id, source=entry["path"]))
+                findings.append(_finding("blocked", str(exc), feature_id=feature_id, source=_source_reference(entry)))
         authoritative = _mapping(reader.get("authoritative", {}), f"{label}.authoritative")
         normalized: dict[str, list[str]] = {}
         for field in AUTHORITATIVE_FIELDS:
@@ -341,20 +481,188 @@ def _normalize_live_status(value: Any, label: str) -> str:
     return status
 
 
-def _validate_live_report(
-    report: dict[str, Any], project_root: Path, skill_root: Path, feature_ids: list[str]
-) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
-    doctor = _mapping(report.get("doctor"), "live report doctor")
+def _doctor_value(report: dict[str, Any], field: str) -> Any:
+    aliases = {
+        "target": ("target", "target_root"),
+        "build": ("build", "build_id"),
+        "endpoint": ("endpoint", "endpoint_url"),
+        "auth": ("auth", "auth_state"),
+        "disposable": ("disposable", "disposable_state"),
+    }
+    for key in aliases[field]:
+        if key in report:
+            return report[key]
+    return None
+
+
+def _doctor_validation(skill_root: Path, report: dict[str, Any]) -> dict[str, Any]:
+    """Validate the one Doctor contract used by both audit and doctor."""
+
+    checks: list[dict[str, Any]] = []
+    checks.append({"name": "skill-root", "pass": skill_root.is_dir() and not skill_root.is_symlink()})
+
+    reported_root = report.get("skill_root")
+    root_matches = False
+    if isinstance(reported_root, str) and reported_root.strip():
+        root_matches = _resolved(Path(reported_root)) == skill_root
+    checks.append({"name": "reported-skill-root", "pass": root_matches})
+    checks.append({"name": "doctor-status", "pass": report.get("status") == "pass"})
+    checks.append({"name": "owned-instance", "pass": report.get("owned") is True})
+    checks.append({"name": "healthy-instance", "pass": report.get("healthy") is True})
+    checks.append(
+        {
+            "name": "session-id",
+            "pass": isinstance(report.get("session_id"), str) and bool(report["session_id"].strip()),
+        }
+    )
+    for field in DOCTOR_METADATA_FIELDS:
+        value = _doctor_value(report, field)
+        passed = value is True if field == "disposable" else _metadata_present(value)
+        checks.append({"name": f"{field}-metadata", "pass": passed})
+
+    status = "pass" if all(check["pass"] for check in checks) else "fail"
+    return {"status": status, "checks": checks}
+
+
+def _doctor_findings(validation: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        _finding("doctor-failure", f"Doctor check failed: {check['name']}", path="SKILL.md")
+        for check in validation["checks"]
+        if check["pass"] is not True
+    ]
+
+
+def _report_context(report: dict[str, Any]) -> dict[str, Any]:
+    run = report.get("run", {})
+    if not isinstance(run, dict):
+        run = {}
+    context: dict[str, Any] = {}
+    for field in ("run_id", "session_id", "phase", "apply_id"):
+        value = report.get(field)
+        if value is None:
+            value = run.get(field)
+        context[field] = value
+    return context
+
+
+def _context_findings(
+    report: dict[str, Any], doctor: dict[str, Any], change_receipt: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    context = _report_context(report)
     findings: list[dict[str, Any]] = []
-    reported_root = doctor.get("skill_root")
-    if reported_root is not None:
+    for field in ("run_id", "session_id", "phase"):
+        value = context.get(field)
+        if not isinstance(value, str) or not value.strip():
+            kind = "doctor-failure" if field == "session_id" else "evidence-failure"
+            findings.append(_finding(kind, f"live report is missing run metadata: {field}", path="SKILL.md"))
+    if context.get("phase") not in {"baseline", "post-apply"}:
+        findings.append(_finding("evidence-failure", "live report phase must be baseline or post-apply", path="SKILL.md"))
+
+    doctor_session = doctor.get("session_id")
+    if isinstance(doctor_session, str) and context.get("session_id") != doctor_session:
+        findings.append(_finding("doctor-failure", "live report session does not match the Doctor session", path="SKILL.md"))
+
+    if change_receipt is not None:
+        for field in ("run_id", "session_id", "apply_id"):
+            expected = change_receipt.get(field)
+            actual = context.get(field)
+            if actual != expected:
+                kind = "doctor-failure" if field == "session_id" else "evidence-failure"
+                findings.append(
+                    _finding(
+                        kind,
+                        f"post-apply live receipt {field} does not match the apply receipt",
+                        path="SKILL.md",
+                    )
+                )
+        if context.get("phase") != "post-apply":
+            findings.append(_finding("evidence-failure", "changed proof requires a post-apply live receipt", path="SKILL.md"))
+    return findings
+
+
+def _evidence_for_result(
+    result: dict[str, Any], label: str, project_root: Path, feature_id: str, findings: list[dict[str, Any]]
+) -> bool:
+    try:
+        evidence = _text_list(result.get("evidence"), f"{label}.evidence", allow_empty=False)
+    except MaintainError as exc:
+        findings.append(_finding("evidence-failure", str(exc), feature_id=feature_id))
+        return False
+    evidence_ok = True
+    for raw_path in evidence:
         try:
-            if _resolved(Path(_text(reported_root, "live report doctor.skill_root"))) != _resolved(skill_root):
-                findings.append(_finding("doctor-failure", "Doctor receipt names a different verification skill", path="SKILL.md"))
-        except (OSError, TypeError) as exc:
-            findings.append(_finding("doctor-failure", f"Doctor receipt has an invalid skill root: {exc}", path="SKILL.md"))
-    if doctor.get("status") != "pass" or doctor.get("owned") is not True or doctor.get("healthy") is not True:
-        findings.append(_finding("doctor-failure", "Doctor did not prove an owned, healthy instance", path="SKILL.md"))
+            _external_existing(raw_path, "evidence artifact", project_root)
+        except MaintainError as exc:
+            evidence_ok = False
+            findings.append(_finding("evidence-failure", str(exc), feature_id=feature_id))
+    if result.get("evidence_survives_cleanup") is not True:
+        evidence_ok = False
+        findings.append(
+            _finding(
+                "evidence-failure",
+                "live proof did not confirm evidence survives cleanup",
+                feature_id=feature_id,
+            )
+        )
+    return evidence_ok
+
+
+def _post_apply_feature_findings(
+    result: dict[str, Any], feature_id: str, change_receipt: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    if change_receipt is None or feature_id not in change_receipt.get("affected_features", []):
+        return []
+    findings: list[dict[str, Any]] = []
+    binding = result.get("post_apply")
+    if binding is None:
+        binding = result.get("re_drive")
+    if not isinstance(binding, dict):
+        binding = {}
+
+    redriven = binding.get("redriven")
+    if redriven is None:
+        redriven = binding.get("re_driven")
+    if redriven is None:
+        redriven = result.get("redriven_after_apply")
+    if redriven is not True:
+        findings.append(
+            _finding(
+                "evidence-failure",
+                "affected feature was not explicitly re-driven after the correction",
+                feature_id=feature_id,
+            )
+        )
+
+    for field in ("apply_id", "run_id", "session_id"):
+        actual = binding.get(field, result.get(field))
+        if actual != change_receipt.get(field):
+            findings.append(
+                _finding(
+                    "evidence-failure",
+                    f"affected feature post-apply receipt does not match {field}",
+                    feature_id=feature_id,
+                )
+            )
+    return findings
+
+
+def _validate_live_report(
+    report: dict[str, Any],
+    project_root: Path,
+    skill_root: Path,
+    feature_ids: list[str],
+    change_receipt: dict[str, Any] | None = None,
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    findings: list[dict[str, Any]] = []
+    raw_doctor = report.get("doctor")
+    if isinstance(raw_doctor, dict):
+        doctor = raw_doctor
+    else:
+        doctor = {}
+        findings.append(_finding("doctor-failure", "live report is missing a Doctor receipt", path="SKILL.md"))
+    doctor_validation = _doctor_validation(skill_root, doctor)
+    findings.extend(_doctor_findings(doctor_validation))
+    findings.extend(_context_findings(report, doctor, change_receipt))
 
     raw_features = report.get("features")
     if not isinstance(raw_features, list):
@@ -373,43 +681,53 @@ def _validate_live_report(
             continue
         status = _normalize_live_status(result.get("status"), f"{label}.status")
         result["status"] = status
+        findings.extend(_post_apply_feature_findings(result, feature_id, change_receipt))
         if status == "pass":
-            evidence = _text_list(result.get("evidence"), f"{label}.evidence", allow_empty=False)
-            for raw_path in evidence:
-                try:
-                    _external_existing(raw_path, "evidence artifact", project_root)
-                except MaintainError as exc:
-                    findings.append(_finding("blocked", str(exc), feature_id=feature_id))
-            if result.get("evidence_survives_cleanup") is not True:
-                findings.append(_finding("blocked", "live proof did not confirm evidence survives cleanup", feature_id=feature_id))
+            _evidence_for_result(result, label, project_root, feature_id, findings)
             if result.get("source_match") is not True:
-                findings.append(_finding("doc-drift", "live pass did not confirm the map matches the current source", feature_id=feature_id))
+                findings.append(
+                    _finding(
+                        "evidence-failure",
+                        "live pass did not prove source/map agreement",
+                        feature_id=feature_id,
+                    )
+                )
         elif status == "fail":
-            _text(result.get("route"), f"{label}.route")
-            _text(result.get("observed"), f"{label}.observed")
-            evidence = _text_list(result.get("evidence"), f"{label}.evidence", allow_empty=False)
-            evidence_ok = True
-            for raw_path in evidence:
+            route_ok = True
+            for field in ("route", "observed"):
                 try:
-                    _external_existing(raw_path, "evidence artifact", project_root)
+                    _text(result.get(field), f"{label}.{field}")
                 except MaintainError as exc:
-                    evidence_ok = False
-                    findings.append(_finding("blocked", str(exc), feature_id=feature_id))
-            doctor_healthy = (
-                doctor.get("status") == "pass"
-                and doctor.get("owned") is True
-                and doctor.get("healthy") is True
-            )
+                    route_ok = False
+                    findings.append(_finding("evidence-failure", str(exc), feature_id=feature_id))
+            evidence_ok = _evidence_for_result(result, label, project_root, feature_id, findings)
+            doctor_healthy = doctor_validation["status"] == "pass"
             if result.get("source_match") is True and doctor_healthy and evidence_ok:
                 findings.append(_finding("product-gap", "live behavior failed after source and map agreement", feature_id=feature_id))
-            else:
-                findings.append(_finding("doc-drift", "live failure was not proven against a source-matching map", feature_id=feature_id))
+            elif result.get("source_match") is not True and route_ok:
+                findings.append(
+                    _finding(
+                        "evidence-failure",
+                        "live failure did not include source/map agreement proof",
+                        feature_id=feature_id,
+                    )
+                )
         elif status == "harness-gap":
-            _text(result.get("route"), f"{label}.route")
-            findings.append(_finding("harness-gap", _text(result.get("reason"), f"{label}.reason"), feature_id=feature_id))
+            try:
+                route = _text(result.get("route"), f"{label}.route")
+                reason = _text(result.get("reason"), f"{label}.reason")
+            except MaintainError as exc:
+                findings.append(_finding("harness-gap", str(exc), feature_id=feature_id))
+            else:
+                findings.append(_finding("harness-gap", f"{route}: {reason}", feature_id=feature_id))
         elif status == "verified-unreachable":
-            _text(result.get("route"), f"{label}.route")
-            prerequisite = _text(result.get("prerequisite"), f"{label}.prerequisite")
+            try:
+                _text(result.get("route"), f"{label}.route")
+                prerequisite = _text(result.get("prerequisite"), f"{label}.prerequisite")
+            except MaintainError as exc:
+                findings.append(_finding("evidence-failure", str(exc), feature_id=feature_id))
+                by_id[feature_id] = result
+                continue
             feature_path = skill_root / "features" / f"{feature_id}.md"
             if feature_path.is_symlink() or not feature_path.is_file():
                 findings.append(_finding("blocked", "feature file disappeared before the live receipt was reconciled", feature_id=feature_id))
@@ -430,7 +748,11 @@ def _validate_live_report(
                 )
             )
         else:
-            findings.append(_finding("blocked", _text(result.get("reason"), f"{label}.reason"), feature_id=feature_id))
+            try:
+                reason = _text(result.get("reason"), f"{label}.reason")
+            except MaintainError as exc:
+                reason = str(exc)
+            findings.append(_finding("blocked", reason, feature_id=feature_id))
         by_id[feature_id] = result
 
     for feature_id in sorted(expected - set(by_id)):
@@ -438,16 +760,119 @@ def _validate_live_report(
     return by_id, findings
 
 
+def _validate_change_receipt(
+    path: Path | None, skill_root: Path, feature_ids: list[str]
+) -> tuple[dict[str, Any] | None, list[str], bool, list[dict[str, Any]]]:
+    """Validate the receipt emitted by apply before it can produce changed."""
+
+    if path is None:
+        return None, [], False, []
+    receipt = _load_json(path)
+    findings: list[dict[str, Any]] = []
+
+    if receipt.get("receipt_version") != RECEIPT_VERSION:
+        findings.append(_finding("evidence-failure", "change receipt has an unsupported receipt_version"))
+    if receipt.get("outcome") != "changed":
+        findings.append(_finding("evidence-failure", "change receipt does not record a changed apply"))
+    for field in ("apply_id", "run_id", "session_id"):
+        if not isinstance(receipt.get(field), str) or not receipt[field].strip():
+            findings.append(_finding("evidence-failure", f"change receipt is missing {field}"))
+
+    reported_root = receipt.get("skill_root")
+    if not isinstance(reported_root, str) or _resolved(Path(reported_root)) != skill_root:
+        findings.append(_finding("evidence-failure", "change receipt names a different verification skill"))
+
+    try:
+        changed_files = _text_list(receipt.get("changed_files"), "change receipt changed_files", allow_empty=False)
+    except MaintainError as exc:
+        findings.append(_finding("evidence-failure", str(exc)))
+        changed_files = []
+    for relative in changed_files:
+        try:
+            changed_path = _safe_path(skill_root, relative, "change receipt path", require_exists=True)
+            if changed_path.is_symlink() or not changed_path.is_file():
+                raise MaintainError(f"change receipt path must be a regular file: {relative}")
+        except MaintainError as exc:
+            findings.append(_finding("evidence-failure", str(exc)))
+
+    try:
+        affected_features = _text_list(
+            receipt.get("affected_features"), "change receipt affected_features", allow_empty=False
+        )
+    except MaintainError as exc:
+        findings.append(_finding("evidence-failure", str(exc)))
+        affected_features = []
+    for feature_id in affected_features:
+        if feature_id not in feature_ids:
+            findings.append(_finding("evidence-failure", f"change receipt names unknown feature {feature_id}", feature_id=feature_id))
+
+    raw_changes = receipt.get("changes")
+    if not isinstance(raw_changes, list) or not raw_changes:
+        findings.append(_finding("evidence-failure", "change receipt must contain changes"))
+    else:
+        change_paths: list[str] = []
+        change_feature_ids: set[str] = set()
+        for index, raw_change in enumerate(raw_changes):
+            label = f"change receipt changes[{index}]"
+            if not isinstance(raw_change, dict):
+                findings.append(_finding("evidence-failure", f"{label} must be an object"))
+                continue
+            try:
+                change_path = _text(raw_change.get("path"), f"{label}.path")
+            except MaintainError as exc:
+                findings.append(_finding("evidence-failure", str(exc)))
+                continue
+            if raw_change.get("kind") not in PATCH_KINDS:
+                findings.append(_finding("evidence-failure", f"{label}.kind is not an applicable correction kind"))
+            if change_path not in changed_files:
+                findings.append(_finding("evidence-failure", f"{label}.path is not in changed_files"))
+            change_paths.append(change_path)
+            try:
+                change_features = _text_list(
+                    raw_change.get("feature_ids"), f"{label}.feature_ids", allow_empty=False
+                )
+            except MaintainError as exc:
+                findings.append(_finding("evidence-failure", str(exc)))
+                continue
+            if not set(change_features).intersection(affected_features):
+                findings.append(_finding("evidence-failure", f"{label} does not identify an affected feature"))
+            change_feature_ids.update(change_features)
+        if set(change_paths) != set(changed_files):
+            findings.append(_finding("evidence-failure", "change receipt changes do not cover changed_files"))
+        if change_feature_ids != set(affected_features):
+            findings.append(_finding("evidence-failure", "change receipt affected_features do not match its changes"))
+
+    raw_digests = receipt.get("file_digests")
+    if not isinstance(raw_digests, dict):
+        findings.append(_finding("evidence-failure", "change receipt must contain file_digests"))
+    else:
+        for relative in changed_files:
+            digest = raw_digests.get(relative)
+            if not isinstance(digest, str) or not digest.strip():
+                findings.append(_finding("evidence-failure", f"change receipt is missing the digest for {relative}"))
+                continue
+            try:
+                changed_path = _safe_path(skill_root, relative, "change receipt path", require_exists=True)
+                if _sha256(changed_path) != digest:
+                    findings.append(_finding("evidence-failure", f"changed file does not match its apply receipt: {relative}"))
+            except (MaintainError, OSError) as exc:
+                findings.append(_finding("evidence-failure", str(exc)))
+
+    return receipt, changed_files, not findings, findings
+
+
 def _load_change_log(path: Path | None, skill_root: Path) -> list[str]:
+    """Compatibility wrapper for callers that only need the changed paths."""
+
     if path is None:
         return []
     raw = _load_json(path)
-    values = raw.get("changed_files", [])
-    changed_files = _text_list(values, "change log changed_files")
-    for relative in changed_files:
-        if Path(relative).is_absolute():
-            raise MaintainError(f"change log path must be relative to the verification skill: {relative}")
-        _safe_path(skill_root, relative, "change log path", require_exists=True)
+    affected = raw.get("affected_features", [])
+    feature_ids = _text_list(affected, "change receipt affected_features", allow_empty=True)
+    _, changed_files, valid, findings = _validate_change_receipt(path, skill_root, feature_ids)
+    if not valid:
+        message = findings[0]["message"] if findings else "change receipt is invalid"
+        raise MaintainError(message)
     return changed_files
 
 
@@ -461,7 +886,7 @@ def audit(
     """Return a source/live classification without writing to the project."""
 
     skill_root = _real_directory(skill_root, "skill root")
-    project_root = _resolved(project_root)
+    project_root = _real_directory(project_root, "project root")
     feature_ids, map_findings = validate_feature_map(skill_root)
     reader_report = _load_json(reader_report_path)
     live_report = _load_json(live_report_path)
@@ -472,27 +897,32 @@ def audit(
         feature_path = skill_root / "features" / f"{feature_id}.md"
         if not feature_path.is_file() or feature_path.is_symlink():
             continue
-        feature_text = feature_path.read_text(encoding="utf-8")
+        regions = _feature_regions(feature_path.read_text(encoding="utf-8").splitlines())
         for field, values in reader["authoritative"].items():
+            region = regions.get("How to get to it (user POV)", "") if field == "entry_points" else regions.get("__actions__", "")
             for value in values:
-                if value not in feature_text:
-                    source = ", ".join(entry["path"] for entry in reader["source_entries"])
+                if value not in region:
+                    source = ", ".join(_source_reference(entry) for entry in reader["source_entries"])
                     reader_findings.append(
                         _finding(
                             "doc-drift",
-                            f"{field} from the source reader is absent from the feature recipe: {value}",
+                            f"{field} from the source reader is absent from the action recipe: {value}",
                             feature_id=feature_id,
                             path=f"features/{feature_id}.md",
                             source=source,
                         )
                     )
-    _, live_findings = _validate_live_report(live_report, project_root, skill_root, feature_ids)
-    findings = map_findings + reader_findings + live_findings
-    changed_files = _load_change_log(change_log_path, skill_root)
+    change_receipt, changed_files, receipt_valid, receipt_findings = _validate_change_receipt(
+        change_log_path, skill_root, feature_ids
+    )
+    _, live_findings = _validate_live_report(
+        live_report, project_root, skill_root, feature_ids, change_receipt if change_log_path else None
+    )
+    findings = map_findings + reader_findings + receipt_findings + live_findings
     blocking = [item for item in findings if item.get("blocking") is True]
     if blocking:
         outcome = "blocked"
-    elif changed_files:
+    elif change_log_path is not None and receipt_valid and changed_files:
         outcome = "changed"
     else:
         outcome = "clean"
@@ -527,7 +957,13 @@ def _atomic_write(path: Path, text: str) -> None:
                 pass
 
 
-def apply_patch_plan(skill_root: Path, patch_plan_path: Path) -> dict[str, Any]:
+def apply_patch_plan(
+    skill_root: Path,
+    patch_plan_path: Path,
+    *,
+    run_id: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, Any]:
     """Apply only explicit doc or harness replacements below skill_root."""
 
     skill_root = _real_directory(skill_root, "skill root")
@@ -538,7 +974,12 @@ def apply_patch_plan(skill_root: Path, patch_plan_path: Path) -> dict[str, Any]:
 
     originals: dict[Path, str] = {}
     proposed: dict[Path, str] = {}
-    metadata: list[dict[str, str]] = []
+    metadata: list[dict[str, Any]] = []
+    plan_features = plan.get("affected_features")
+    if plan_features is None:
+        plan_features = plan.get("feature_ids")
+    if plan_features is not None:
+        plan_features = _text_list(plan_features, "patch plan affected_features", allow_empty=False)
     for index, raw_change in enumerate(changes):
         label = f"changes[{index}]"
         change = _mapping(raw_change, label)
@@ -557,6 +998,14 @@ def apply_patch_plan(skill_root: Path, patch_plan_path: Path) -> dict[str, Any]:
         _text(change.get("source"), f"{label}.source")
         if old == new:
             raise MaintainError(f"{label} does not change its target")
+        change_features = change.get("feature_ids")
+        if change_features is None:
+            change_features = change.get("affected_features")
+        if change_features is None:
+            change_features = plan_features
+        if change_features is None and raw_path.startswith("features/") and raw_path.endswith(".md"):
+            change_features = [Path(raw_path).stem]
+        change_features = _text_list(change_features, f"{label}.feature_ids", allow_empty=False)
         if path not in originals:
             originals[path] = path.read_text(encoding="utf-8")
             proposed[path] = originals[path]
@@ -564,7 +1013,16 @@ def apply_patch_plan(skill_root: Path, patch_plan_path: Path) -> dict[str, Any]:
         if count != 1:
             raise MaintainError(f"{label}.old must occur exactly once in {raw_path}, found {count}")
         proposed[path] = proposed[path].replace(old, new, 1)
-        metadata.append({"path": raw_path, "kind": kind})
+        metadata.append({"path": raw_path, "kind": kind, "feature_ids": change_features})
+
+    affected_features = sorted({feature_id for change in metadata for feature_id in change["feature_ids"]})
+    if not affected_features:
+        raise MaintainError("patch plan must identify at least one affected feature")
+    apply_id = _new_id("apply")
+    run_id = run_id or plan.get("run_id") or _new_id("run")
+    session_id = session_id or plan.get("session_id") or _new_id("session")
+    run_id = _text(run_id, "apply run_id")
+    session_id = _text(session_id, "apply session_id")
 
     written: list[Path] = []
     try:
@@ -575,9 +1033,17 @@ def apply_patch_plan(skill_root: Path, patch_plan_path: Path) -> dict[str, Any]:
         for path in written:
             _atomic_write(path, originals[path])
         raise
+    changed_files = [path.relative_to(skill_root).as_posix() for path in proposed]
     return {
+        "receipt_version": RECEIPT_VERSION,
         "outcome": "changed",
-        "changed_files": [path.relative_to(skill_root).as_posix() for path in proposed],
+        "apply_id": apply_id,
+        "run_id": run_id,
+        "session_id": session_id,
+        "skill_root": str(skill_root),
+        "affected_features": affected_features,
+        "changed_files": changed_files,
+        "file_digests": {relative: _sha256(skill_root / relative) for relative in changed_files},
         "changes": metadata,
     }
 
@@ -587,18 +1053,7 @@ def doctor(skill_root: Path, report_path: Path) -> dict[str, Any]:
 
     skill_root = _real_directory(skill_root, "skill root")
     report = _load_json(report_path)
-    checks: list[dict[str, Any]] = []
-    checks.append({"name": "skill-root", "pass": skill_root.is_dir() and not skill_root.is_symlink()})
-    reported_root = report.get("skill_root")
-    root_matches = False
-    if isinstance(reported_root, str):
-        root_matches = _resolved(Path(reported_root)) == skill_root
-    checks.append({"name": "reported-skill-root", "pass": root_matches})
-    checks.append({"name": "owned-instance", "pass": report.get("owned") is True})
-    checks.append({"name": "healthy-instance", "pass": report.get("healthy") is True})
-    checks.append({"name": "session-id", "pass": isinstance(report.get("session_id"), str) and bool(report["session_id"].strip())})
-    status = "pass" if all(check["pass"] for check in checks) else "fail"
-    return {"status": status, "checks": checks}
+    return _doctor_validation(skill_root, report)
 
 
 def _cleanup_path(run_root: Path, raw: str) -> Path:
@@ -608,15 +1063,59 @@ def _cleanup_path(run_root: Path, raw: str) -> Path:
     return _safe_path(run_root, raw, "owned cleanup path")
 
 
-def cleanup(run_root: Path, manifest_path: Path, project_root: Path | None = None) -> dict[str, Any]:
+def _path_overlaps(left: Path, right: Path) -> bool:
+    return _is_relative_to(left, right) or _is_relative_to(right, left)
+
+
+def _cleanup_protected_roots(project_root: Path, skill_root: Path | None) -> list[Path]:
+    roots = [project_root]
+    if skill_root is not None:
+        roots.append(skill_root)
+    for relative in (".agents/skills", ".cursor/skills", ".codex/skills"):
+        candidate = project_root / relative
+        if candidate.is_dir() and not candidate.is_symlink():
+            roots.append(candidate.resolve())
+    return roots
+
+
+def cleanup(
+    run_root: Path,
+    manifest_path: Path,
+    project_root: Path | None = None,
+    skill_root: Path | None = None,
+) -> dict[str, Any]:
     """Remove only owned scratch paths and verify evidence remains."""
 
     run_root = _real_directory(run_root, "run root")
+    if project_root is None:
+        raise MaintainError("cleanup requires --project-root to protect product files")
+    project_root = _real_directory(project_root, "project root")
+    if skill_root is not None:
+        skill_root = _real_directory(skill_root, "skill root")
+    protected_roots = _cleanup_protected_roots(project_root, skill_root)
+    if any(_is_relative_to(run_root, protected) for protected in protected_roots):
+        raise MaintainError("run root must be outside the project and verification roots")
+
+    manifest_path = manifest_path.expanduser()
+    if manifest_path.is_symlink() or not manifest_path.is_file():
+        raise MaintainError(f"cleanup manifest must be a regular file: {manifest_path}")
+    manifest_path = manifest_path.resolve()
+    if not _is_relative_to(manifest_path, run_root):
+        raise MaintainError("cleanup manifest must be inside the disposable run root")
     manifest = _load_json(manifest_path)
     owned = _text_list(manifest.get("owned_paths"), "owned_paths", allow_empty=True)
     evidence = _text_list(manifest.get("evidence_paths"), "evidence_paths", allow_empty=False)
     owned_paths = [_cleanup_path(run_root, raw) for raw in owned]
     evidence_paths = [_external_existing(raw, "evidence artifact", project_root) for raw in evidence]
+    for index, path in enumerate(owned_paths):
+        if any(_path_overlaps(path, protected) for protected in protected_roots):
+            raise MaintainError(f"owned cleanup target is inside or contains a protected root: {owned[index]}")
+        if any(index != other and _path_overlaps(path, other_path) for other, other_path in enumerate(owned_paths)):
+            raise MaintainError(f"owned cleanup targets overlap: {owned[index]}")
+        if path == manifest_path or _is_relative_to(manifest_path, path):
+            raise MaintainError(f"owned cleanup target would remove its manifest: {owned[index]}")
+        if (os.path.lexists(path) and not (path.is_file() or path.is_dir())) or path.is_symlink():
+            raise MaintainError(f"owned cleanup target is not a regular file or directory: {owned[index]}")
     for evidence_path in evidence_paths:
         if any(evidence_path == owned_path or _is_relative_to(evidence_path, owned_path) for owned_path in owned_paths):
             raise MaintainError(f"cleanup would remove evidence: {evidence_path}")
@@ -625,7 +1124,7 @@ def cleanup(run_root: Path, manifest_path: Path, project_root: Path | None = Non
     for path in owned_paths:
         if not os.path.lexists(path):
             continue
-        if path.is_symlink() or path.is_file():
+        if path.is_file():
             path.unlink()
         elif path.is_dir():
             shutil.rmtree(path)
@@ -664,6 +1163,8 @@ def build_parser() -> argparse.ArgumentParser:
     apply_parser = subparsers.add_parser("apply", help="apply an explicit safe patch plan")
     apply_parser.add_argument("--skill-root", required=True)
     apply_parser.add_argument("--patch-plan", required=True)
+    apply_parser.add_argument("--run-id")
+    apply_parser.add_argument("--session-id")
     apply_parser.add_argument("--json", action="store_true")
 
     doctor_parser = subparsers.add_parser("doctor", help="validate an owned, healthy Doctor receipt")
@@ -674,7 +1175,8 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_parser = subparsers.add_parser("cleanup", help="remove owned scratch paths and retain evidence")
     cleanup_parser.add_argument("--run-root", required=True)
     cleanup_parser.add_argument("--manifest", required=True)
-    cleanup_parser.add_argument("--project-root")
+    cleanup_parser.add_argument("--project-root", required=True)
+    cleanup_parser.add_argument("--skill-root")
     cleanup_parser.add_argument("--json", action="store_true")
     return parser
 
@@ -693,7 +1195,12 @@ def main(argv: list[str] | None = None) -> int:
             _print_payload(payload, args.json)
             return 1 if payload["outcome"] == "blocked" else 0
         if args.command == "apply":
-            payload = apply_patch_plan(Path(args.skill_root), Path(args.patch_plan))
+            payload = apply_patch_plan(
+                Path(args.skill_root),
+                Path(args.patch_plan),
+                run_id=args.run_id,
+                session_id=args.session_id,
+            )
             _print_payload(payload, args.json)
             return 0
         if args.command == "doctor":
@@ -703,7 +1210,8 @@ def main(argv: list[str] | None = None) -> int:
         payload = cleanup(
             Path(args.run_root),
             Path(args.manifest),
-            Path(args.project_root) if args.project_root else None,
+            Path(args.project_root),
+            Path(args.skill_root) if args.skill_root else None,
         )
         _print_payload(payload, args.json)
         return 0
