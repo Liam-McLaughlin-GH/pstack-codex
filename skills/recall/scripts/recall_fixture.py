@@ -35,8 +35,21 @@ STATUS_PATTERNS = (
     re.compile(r"^\[reverted #[1-9][0-9]*\]$"),
     re.compile(r"^\[planned, not started\]$"),
 )
+LOG_TIMESTAMP_PATTERN = (
+    r"\d{4}-\d{2}-\d{2}"
+    r"(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?"
+)
+LOG_PREFIX_PATTERN = re.compile(
+    rf"^(?:\[{LOG_TIMESTAMP_PATTERN}\]|{LOG_TIMESTAMP_PATTERN})"
+    r"(?:\s+[A-Za-z][A-Za-z0-9_.-]*)?\s+"
+)
+ROLE_PREFIX_PATTERN = re.compile(
+    r"^(?:user|assistant|system|developer|tool)\s*:\s*",
+    flags=re.IGNORECASE,
+)
+MARKDOWN_PREFIX_PATTERN = re.compile(r"^(?:[-*+]\s+|#{1,6}\s+)")
 TEXT_FIELD_PATTERN = re.compile(
-    r"(?i)(?<![A-Za-z0-9_])"
+    r"(?i)^"
     r"(?P<label>codex[- _]?recall[- _]?export|"
     r"modified(?:[_ -]?at)?|timestamp|"
     r"next(?:[_ -]?move)?|"
@@ -46,7 +59,10 @@ TEXT_FIELD_PATTERN = re.compile(
     r"decision|verified|verification|evidence|fact|"
     r"assumption|inference|unknown|missing|problem|blocker|todo|"
     r"issue|commit|claim)"
-    r"\s*:\s*(?P<value>.*)$"
+    r"\s*:\s*(?P<value>[^\r\n]*)$"
+)
+EXPORT_MARKER_PATTERN = re.compile(
+    r"(?i)^codex[- _]?recall[- _]?export\s*:\s*(?P<version>[^\s]+)$"
 )
 MAX_ARTIFACTS = 32
 MAX_FILE_BYTES = 1_000_000
@@ -176,6 +192,12 @@ def resolve_artifact(workspace: Path, raw_artifact: str) -> Path:
             f"{quote_path(raw_artifact)}"
         )
     candidate = Path(raw_artifact).expanduser()
+    supplied_suffix = candidate.suffix.lower()
+    if supplied_suffix not in ALLOWED_SUFFIXES:
+        raise RecallError(
+            f"unsupported artifact type {candidate.suffix or '<none>'!r}: "
+            f"{quote_path(raw_artifact)}"
+        )
     if not candidate.is_absolute():
         candidate = workspace / candidate
     try:
@@ -195,9 +217,10 @@ def resolve_artifact(workspace: Path, raw_artifact: str) -> Path:
             "artifact path contains unsafe control or line-separator characters after "
             f"resolution: {quote_path(relative)}"
         )
-    if resolved.suffix.lower() not in ALLOWED_SUFFIXES:
+    resolved_suffix = resolved.suffix.lower()
+    if resolved_suffix not in ALLOWED_SUFFIXES or resolved_suffix != supplied_suffix:
         raise RecallError(
-            f"unsupported artifact type {resolved.suffix or '<none>'!r}: "
+            f"artifact suffix does not match its resolved target: "
             f"{quote_path(raw_artifact)}"
         )
     return resolved
@@ -517,17 +540,24 @@ def normalize_label(label: str) -> str:
     return re.sub(r"_+", "_", label.lower().replace("-", "_").replace(" ", "_"))
 
 
-def extract_text_field(line: str) -> tuple[str, str] | None:
+def strip_allowed_text_prefixes(line: str) -> str:
+    """Remove only documented line prefixes before parsing a text field."""
+
     candidate = line.strip()
-    candidate = re.sub(r"^(?:[-*+]\s+|#{1,6}\s+)", "", candidate)
-    candidate = re.sub(r"^\[[^\]\r\n]{1,80}\]\s*", "", candidate)
-    candidate = re.sub(
-        r"^(?:user|assistant|system|developer|tool)\s*:\s*",
-        "",
-        candidate,
-        flags=re.IGNORECASE,
-    )
-    match = TEXT_FIELD_PATTERN.search(candidate)
+    while candidate:
+        for pattern in (MARKDOWN_PREFIX_PATTERN, ROLE_PREFIX_PATTERN, LOG_PREFIX_PATTERN):
+            match = pattern.match(candidate)
+            if match is not None:
+                candidate = candidate[match.end() :].lstrip()
+                break
+        else:
+            break
+    return candidate
+
+
+def extract_text_field(line: str) -> tuple[str, str] | None:
+    candidate = strip_allowed_text_prefixes(line)
+    match = TEXT_FIELD_PATTERN.fullmatch(candidate)
     if not match:
         return None
     value = match.group("value").strip().strip("*`").strip()
@@ -550,9 +580,10 @@ def iter_text_lines(text: str) -> Iterable[str]:
 def export_marker_versions(text: str) -> list[str]:
     versions: list[str] = []
     for line in iter_text_lines(text):
-        field = extract_text_field(line)
-        if field is not None and field[0] == "codex_recall_export":
-            versions.append(field[1])
+        candidate = strip_allowed_text_prefixes(line)
+        match = EXPORT_MARKER_PATTERN.fullmatch(candidate)
+        if match is not None:
+            versions.append(match.group("version"))
     return versions
 
 
