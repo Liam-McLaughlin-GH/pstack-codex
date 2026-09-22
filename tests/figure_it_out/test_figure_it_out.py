@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -376,6 +378,86 @@ class WorkflowBehaviorTests(unittest.TestCase):
             with self.assertRaises(figure_it_out.StateError) as start_error:
                 valid_workflow.start_phase()
             self.assertIn("missing required fields", str(start_error.exception))
+
+    def test_persisted_state_rejects_incomplete_phase_predicate_and_checkpoint_records(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            workflow.start_phase()
+            workflow.checkpoint("checkpoint", ["artifacts/checkpoint.txt"], "complete phase-1")
+            workflow.complete_phase(
+                "completed output",
+                {"check_id": "check-1", "passed": True, "evidence": ["tests/phase-pass.txt"]},
+            )
+            workflow.record_predicate("focused-tests", True, ["tests/focused.txt"])
+            workflow.record_predicate("artifact-inspection", True, ["artifacts/inspection.txt"])
+            state_path = root / "run.json"
+            valid_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+            malformed_cases = {
+                "passed phase without output": lambda state: state["phases"][0].update(output_value=None),
+                "passed phase without verification": lambda state: state["phases"][0].update(verification_result=None),
+                "phase verification with empty evidence": lambda state: state["phases"][0]["verification_result"].update(evidence=[]),
+                "verified predicate with empty evidence": lambda state: state["predicate_results"]["focused-tests"].update(evidence=[]),
+                "verified predicate with placeholder evidence": lambda state: state["predicate_results"]["focused-tests"].update(evidence=["checked"]),
+                "checkpoint with empty evidence": lambda state: state["checkpoints"][0].update(evidence=[]),
+                "phase with incomplete checkpoint reference": lambda state: state["phases"][0].update(checkpoints=["cp-missing"]),
+            }
+            for label, mutate in malformed_cases.items():
+                with self.subTest(case=label):
+                    malformed = deepcopy(valid_state)
+                    mutate(malformed)
+                    state_path.write_text(json.dumps(malformed), encoding="utf-8")
+                    with self.assertRaises(figure_it_out.StateError):
+                        figure_it_out.Workflow.load(state_path, workspace_root=root)
+
+            workflow.state["checkpoints"][0]["evidence"] = []
+            with self.assertRaises(figure_it_out.StateError):
+                workflow.finish()
+
+    def test_cli_audit_rejects_existing_non_regular_destinations_without_traceback_or_overwrite(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            state_path = root / "run.json"
+            destinations = {
+                "directory": root / "audit-directory",
+                "fifo": root / "audit-fifo",
+            }
+            destinations["directory"].mkdir()
+            (destinations["directory"] / "marker.txt").write_text("preserve", encoding="utf-8")
+            os.mkfifo(destinations["fifo"])
+
+            for kind, destination in destinations.items():
+                with self.subTest(destination=kind):
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(SCRIPT),
+                            "audit",
+                            "--state",
+                            str(state_path),
+                            "--workspace-root",
+                            str(root),
+                            "--output",
+                            str(destination),
+                        ],
+                        cwd=ROOT,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    error = json.loads(result.stderr)
+                    self.assertEqual(error["status"], "refused")
+                    self.assertEqual(error["refusal"]["status"], "refused")
+                    self.assertTrue(error["refusal"]["next_action"])
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertEqual(result.stdout, "")
+
+            self.assertTrue((destinations["directory"] / "marker.txt").is_file())
+            self.assertTrue(stat.S_ISDIR(destinations["directory"].stat().st_mode))
+            self.assertTrue(stat.S_ISFIFO(destinations["fifo"].stat().st_mode))
 
     def test_cli_replan_rejects_invalid_json_without_traceback(self):
         with tempfile.TemporaryDirectory() as directory:

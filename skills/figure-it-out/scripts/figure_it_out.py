@@ -8,6 +8,7 @@ import csv
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 import unicodedata
@@ -323,7 +324,7 @@ def _state_path(path: str | os.PathLike[str], workspace_root: str | os.PathLike[
     root = root.absolute().resolve()
     candidate = raw if raw.is_absolute() else root / raw
     candidate = candidate.absolute()
-    if candidate.exists() and candidate.is_symlink():
+    if candidate.is_symlink():
         raise ScopeRefusal(
             "state path must not be a symlink",
             {"status": "refused", "reason": "state path is a symlink", "next_action": "choose a regular local state path"},
@@ -341,9 +342,55 @@ def _state_path(path: str | os.PathLike[str], workspace_root: str | os.PathLike[
     return candidate, root
 
 
-def _state_text(value: Any, field: str) -> None:
-    if not isinstance(value, str) or not value.strip():
-        raise StateError(f"invalid state: {field} must be a non-empty string")
+def _state_text(value: Any, field: str, *, max_length: int = MAX_TEXT) -> None:
+    try:
+        _text(value, field, max_length=max_length)
+    except PlanError as exc:
+        raise StateError(f"invalid state: {exc}") from exc
+
+
+def _state_evidence(value: Any, field: str) -> None:
+    if not isinstance(value, list):
+        raise StateError(f"invalid state: {field} must be a list")
+    try:
+        _evidence(value, field)
+    except (PlanError, TypeError, ValueError, KeyError, AttributeError) as exc:
+        raise StateError(f"invalid state: {exc}") from exc
+
+
+def _state_output(value: Any, field: str) -> None:
+    if value is None:
+        return
+    if value == "" or value == {} or value == []:
+        raise StateError(f"invalid state: {field} must be present")
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError) as exc:
+        raise StateError(f"invalid state: {field} must be JSON serializable") from exc
+
+
+def _state_phase_verification(value: Any, field: str, expected_check_id: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, Mapping):
+        raise StateError(f"invalid state: {field} must be an object or null")
+    _require_state_fields(value, {"check_id", "passed", "evidence", "observed"}, field)
+    if value["check_id"] != expected_check_id or value["passed"] is not True:
+        raise StateError(f"invalid state: {field} has an invalid check result")
+    _state_evidence(value["evidence"], f"{field}.evidence")
+    _state_text(value["observed"], f"{field}.observed", max_length=1000)
+
+
+def _state_failure(value: Any, field: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, Mapping):
+        raise StateError(f"invalid state: {field} must be an object or null")
+    _require_state_fields(value, {"reason", "evidence", "next_action", "at"}, field)
+    _state_text(value["reason"], f"{field}.reason", max_length=1000)
+    _state_evidence(value["evidence"], f"{field}.evidence")
+    _state_text(value["next_action"], f"{field}.next_action", max_length=1000)
+    _state_text(value["at"], f"{field}.at")
 
 
 def _require_state_fields(value: Mapping[str, Any], fields: set[str], label: str) -> None:
@@ -402,6 +449,7 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
     if len(phases) != len(validated_plan["phases"]):
         raise StateError("invalid state: phases do not match the plan")
     phase_ids = [phase["id"] for phase in validated_plan["phases"]]
+    phase_checkpoint_refs: dict[str, list[str]] = {}
     for index, (phase, spec) in enumerate(zip(phases, validated_plan["phases"])):
         if not isinstance(phase, Mapping):
             raise StateError(f"invalid state: phases[{index}] must be an object")
@@ -422,22 +470,51 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
             },
             f"phases[{index}]",
         )
-        if phase["id"] != spec["id"]:
-            raise StateError(f"invalid state: phases[{index}].id does not match the plan")
+        for field in ("id", "name", "hypothesis", "output", "verification"):
+            if phase[field] != spec[field]:
+                raise StateError(f"invalid state: phases[{index}].{field} does not match the plan")
         if not isinstance(phase["status"], str) or phase["status"] not in PHASE_STATUSES:
             raise StateError(f"invalid state: phases[{index}].status is not supported")
-        if isinstance(phase["attempt"], bool) or not isinstance(phase["attempt"], int) or phase["attempt"] < 0:
+        if (
+            isinstance(phase["attempt"], bool)
+            or not isinstance(phase["attempt"], int)
+            or not 0 <= phase["attempt"] <= validated_plan["limits"]["max_attempts_per_phase"]
+        ):
             raise StateError(f"invalid state: phases[{index}].attempt must be a non-negative integer")
-        if not isinstance(phase["verification"], Mapping):
-            raise StateError(f"invalid state: phases[{index}].verification must be an object")
-        if phase["verification"] != spec["verification"]:
-            raise StateError(f"invalid state: phases[{index}].verification does not match the plan")
         if not isinstance(phase["checkpoints"], list):
             raise StateError(f"invalid state: phases[{index}].checkpoints must be a list")
-        if phase["verification_result"] is not None and not isinstance(phase["verification_result"], Mapping):
-            raise StateError(f"invalid state: phases[{index}].verification_result must be an object or null")
-        if phase["failure"] is not None and not isinstance(phase["failure"], Mapping):
-            raise StateError(f"invalid state: phases[{index}].failure must be an object or null")
+        checkpoint_refs: list[str] = []
+        for checkpoint_index, checkpoint_id in enumerate(phase["checkpoints"]):
+            _state_text(checkpoint_id, f"phases[{index}].checkpoints[{checkpoint_index}]", max_length=100)
+            checkpoint_refs.append(checkpoint_id)
+        if len(checkpoint_refs) != len(set(checkpoint_refs)):
+            raise StateError(f"invalid state: phases[{index}].checkpoints contains duplicates")
+        phase_checkpoint_refs[phase["id"]] = checkpoint_refs
+
+        output_value = phase["output_value"]
+        _state_output(output_value, f"phases[{index}].output_value")
+        verification_result = phase["verification_result"]
+        _state_phase_verification(
+            verification_result,
+            f"phases[{index}].verification_result",
+            spec["verification"]["id"],
+        )
+        failure = phase["failure"]
+        _state_failure(failure, f"phases[{index}].failure")
+        if phase["status"] == "passed":
+            if output_value is None:
+                raise StateError(f"invalid state: phases[{index}].passed phase is missing output_value")
+            if verification_result is None:
+                raise StateError(f"invalid state: phases[{index}].passed phase is missing verification_result")
+            if failure is not None:
+                raise StateError(f"invalid state: phases[{index}].passed phase has a failure")
+        else:
+            if output_value is not None or verification_result is not None:
+                raise StateError(f"invalid state: phases[{index}] has output or verification before passing")
+        if phase["status"] == "failed" and failure is None:
+            raise StateError(f"invalid state: phases[{index}].failed phase is missing failure")
+        if phase["status"] != "failed" and failure is not None:
+            raise StateError(f"invalid state: phases[{index}] has failure outside failed status")
 
     current_phase = state["current_phase"]
     if current_phase is not None and (not isinstance(current_phase, str) or current_phase not in phase_ids):
@@ -471,9 +548,12 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
         _require_state_fields(result, {"check_id", "passed", "status", "evidence", "observed", "at"}, f"predicate_results[{check_id}]")
         if result["check_id"] != check_id or not isinstance(result["passed"], bool):
             raise StateError(f"invalid state: predicate_results[{check_id}] has an invalid check result")
-        if not isinstance(result["status"], str) or result["status"] not in CHECK_STATUSES or not isinstance(result["evidence"], list):
-            raise StateError(f"invalid state: predicate_results[{check_id}] has an invalid status or evidence")
-        _state_text(result["observed"], f"predicate_results[{check_id}].observed")
+        if not isinstance(result["status"], str) or result["status"] not in CHECK_STATUSES:
+            raise StateError(f"invalid state: predicate_results[{check_id}] has an invalid status")
+        if (result["status"] == "verified") != result["passed"]:
+            raise StateError(f"invalid state: predicate_results[{check_id}] has an invalid passed/status pair")
+        _state_evidence(result["evidence"], f"predicate_results[{check_id}].evidence")
+        _state_text(result["observed"], f"predicate_results[{check_id}].observed", max_length=1000)
         _state_text(result["at"], f"predicate_results[{check_id}].at")
 
     for index, decision in enumerate(state["decisions"]):
@@ -482,8 +562,9 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
         _require_state_fields(decision, {"at", "phase", "decision", "why", "evidence", "result"}, f"decisions[{index}]")
         for field in ("at", "phase", "decision", "why"):
             _state_text(decision[field], f"decisions[{index}].{field}")
-        if not isinstance(decision["result"], str) or decision["result"] not in VALID_RESULTS or not isinstance(decision["evidence"], list):
-            raise StateError(f"invalid state: decisions[{index}] has an invalid result or evidence")
+        if not isinstance(decision["result"], str) or decision["result"] not in VALID_RESULTS:
+            raise StateError(f"invalid state: decisions[{index}] has an invalid result")
+        _state_evidence(decision["evidence"], f"decisions[{index}].evidence")
         decision_status = decision.get("status")
         if decision_status is not None and (not isinstance(decision_status, str) or decision_status not in {"blocked", "refused"}):
             raise StateError(f"invalid state: decisions[{index}].status is not supported")
@@ -493,14 +574,25 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
             _state_text(decision["reason"], f"decisions[{index}].reason")
             _state_text(decision["next_action"], f"decisions[{index}].next_action")
 
+    checkpoint_by_id: dict[str, Mapping[str, Any]] = {}
     for index, checkpoint in enumerate(state["checkpoints"]):
         if not isinstance(checkpoint, Mapping):
             raise StateError(f"invalid state: checkpoints[{index}] must be an object")
         _require_state_fields(checkpoint, {"id", "at", "phase", "label", "evidence", "next_action"}, f"checkpoints[{index}]")
         for field in ("id", "at", "phase", "label", "next_action"):
             _state_text(checkpoint[field], f"checkpoints[{index}].{field}")
-        if not isinstance(checkpoint["evidence"], list):
-            raise StateError(f"invalid state: checkpoints[{index}].evidence must be a list")
+        if checkpoint["phase"] not in phase_ids:
+            raise StateError(f"invalid state: checkpoints[{index}].phase is not a declared phase")
+        _state_evidence(checkpoint["evidence"], f"checkpoints[{index}].evidence")
+        if checkpoint["id"] in checkpoint_by_id:
+            raise StateError(f"invalid state: checkpoints[{index}].id is duplicated")
+        checkpoint_by_id[checkpoint["id"]] = checkpoint
+
+    for phase_id, checkpoint_refs in phase_checkpoint_refs.items():
+        for checkpoint_id in checkpoint_refs:
+            checkpoint = checkpoint_by_id.get(checkpoint_id)
+            if checkpoint is None or checkpoint["phase"] != phase_id:
+                raise StateError(f"invalid state: phases[{phase_id}].checkpoints references an incomplete checkpoint")
 
     for index, replan in enumerate(state["replans"]):
         if not isinstance(replan, Mapping):
@@ -510,8 +602,27 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
             raise StateError(f"invalid state: replans[{index}].number must be a positive integer")
         for field in ("at", "phase", "reason", "next_action"):
             _state_text(replan[field], f"replans[{index}].{field}")
-        if not isinstance(replan["evidence"], list) or not isinstance(replan["replacement"], Mapping):
-            raise StateError(f"invalid state: replans[{index}] has an invalid evidence or replacement")
+        if replan["number"] != index + 1:
+            raise StateError(f"invalid state: replans[{index}].number is not sequential")
+        if replan["phase"] not in phase_ids:
+            raise StateError(f"invalid state: replans[{index}].phase is not a declared phase")
+        _state_evidence(replan["evidence"], f"replans[{index}].evidence")
+        replacement = replan["replacement"]
+        if not isinstance(replacement, Mapping):
+            raise StateError(f"invalid state: replans[{index}].replacement must be an object")
+        if "verification" in replacement:
+            try:
+                replacement_spec = _phase_spec(replacement, index)
+            except (PlanError, TypeError, ValueError, KeyError, AttributeError) as exc:
+                raise StateError(f"invalid state: replans[{index}].replacement is invalid: {exc}") from exc
+            if replacement_spec["id"] != replan["phase"]:
+                raise StateError(f"invalid state: replans[{index}].replacement id does not match the phase")
+        else:
+            _require_state_fields(replacement, {"id", "method"}, f"replans[{index}].replacement")
+            _state_text(replacement["id"], f"replans[{index}].replacement.id", max_length=100)
+            _state_text(replacement["method"], f"replans[{index}].replacement.method", max_length=1000)
+            if replacement["id"] != replan["phase"]:
+                raise StateError(f"invalid state: replans[{index}].replacement id does not match the phase")
 
     for index, event in enumerate(state["events"]):
         if not isinstance(event, Mapping):
@@ -528,8 +639,9 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
         _state_text(blocker["at"], "blocker.at")
         _state_text(blocker["reason"], "blocker.reason")
         _state_text(blocker["next_action"], "blocker.next_action")
-        if not isinstance(blocker["evidence"], list):
-            raise StateError("invalid state: blocker.evidence must be a list")
+        if blocker["phase"] is not None and blocker["phase"] not in phase_ids:
+            raise StateError("invalid state: blocker.phase is not a declared phase")
+        _state_evidence(blocker["evidence"], "blocker.evidence")
     if status == "blocked" and blocker is None:
         raise StateError("invalid state: blocked runs require a blocker")
 
@@ -540,8 +652,15 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
         _require_state_fields(interruption, {"at", "phase", "checkpoint", "reason"}, "interruption")
         for field in ("at", "phase", "checkpoint", "reason"):
             _state_text(interruption[field], f"interruption.{field}")
+        if interruption["phase"] not in phase_ids:
+            raise StateError("invalid state: interruption.phase is not a declared phase")
+        checkpoint = checkpoint_by_id.get(interruption["checkpoint"])
+        if checkpoint is None or checkpoint["phase"] != interruption["phase"]:
+            raise StateError("invalid state: interruption.checkpoint is not a checkpoint for the phase")
     if status == "interrupted" and interruption is None:
         raise StateError("invalid state: interrupted runs require interruption details")
+    if status != "interrupted" and any(phase["status"] == "interrupted" for phase in phases):
+        raise StateError("invalid state: interrupted phases require an interrupted run")
 
     terminal = state["terminal"]
     if status == "completed":
@@ -550,6 +669,8 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
         _require_state_fields(terminal, {"at", "predicate", "checks"}, "terminal")
         _state_text(terminal["at"], "terminal.at")
         _state_text(terminal["predicate"], "terminal.predicate")
+        if terminal["predicate"] != validated_plan["terminal_predicate"]["description"]:
+            raise StateError("invalid state: terminal predicate does not match the plan")
         if not isinstance(terminal["checks"], Mapping) or terminal["checks"] != predicate_results:
             raise StateError("invalid state: terminal checks do not match predicate_results")
         if any(phase["status"] != "passed" for phase in phases):
@@ -1293,6 +1414,30 @@ class Workflow:
                     "next_action": "choose a separate local TSV audit path",
                 },
             )
+        try:
+            destination_mode = path.lstat().st_mode
+        except FileNotFoundError:
+            destination_mode = None
+        except OSError as exc:
+            raise StateError(f"audit output destination could not be inspected: {path}") from exc
+        if destination_mode is not None and not stat.S_ISREG(destination_mode):
+            raise ScopeRefusal(
+                "audit output must be a regular file path",
+                {
+                    "status": "refused",
+                    "reason": "audit output destination is not a regular file",
+                    "next_action": "choose a new or existing regular local TSV path",
+                },
+            )
+        if path.parent.exists() and not path.parent.is_dir():
+            raise ScopeRefusal(
+                "audit output parent must be a directory",
+                {
+                    "status": "refused",
+                    "reason": "audit output parent is not a directory",
+                    "next_action": "choose a local TSV path below a directory",
+                },
+            )
         rows = [["ts", "phase", "decision", "why", "evidence", "result"]]
         for item in self.state["decisions"]:
             rows.append([
@@ -1470,7 +1615,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise StateError(f"unknown command: {args.command}")
         _print_state(result if isinstance(result, Mapping) else {"result": result})
         return 0
-    except WorkflowError as exc:
+    except (WorkflowError, OSError) as exc:
         error = {"status": "refused" if isinstance(exc, ScopeRefusal) else "error", "error": str(exc)}
         if isinstance(exc, ScopeRefusal):
             error["refusal"] = exc.refusal
