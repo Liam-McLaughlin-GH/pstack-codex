@@ -44,7 +44,7 @@ The port preserves the names of these workflows where possible. In Codex, invoke
 
 ## What is missing
 
-The following 8 upstream skills are not active in the port.
+The following 7 upstream skills are not active in the port.
 
 - `automate-me`. It depends on Cursor's built-in skill-authoring flow and transcript paths.
 - `create-verification-skill`. Its feature-map workflow assumes Cursor control skills and `.cursor/skills`.
@@ -88,25 +88,26 @@ This repo is the source tree. It is not linked into Codex automatically.
 Review the port first.
 
 ```sh
-cd /Users/liammclaughlin/PycharmProjects/pstack-codex
+cd /path/to/pstack-codex
 python3 scripts/verify_port.py
 git status --short
 ```
 
 When you are ready to activate it, link the skill folders into your local Codex skill directory after checking for name collisions.
 
-The repository remains the source of truth. The entries under `~/.agents/skills` are only discoverability links for the local Codex runtime.
+The repository remains the source of truth. The entries under `${CODEX_HOME:-$HOME/.codex}/skills` are discoverability links for the local Codex runtime.
 
 ```sh
-REPO=/Users/liammclaughlin/PycharmProjects/pstack-codex
-mkdir -p "$HOME/.agents/skills"
-for skill_dir in "$REPO"/skills/*; do
+REPO_DIR="${REPO_DIR:-$PWD}"
+CODEX_SKILLS_DIR="${CODEX_HOME:-$HOME/.codex}/skills"
+mkdir -p "$CODEX_SKILLS_DIR"
+for skill_dir in "$REPO_DIR"/skills/*; do
   skill_name=$(basename "$skill_dir")
-  [ -e "$HOME/.agents/skills/$skill_name" ] && {
+  [ -e "$CODEX_SKILLS_DIR/$skill_name" ] && {
     printf 'Skipping existing skill %s\n' "$skill_name"
     continue
   }
-  ln -s "$skill_dir" "$HOME/.agents/skills/$skill_name"
+  ln -s "$skill_dir" "$CODEX_SKILLS_DIR/$skill_name"
 done
 ```
 
