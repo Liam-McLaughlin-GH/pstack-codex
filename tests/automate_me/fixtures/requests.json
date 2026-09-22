@@ -1,0 +1,56 @@
+[
+  {
+    "id": "personal-create",
+    "request": "Create my alex-mode skill from my working style",
+    "artifact": "skill",
+    "category": "personal-mode",
+    "operation": "create",
+    "target": "skills/alex-mode/SKILL.md",
+    "confirmation_required": false
+  },
+  {
+    "id": "personal-update",
+    "request": "Update my alex-mode skill with the preferences I approved",
+    "artifact": "skill",
+    "category": "personal-mode",
+    "operation": "update",
+    "target": "skills/alex-mode/SKILL.md",
+    "confirmation_required": false
+  },
+  {
+    "id": "project-verification",
+    "request": "Create a project-local verification skill named checkout-verification for this repository",
+    "artifact": "skill",
+    "category": "project-skill",
+    "operation": "create",
+    "target": "skills/checkout-verification/SKILL.md",
+    "confirmation_required": false
+  },
+  {
+    "id": "project-script",
+    "request": "Create a project-local deterministic helper script named scrub-fixtures",
+    "artifact": "script",
+    "category": "project-helper",
+    "operation": "create",
+    "target": "scripts/scrub-fixtures.py",
+    "confirmation_required": false
+  },
+  {
+    "id": "durable-reference",
+    "request": "Save a durable preference reference named response-style for this workspace",
+    "artifact": "reference",
+    "category": "durable-preference",
+    "operation": "create",
+    "target": "references/response-style.md",
+    "confirmation_required": true
+  },
+  {
+    "id": "route-elsewhere",
+    "request": "Fix the flaky checkout test in this repository",
+    "artifact": "none",
+    "category": "route-elsewhere",
+    "operation": "none",
+    "target": null,
+    "confirmation_required": false
+  }
+]
