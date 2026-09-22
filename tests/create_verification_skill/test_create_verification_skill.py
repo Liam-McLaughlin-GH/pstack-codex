@@ -411,6 +411,180 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
             errors = scaffold_module.validate_generated_skill(skill_root)
             self.assertTrue(any("Cleanup.Command.cwd" in error for error in errors), errors)
 
+    def test_cleanup_targets_are_normalized_and_bound_to_disposable_state(self) -> None:
+        rejected = (
+            ["-rf", "./artifacts"],
+            ["-rf", "././artifacts"],
+            ["-rf", "."],
+            ["-rf", "unrelated"],
+            ["-rf", "scratch/other"],
+        )
+        for argv in rejected:
+            with self.subTest(argv=argv):
+                spec = spec_for()
+                spec["app"]["cleanup"] = {"executable": "rm", "argv": argv}  # type: ignore[index]
+                with self.assertRaises(ScaffoldError):
+                    validate_spec(spec)
+
+        for argv in (["-rf", "./scratch/./state.txt"], ["-rf", "scratch"]):
+            with self.subTest(accepted_argv=argv):
+                spec = spec_for()
+                spec["app"]["cleanup"] = {"executable": "rm", "argv": argv}  # type: ignore[index]
+                validate_spec(spec)
+
+    def test_existing_tree_revalidates_cleanup_policy_and_root_separation(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-cleanup-policy-") as temporary:
+            root = Path(temporary)
+            skill_root, _ = self.create_skill(root)
+            skill_file = skill_root / "SKILL.md"
+            original_skill = skill_file.read_text(encoding="utf-8")
+            cleanup_section = _generated_section_body(original_skill, "Cleanup")
+            cleanup_line = next(
+                line for line in cleanup_section.splitlines() if line.strip().startswith("- Command: ")
+            )
+            for rendered in ("rm -rf ./artifacts", "rm -rf scratch/other", "rm -rf ."):
+                with self.subTest(rendered=rendered):
+                    skill_file.write_text(
+                        original_skill.replace(cleanup_line, f"- Command: `{rendered}`", 1),
+                        encoding="utf-8",
+                    )
+                    errors = scaffold_module.validate_generated_skill(skill_root)
+                    self.assertTrue(any("Cleanup.Command.argv" in error for error in errors), errors)
+                    skill_file.write_text(original_skill, encoding="utf-8")
+
+            index = skill_root / "features" / "README.md"
+            original_index = index.read_text(encoding="utf-8")
+            skill_file.write_text(
+                original_skill.replace("- Disposable root: `scratch`", "- Disposable root: `artifacts`", 1),
+                encoding="utf-8",
+            )
+            index.write_text(
+                original_index.replace("- Disposable root: `scratch`", "- Disposable root: `artifacts`", 1),
+                encoding="utf-8",
+            )
+            errors = scaffold_module.validate_generated_skill(skill_root)
+            self.assertTrue(any("roots must not overlap" in error for error in errors), errors)
+
+    def test_indirect_shell_and_interpreter_code_boundaries_are_rejected(self) -> None:
+        cases = (
+            ("env", ["sh", "-c", "echo unsafe"]),
+            ("busybox", ["sh", "-c", "echo unsafe"]),
+            ("xargs", ["sh", "-c", "echo unsafe"]),
+            ("python", ["-c", "print('unsafe')"]),
+            ("node", ["-e", "console.log('unsafe')"]),
+        )
+        for executable, argv in cases:
+            with self.subTest(executable=executable):
+                spec = spec_for()
+                spec["app"]["doctor"] = {"executable": executable, "argv": argv}  # type: ignore[index]
+                with self.assertRaises(ScaffoldError):
+                    validate_spec(spec)
+
+    def test_existing_tree_rejects_blank_context_and_evidence_proof(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-context-validation-") as temporary:
+            root = Path(temporary)
+            skill_root, _ = self.create_skill(root)
+            skill_file = skill_root / "SKILL.md"
+            original_skill = skill_file.read_text(encoding="utf-8")
+
+            skill_lines = original_skill.splitlines()
+            setup_index = next(index for index, line in enumerate(skill_lines) if line == "- Setup:")
+            skill_lines[setup_index + 1] = "  - "
+            skill_file.write_text("\n".join(skill_lines) + "\n", encoding="utf-8")
+            errors = scaffold_module.validate_generated_skill(skill_root)
+            self.assertTrue(any("Setup must have a non-empty value" in error for error in errors), errors)
+            skill_file.write_text(original_skill, encoding="utf-8")
+
+            feature_file = skill_root / "features" / "check-state.md"
+            original_feature = feature_file.read_text(encoding="utf-8")
+            for label in ("Expected result", "Failure signals"):
+                with self.subTest(label=label):
+                    feature_lines = original_feature.splitlines()
+                    line_index = next(
+                        index
+                        for index, line in enumerate(feature_lines)
+                        if line.startswith("  - ") and line.strip().startswith(f"- {label}:")
+                    )
+                    indent = feature_lines[line_index][: len(feature_lines[line_index]) - len(feature_lines[line_index].lstrip())]
+                    feature_lines[line_index] = f"{indent}- {label}:"
+                    feature_file.write_text("\n".join(feature_lines) + "\n", encoding="utf-8")
+                    errors = scaffold_module.validate_generated_skill(skill_root)
+                    self.assertTrue(any(f"{label} must have a non-empty value" in error for error in errors), errors)
+                    feature_file.write_text(original_feature, encoding="utf-8")
+
+            feature_lines = original_feature.splitlines()
+            evidence_index = next(
+                index for index, line in enumerate(feature_lines) if line.strip().startswith("- Evidence: ")
+            )
+            evidence_line = feature_lines[evidence_index]
+            feature_lines[evidence_index] = evidence_line.split(",", 1)[0] + ","
+            feature_file.write_text("\n".join(feature_lines) + "\n", encoding="utf-8")
+            errors = scaffold_module.validate_generated_skill(skill_root)
+            self.assertTrue(any("artifact path and proof" in error for error in errors), errors)
+
+    def test_no_pyyaml_fallback_rejects_plain_yaml_mapping_syntax(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-frontmatter-syntax-") as temporary:
+            root = Path(temporary)
+            skill_root, _ = self.create_skill(root)
+            skill_file = skill_root / "SKILL.md"
+            original = skill_file.read_text(encoding="utf-8")
+            description_line = next(
+                line for line in original.splitlines() if line.startswith("description: ")
+            )
+            for replacement in ("description: foo: bar", "description: :"):
+                with self.subTest(replacement=replacement):
+                    skill_file.write_text(original.replace(description_line, replacement, 1), encoding="utf-8")
+                    with mock.patch.dict(sys.modules, {"yaml": None}):
+                        errors = scaffold_module.validate_generated_skill(skill_root)
+                    self.assertTrue(any("frontmatter" in error for error in errors), errors)
+                    skill_file.write_text(original, encoding="utf-8")
+
+    def test_invalid_utf8_is_reported_as_a_validation_error(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-invalid-utf8-") as temporary:
+            root = Path(temporary)
+            skill_root, _ = self.create_skill(root)
+            skill_file = skill_root / "SKILL.md"
+            skill_file.write_bytes(skill_file.read_bytes() + b"\xff")
+            errors = scaffold_module.validate_generated_skill(skill_root)
+            self.assertTrue(any("UTF-8" in error for error in errors), errors)
+
+    def test_child_publication_races_preserve_competing_file_and_symlink(self) -> None:
+        for kind in ("file", "symlink"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(
+                prefix=f"create-verification-child-race-{kind}-"
+            ) as temporary:
+                root = Path(temporary)
+                project = root / "project"
+                project.mkdir()
+                spec = spec_for()
+                target = project / ".agents" / "skills" / "verify-tiny-fixture"
+                attacker_file = root / "attacker.txt"
+                attacker_file.write_text("attacker\n", encoding="utf-8")
+                original_lexists = os.path.lexists
+                injected = False
+
+                def race_lexists(path: str | os.PathLike[str]) -> bool:
+                    nonlocal injected
+                    present = original_lexists(path)
+                    if Path(path) == target / "SKILL.md" and not present and not injected:
+                        injected = True
+                        if kind == "file":
+                            Path(path).write_text("preserve\n", encoding="utf-8")
+                        else:
+                            os.symlink(attacker_file, path)
+                    return present
+
+                with mock.patch.object(os.path, "lexists", side_effect=race_lexists):
+                    with self.assertRaises(CollisionError):
+                        scaffold_module.scaffold(spec, project)
+                self.assertTrue(injected)
+                competing = target / "SKILL.md"
+                if kind == "file":
+                    self.assertEqual(competing.read_text(encoding="utf-8"), "preserve\n")
+                else:
+                    self.assertTrue(competing.is_symlink())
+                    self.assertEqual(os.readlink(competing), str(attacker_file))
+
     def test_existing_tree_revalidates_all_emitted_command_contracts(self) -> None:
         with tempfile.TemporaryDirectory(prefix="create-verification-command-validation-") as temporary:
             root = Path(temporary)

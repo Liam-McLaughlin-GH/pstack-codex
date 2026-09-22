@@ -44,7 +44,7 @@ The port preserves the names of these workflows where possible. In Codex, invoke
 
 ## What is missing
 
-The following 8 upstream skills are not active in the port.
+The following 7 upstream skills are not active in the port.
 
 - `automate-me`. It depends on Cursor's built-in skill-authoring flow and transcript paths.
 - `figure-it-out`. Its playbook routing and subagent instructions need a Codex-specific rewrite.

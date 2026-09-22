@@ -40,6 +40,35 @@ COMMAND_SHELL_MARKERS = frozenset(";&|<>$`{}*?!()")
 SHELL_EXECUTABLES = frozenset(
     {"sh", "bash", "zsh", "dash", "fish", "ksh", "csh", "tcsh", "pwsh", "powershell", "cmd", "cmd.exe"}
 )
+INDIRECT_LAUNCHERS = frozenset(
+    {"busybox", "chroot", "command", "doas", "env", "exec", "nice", "nohup", "sudo", "timeout", "xargs"}
+)
+SHELL_COMMAND_FLAGS = frozenset(
+    {
+        "-c",
+        "/c",
+        "-command",
+        "--command",
+        "-encodedcommand",
+        "--encodedcommand",
+        "-ec",
+        "-lc",
+        "-xc",
+    }
+)
+INTERPRETER_CODE_FLAGS = {
+    "node": frozenset({"-e", "--eval"}),
+    "nodejs": frozenset({"-e", "--eval"}),
+    "deno": frozenset({"eval", "-e", "--eval"}),
+    "lua": frozenset({"-e", "--execute"}),
+    "osascript": frozenset({"-e"}),
+    "perl": frozenset({"-e", "--execute"}),
+    "php": frozenset({"-r", "--run"}),
+    "pypy": frozenset({"-c", "--command"}),
+    "powershell": SHELL_COMMAND_FLAGS,
+    "pwsh": SHELL_COMMAND_FLAGS,
+    "ruby": frozenset({"-e", "--eval"}),
+}
 CONTEXT_FIELDS = (
     "setup",
     "environment",
@@ -182,6 +211,58 @@ def _path_is_within(path: str, root: str) -> bool:
     return path_parts[: len(root_parts)] == root_parts
 
 
+def _command_basename(value: str) -> str:
+    return re.split(r"[/\\]", value)[-1].casefold()
+
+
+def _option_name(value: str) -> str:
+    return value.split("=", 1)[0].casefold()
+
+
+def _interpreter_code_flags(executable: str) -> frozenset[str]:
+    basename = _command_basename(executable)
+    if re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", basename):
+        return frozenset({"-c", "--command"})
+    return INTERPRETER_CODE_FLAGS.get(basename, frozenset())
+
+
+def _matches_code_flag(value: str, flags: frozenset[str]) -> bool:
+    option = _option_name(value)
+    if option in flags:
+        return True
+    return any(
+        flag.startswith("-")
+        and not flag.startswith("--")
+        and len(flag) == 2
+        and option.startswith(flag)
+        for flag in flags
+    )
+
+
+def _validate_command_boundary(executable: str, argv: list[str], label: str) -> None:
+    """Reject shell, launcher, and interpreter code-string boundaries."""
+
+    basename = _command_basename(executable)
+    if basename in SHELL_EXECUTABLES:
+        raise ScaffoldError(f"{label} must not introduce a free-form shell command")
+    if basename in INDIRECT_LAUNCHERS:
+        raise ScaffoldError(f"{label} must not use an indirect command launcher")
+
+    tokens = [executable, *argv]
+    for index, token in enumerate(tokens):
+        token_basename = _command_basename(token)
+        if token_basename in SHELL_EXECUTABLES:
+            if any(_matches_code_flag(candidate, SHELL_COMMAND_FLAGS) for candidate in tokens[index + 1 :]):
+                raise ScaffoldError(f"{label} must not introduce a free-form shell command")
+        code_flags = _interpreter_code_flags(token)
+        if code_flags and any(
+            _matches_code_flag(candidate, code_flags) for candidate in tokens[index + 1 :]
+        ):
+            raise ScaffoldError(
+                f"{label} must not introduce an interpreter code-string boundary"
+            )
+
+
 def _validate_roots(app: dict[str, Any]) -> tuple[str, str]:
     disposable_root = _safe_relative_path(app["disposable_root"], "app.disposable_root")
     evidence_root = _safe_relative_path(app["evidence_root"], "app.evidence_root")
@@ -224,13 +305,6 @@ def _validate_command(value: Any, label: str, *, forbidden_roots: tuple[str, ...
     argv = command.get("argv")
     if not isinstance(argv, list):
         raise ScaffoldError(f"{label}.argv must be an array")
-    if Path(executable).name.casefold() in SHELL_EXECUTABLES:
-        if any(
-            argument.casefold() in {"-c", "/c", "-command", "-encodedcommand"}
-            for argument in argv
-            if isinstance(argument, str)
-        ):
-            raise ScaffoldError(f"{label} must not introduce a free-form shell command")
     for index, argument in enumerate(argv):
         argument = _require_text(argument, f"{label}.argv[{index}]")
         for candidate in _command_argument_candidates(argument):
@@ -261,6 +335,141 @@ def _validate_command(value: Any, label: str, *, forbidden_roots: tuple[str, ...
         command["cwd"] = cwd
     command["executable"] = executable
     command["argv"] = argv
+    _validate_command_boundary(executable, argv, label)
+    return command
+
+
+DISPOSABLE_TARGET_EXECUTABLES = frozenset(
+    {"del", "erase", "rm", "rmdir", "shred", "unlink"}
+)
+DISPOSABLE_COMMAND_WORDS = frozenset({"clean", "cleanup", "delete", "remove", "teardown"})
+DISPOSABLE_PATH_OPTIONS = frozenset(
+    {
+        "--data-dir",
+        "--directory",
+        "--dir",
+        "--file",
+        "--output",
+        "--out",
+        "--path",
+        "--state-file",
+        "--state",
+        "--target",
+        "--workdir",
+        "-d",
+        "-f",
+        "-o",
+    }
+)
+
+
+def _normalize_cleanup_path(value: str, label: str) -> str:
+    """Normalize a relative cleanup target without allowing it to escape."""
+
+    value = _require_text(value, label)
+    if "\\" in value or value.startswith(("/", "~", "//")):
+        raise ScaffoldError(f"{label} must be a relative POSIX path")
+    if re.match(r"^[A-Za-z]:", value) or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", value):
+        raise ScaffoldError(f"{label} must not be an absolute path or URI")
+
+    parts: list[str] = []
+    for part in value.split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            if not parts:
+                raise ScaffoldError(f"{label} must not escape the project with '..'")
+            parts.pop()
+            continue
+        parts.append(part)
+    return "/".join(parts)
+
+
+def _cleanup_target_candidates(command: dict[str, Any]) -> list[tuple[int, str]]:
+    """Return argv values that a cleanup command treats as filesystem targets."""
+
+    argv = command["argv"]
+    basename = _command_basename(command["executable"])
+    candidates: list[tuple[int, str]] = []
+
+    if basename in DISPOSABLE_TARGET_EXECUTABLES:
+        after_options = False
+        for index, argument in enumerate(argv):
+            if not after_options and argument == "--":
+                after_options = True
+                continue
+            if not after_options and argument.startswith("-"):
+                continue
+            candidates.append((index, argument))
+        return candidates
+
+    for index, argument in enumerate(argv):
+        if argument.startswith("-") and "=" in argument:
+            option, value = argument.split("=", 1)
+            if option.casefold() in DISPOSABLE_PATH_OPTIONS and value:
+                candidates.append((index, value))
+        if _option_name(argument) in DISPOSABLE_PATH_OPTIONS:
+            if index + 1 < len(argv):
+                candidates.append((index + 1, argv[index + 1]))
+            continue
+        if index == 0 or argument.startswith("-"):
+            continue
+        if (
+            "/" in argument
+            or argument.startswith(".")
+            or (index > 0 and argv[index - 1].casefold() in DISPOSABLE_COMMAND_WORDS)
+        ):
+            candidates.append((index, argument))
+
+    deduplicated: list[tuple[int, str]] = []
+    seen: set[tuple[int, str]] = set()
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            deduplicated.append(candidate)
+    return deduplicated
+
+
+def _validate_cleanup_command(
+    value: Any,
+    label: str,
+    *,
+    disposable_root: str,
+    disposable_paths: tuple[str, ...],
+    evidence_root: str,
+) -> dict[str, Any]:
+    """Validate a typed cleanup command against its declared disposable state."""
+
+    command = _validate_command(value, label, forbidden_roots=(evidence_root,))
+    candidates = _cleanup_target_candidates(command)
+    if not candidates:
+        raise ScaffoldError(f"{label} must name at least one disposable target")
+
+    cwd = command.get("cwd", "")
+    for index, candidate in candidates:
+        normalized_candidate = _normalize_cleanup_path(
+            candidate,
+            f"{label}.argv[{index}]",
+        )
+        combined = "/".join(part for part in (cwd, normalized_candidate) if part)
+        normalized_target = _normalize_cleanup_path(
+            combined or ".",
+            f"{label}.argv[{index}]",
+        )
+        if not normalized_target:
+            raise ScaffoldError(f"{label}.argv[{index}] must not target the project root")
+        if _path_is_within(normalized_target, evidence_root):
+            raise ScaffoldError(
+                f"{label}.argv[{index}] must not target the evidence root or a path below it"
+            )
+        declared_path = any(
+            normalized_target == allowed or _path_is_within(normalized_target, allowed)
+            for allowed in disposable_paths
+        )
+        if normalized_target != disposable_root and not declared_path:
+            raise ScaffoldError(
+                f"{label}.argv[{index}] must target declared disposable state"
+            )
     return command
 
 
@@ -319,7 +528,16 @@ def validate_spec(spec: Any) -> dict[str, Any]:
     _validate_command(app["launch"], "app.launch")
     _validate_command(app["doctor"], "app.doctor")
     _validate_command(app["drive"], "app.drive")
-    _validate_command(app["cleanup"], "app.cleanup", forbidden_roots=(evidence_root,))
+    _validate_cleanup_command(
+        app["cleanup"],
+        "app.cleanup",
+        disposable_root=disposable_root,
+        disposable_paths=tuple(
+            _normalize_cleanup_path(path, f"app.disposable_paths[{index}]")
+            for index, path in enumerate(app["disposable_paths"])
+        ),
+        evidence_root=evidence_root,
+    )
     if "evidence" in app:
         _require_text(app["evidence"], "app.evidence")
     for field in ("baseline", "helpers"):
@@ -654,17 +872,25 @@ def _strict_frontmatter_subset(text: str) -> dict[str, str]:
             continue
         if value.startswith(("[", "{", "&", "*", "!", "|", ">", "%", "@", "`")):
             raise ScaffoldError(f"frontmatter field {key!r} is not a supported scalar")
+        if value.startswith(("#", "- ", "? ")) or re.search(r":(?:[ \t]|$|[\[\]{},])", value):
+            raise ScaffoldError(f"frontmatter field {key!r} has invalid plain scalar syntax")
         if _is_non_string_yaml_scalar(value):
             raise ScaffoldError(f"frontmatter field {key!r} must be a string")
         fields[key] = value
     return fields
 
 
-def _parse_frontmatter(path: Path) -> dict[str, str]:
+def _read_utf8(path: Path) -> str:
     try:
-        text = path.read_text(encoding="utf-8")
+        return path.read_text(encoding="utf-8")
+    except UnicodeError as exc:
+        raise ScaffoldError(f"cannot decode {path} as UTF-8: {exc}") from exc
     except OSError as exc:
         raise ScaffoldError(f"cannot read {path}: {exc}") from exc
+
+
+def _parse_frontmatter(path: Path) -> dict[str, str]:
+    text = _read_utf8(path)
     lines = text.splitlines()
     if not lines or lines[0] != "---":
         raise ScaffoldError(f"{path} is missing YAML frontmatter")
@@ -834,7 +1060,7 @@ def _validate_link_target(root: Path, path: Path, target: str) -> None:
 def _check_links(root: Path) -> None:
     root = _lexical_absolute(root)
     for path in sorted(root.rglob("*.md")):
-        text = _strip_markdown_code(path.read_text(encoding="utf-8"))
+        text = _strip_markdown_code(_read_utf8(path))
         definitions: dict[str, str] = {}
         for line in text.splitlines():
             prefix = REFERENCE_DEFINITION_PREFIX.match(line)
@@ -881,15 +1107,38 @@ def _section_lines(lines: list[str], heading: str) -> tuple[int, int, list[str]]
 
 def _require_label(lines: list[str], label: str, location: str, errors: list[str]) -> None:
     prefix = f"- {label}:"
+    found_label = False
     for index, line in enumerate(lines):
         stripped = line.strip()
         if not stripped.startswith(prefix):
             continue
+        found_label = True
         if stripped[len(prefix) :].strip():
-            return
-        if index + 1 < len(lines) and lines[index + 1].strip().startswith("-"):
-            return
-    errors.append(f"{location} is missing {label}:")
+            continue
+        label_indent = len(line) - len(line.lstrip(" \t"))
+        child_index = index + 1
+        found_child = False
+        while child_index < len(lines):
+            child = lines[child_index]
+            if not child.strip():
+                break
+            child_indent = len(child) - len(child.lstrip(" \t"))
+            if child_indent <= label_indent:
+                break
+            child_match = re.match(r"^[ \t]+-[ \t]*(?P<value>.*)$", child)
+            if child_match is None:
+                break
+            found_child = True
+            if not child_match.group("value").strip():
+                errors.append(f"{location} {label} must have a non-empty value")
+                return
+            child_index += 1
+        if found_child:
+            continue
+        errors.append(f"{location} {label} must have a non-empty value")
+        return
+    if not found_label:
+        errors.append(f"{location} is missing {label}:")
 
 
 def _code_label_values(lines: list[str], label: str) -> list[str]:
@@ -916,6 +1165,45 @@ def _inline_code_label_value(line: str, label: str) -> str | None:
     return match.group("value").strip()
 
 
+def _parse_rendered_command(
+    lines: list[str],
+    label: str,
+    location: str,
+    errors: list[str],
+) -> dict[str, Any] | None:
+    prefix = f"- {label}:"
+    command_lines = [line for line in lines if line.strip().startswith(prefix)]
+    if len(command_lines) != 1:
+        errors.append(f"{location} must contain exactly one {label} command")
+        return None
+    rendered = _inline_code_label_value(command_lines[0], label)
+    if not rendered:
+        errors.append(f"{location} {label} must be a non-empty inline code command")
+        return None
+    try:
+        argv = shlex.split(rendered, posix=True)
+    except ValueError as exc:
+        errors.append(f"{location} {label} has invalid command quoting: {exc}")
+        return None
+    if not argv:
+        errors.append(f"{location} {label} must contain an executable")
+        return None
+
+    command: dict[str, Any] = {"executable": argv[0], "argv": argv[1:]}
+    cwd_prefix = "- Working directory:"
+    cwd_lines = [line for line in lines if line.strip().startswith(cwd_prefix)]
+    if len(cwd_lines) > 1:
+        errors.append(f"{location} must contain at most one Working directory")
+        return None
+    if cwd_lines:
+        cwd = _inline_code_label_value(cwd_lines[0], "Working directory")
+        if not cwd:
+            errors.append(f"{location} Working directory must be a non-empty inline code path")
+            return None
+        command["cwd"] = cwd
+    return command
+
+
 def _validate_rendered_command(
     lines: list[str],
     label: str,
@@ -924,39 +1212,43 @@ def _validate_rendered_command(
     *,
     forbidden_roots: tuple[str, ...] = (),
 ) -> None:
-    prefix = f"- {label}:"
-    command_lines = [line for line in lines if line.strip().startswith(prefix)]
-    if len(command_lines) != 1:
-        errors.append(f"{location} must contain exactly one {label} command")
+    command = _parse_rendered_command(lines, label, location, errors)
+    if command is None:
         return
-    rendered = _inline_code_label_value(command_lines[0], label)
-    if not rendered:
-        errors.append(f"{location} {label} must be a non-empty inline code command")
-        return
-    try:
-        argv = shlex.split(rendered, posix=True)
-    except ValueError as exc:
-        errors.append(f"{location} {label} has invalid command quoting: {exc}")
-        return
-    if not argv:
-        errors.append(f"{location} {label} must contain an executable")
-        return
-
-    command: dict[str, Any] = {"executable": argv[0], "argv": argv[1:]}
-    cwd_prefix = "- Working directory:"
-    cwd_lines = [line for line in lines if line.strip().startswith(cwd_prefix)]
-    if len(cwd_lines) > 1:
-        errors.append(f"{location} must contain at most one Working directory")
-        return
-    if cwd_lines:
-        cwd = _inline_code_label_value(cwd_lines[0], "Working directory")
-        if not cwd:
-            errors.append(f"{location} Working directory must be a non-empty inline code path")
-            return
-        command["cwd"] = cwd
 
     try:
         _validate_command(command, f"{location}.{label}", forbidden_roots=forbidden_roots)
+    except ScaffoldError as exc:
+        errors.append(str(exc))
+
+
+def _validate_rendered_cleanup(
+    lines: list[str],
+    location: str,
+    errors: list[str],
+    *,
+    disposable_root: str | None,
+    disposable_paths: tuple[str, ...],
+    evidence_root: str | None,
+) -> None:
+    command = _parse_rendered_command(lines, "Command", location, errors)
+    if command is None:
+        return
+    try:
+        if disposable_root is None or evidence_root is None:
+            _validate_command(
+                command,
+                f"{location}.Command",
+                forbidden_roots=(evidence_root,) if evidence_root is not None else (),
+            )
+            return
+        _validate_cleanup_command(
+            command,
+            f"{location}.Command",
+            disposable_root=disposable_root,
+            disposable_paths=disposable_paths,
+            evidence_root=evidence_root,
+        )
     except ScaffoldError as exc:
         errors.append(str(exc))
 
@@ -970,6 +1262,29 @@ def _inline_code_values(lines: list[str], label: str) -> list[str]:
     return []
 
 
+def _validate_generated_root_contract(
+    disposable_root: str | None,
+    evidence_root: str | None,
+    disposable_paths: tuple[str, ...],
+    location: str,
+    errors: list[str],
+) -> None:
+    if disposable_root is not None and evidence_root is not None:
+        if _path_is_within(disposable_root, evidence_root) or _path_is_within(
+            evidence_root, disposable_root
+        ):
+            errors.append(f"{location} disposable and evidence roots must not overlap")
+    if disposable_root is None:
+        return
+    for path in disposable_paths:
+        try:
+            normalized = _safe_relative_path(path, f"{location} disposable path")
+            if not _path_is_within(normalized, disposable_root):
+                errors.append(f"{location} disposable path escapes the disposable root")
+        except ScaffoldError as exc:
+            errors.append(str(exc))
+
+
 def _validate_index(
     index: Path,
     feature_files: list[Path],
@@ -979,7 +1294,7 @@ def _validate_index(
     disposable_root: str | None = None,
     evidence_root: str | None = None,
 ) -> None:
-    lines = index.read_text(encoding="utf-8").splitlines()
+    lines = _read_utf8(index).splitlines()
     nonempty = [line for line in lines if line.strip()]
     if not nonempty or not nonempty[0].startswith("# ") or nonempty[0].startswith("## "):
         errors.append("features/README.md must start with an H1")
@@ -1001,7 +1316,7 @@ def _validate_index(
         _require_label(lines, label, "features/README.md", errors)
 
     expected_ids = [path.stem for path in feature_files]
-    links = re.findall(r"\]\(\./([a-z0-9-]+)\.md\)", index.read_text(encoding="utf-8"))
+    links = re.findall(r"\]\(\./([a-z0-9-]+)\.md\)", _read_utf8(index))
     if len(links) != len(set(links)):
         errors.append("features/README.md repeats a feature link")
     if set(links) != set(expected_ids) or len(links) != len(expected_ids):
@@ -1029,6 +1344,24 @@ def _validate_index(
                 errors.append("features/README.md Evidence root does not match SKILL.md")
         except ScaffoldError as exc:
             errors.append(str(exc))
+    if index_disposable_root is not None and index_evidence_root is not None:
+        try:
+            normalized_disposable = _safe_relative_path(
+                index_disposable_root,
+                "features/README.md Disposable root",
+            )
+            normalized_evidence = _safe_relative_path(
+                index_evidence_root,
+                "features/README.md Evidence root",
+            )
+            if _path_is_within(normalized_disposable, normalized_evidence) or _path_is_within(
+                normalized_evidence, normalized_disposable
+            ):
+                errors.append(
+                    "features/README.md disposable and evidence roots must not overlap"
+                )
+        except ScaffoldError:
+            pass
 
 
 def _validate_feature(
@@ -1039,7 +1372,7 @@ def _validate_feature(
     evidence_root: str | None = None,
 ) -> None:
     relative = path.relative_to(root)
-    lines = path.read_text(encoding="utf-8").splitlines()
+    lines = _read_utf8(path).splitlines()
     nonempty = [line for line in lines if line.strip()]
     if not nonempty or not nonempty[0].startswith("# ") or nonempty[0].startswith("## "):
         errors.append(f"{relative} must start with an H1")
@@ -1083,9 +1416,12 @@ def _validate_feature(
             _require_label(block, label, str(relative), errors)
         _validate_rendered_command(block, "Action", str(relative), errors)
         evidence_line = next((line.strip() for line in block if line.strip().startswith("- Evidence:")), None)
-        evidence_match = re.match(r"^- Evidence: `([^`]+)`(?:,|$)", evidence_line or "")
+        evidence_match = re.fullmatch(
+            r"^- Evidence: `([^`]+)`,[ \t]*(?P<proves>\S.*)$",
+            evidence_line or "",
+        )
         if evidence_match is None:
-            errors.append(f"{relative} action evidence must name an artifact path")
+            errors.append(f"{relative} action evidence must name an artifact path and proof")
         elif evidence_root is not None:
             try:
                 evidence_path = _safe_relative_path(evidence_match.group(1), f"{relative} evidence path")
@@ -1126,10 +1462,11 @@ def validate_generated_skill(
 
     disposable_root: str | None = None
     evidence_root: str | None = None
+    disposable_paths: tuple[str, ...] = ()
     try:
         frontmatter = _parse_frontmatter(skill_file)
         _validate_frontmatter_fields(frontmatter, expected_name=expected_name, path=skill_file)
-        skill_lines = skill_file.read_text(encoding="utf-8").splitlines()
+        skill_lines = _read_utf8(skill_file).splitlines()
         disposable_root = _code_label_value(skill_lines, "Disposable root")
         if disposable_root is None:
             errors.append("SKILL.md must name a relative Disposable root")
@@ -1139,17 +1476,17 @@ def validate_generated_skill(
             except ScaffoldError as exc:
                 errors.append(str(exc))
                 disposable_root = None
-        disposable_paths = _inline_code_values(skill_lines, "Disposable paths")
-        if not disposable_paths:
+        raw_disposable_paths = _inline_code_values(skill_lines, "Disposable paths")
+        if not raw_disposable_paths:
             errors.append("SKILL.md must name disposable paths")
-        elif disposable_root is not None:
-            for path in disposable_paths:
+        else:
+            normalized_paths: list[str] = []
+            for path in raw_disposable_paths:
                 try:
-                    normalized = _safe_relative_path(path, "SKILL.md disposable path")
-                    if not _path_is_within(normalized, disposable_root):
-                        errors.append("SKILL.md disposable path escapes the disposable root")
+                    normalized_paths.append(_safe_relative_path(path, "SKILL.md disposable path"))
                 except ScaffoldError as exc:
                     errors.append(str(exc))
+            disposable_paths = tuple(normalized_paths)
         evidence_root = _code_label_value(skill_lines, "Evidence root")
         if evidence_root is None:
             errors.append("SKILL.md must name a relative Evidence root")
@@ -1159,6 +1496,13 @@ def validate_generated_skill(
             except ScaffoldError as exc:
                 errors.append(str(exc))
                 evidence_root = None
+        _validate_generated_root_contract(
+            disposable_root,
+            evidence_root,
+            disposable_paths,
+            "SKILL.md",
+            errors,
+        )
         headings = [line.removeprefix("## ") for line in skill_lines if line.startswith("## ")]
         if headings != list(SKILL_HEADING_ORDER):
             errors.append("generated SKILL.md sections are incomplete or out of order")
@@ -1172,15 +1516,21 @@ def validate_generated_skill(
             section = _section_lines(skill_lines, f"## {section_name}")
             if section is None:
                 continue
-            if section_name in {"Launch", "Doctor", "Drive", "Cleanup"}:
+            if section_name == "Cleanup":
+                _validate_rendered_cleanup(
+                    section[2],
+                    "SKILL.md Cleanup",
+                    errors,
+                    disposable_root=disposable_root,
+                    disposable_paths=disposable_paths,
+                    evidence_root=evidence_root,
+                )
+            elif section_name in {"Launch", "Doctor", "Drive"}:
                 _validate_rendered_command(
                     section[2],
                     "Command",
                     f"SKILL.md {section_name}",
                     errors,
-                    forbidden_roots=(evidence_root,)
-                    if section_name == "Cleanup" and evidence_root is not None
-                    else (),
                 )
         maintenance = _section_lines(skill_lines, "## Maintenance")
         maintenance_ok = maintenance is not None and any(
@@ -1190,24 +1540,27 @@ def validate_generated_skill(
         if not maintenance_ok:
             errors.append("SKILL.md must state the unsupported #4 maintenance handoff")
         _check_links(skill_root)
-    except (OSError, ScaffoldError) as exc:
+    except (OSError, UnicodeError, ScaffoldError) as exc:
         errors.append(str(exc))
 
     feature_files = sorted(path for path in features_dir.glob("*.md") if path.name != "README.md")
     if not feature_files:
         errors.append("feature map has no feature files")
-    _validate_index(
-        index,
-        feature_files,
-        skill_root,
-        errors,
-        disposable_root=disposable_root,
-        evidence_root=evidence_root,
-    )
+    try:
+        _validate_index(
+            index,
+            feature_files,
+            skill_root,
+            errors,
+            disposable_root=disposable_root,
+            evidence_root=evidence_root,
+        )
+    except (OSError, UnicodeError, ScaffoldError) as exc:
+        errors.append(f"features/README.md cannot be read: {exc}")
     for path in feature_files:
         try:
             _validate_feature(path, skill_root, errors, evidence_root=evidence_root)
-        except OSError as exc:
+        except (OSError, UnicodeError, ScaffoldError) as exc:
             errors.append(f"{path.relative_to(skill_root)} cannot be read: {exc}")
     return tuple(errors)
 
@@ -1249,6 +1602,69 @@ def _existing_directory(path: Path, label: str) -> bool:
     return True
 
 
+PublishedEntry = tuple[Path, int, int, bool]
+
+
+def _published_identity(path: Path, *, is_directory: bool) -> PublishedEntry:
+    identity = os.lstat(path)
+    return path, identity.st_dev, identity.st_ino, is_directory
+
+
+def _rollback_published(entries: list[PublishedEntry]) -> None:
+    for path, device, inode, is_directory in reversed(entries):
+        try:
+            current = os.lstat(path)
+        except FileNotFoundError:
+            continue
+        if current.st_dev != device or current.st_ino != inode:
+            continue
+        try:
+            if is_directory:
+                path.rmdir()
+            else:
+                path.unlink()
+        except OSError:
+            pass
+
+
+def _publish_entry_no_replace(source: Path, destination: Path) -> list[PublishedEntry]:
+    """Publish one staged entry without ever replacing a destination entry."""
+
+    if os.path.lexists(destination):
+        raise CollisionError(f"target changed during publication: {destination}")
+    source_mode = os.lstat(source).st_mode
+    published: list[PublishedEntry] = []
+    if stat.S_ISDIR(source_mode):
+        try:
+            os.mkdir(destination)
+        except FileExistsError as exc:
+            raise CollisionError(f"target changed during publication: {destination}") from exc
+        published.append(_published_identity(destination, is_directory=True))
+        try:
+            for child in sorted(source.iterdir(), key=lambda path: path.name):
+                published.extend(_publish_entry_no_replace(child, destination / child.name))
+            source.rmdir()
+            return published
+        except Exception:
+            _rollback_published(published)
+            raise
+    if not stat.S_ISREG(source_mode):
+        raise ScaffoldError(f"staging contains a non-regular entry: {source}")
+
+    try:
+        # A hard link is an atomic no-replace publication on the same filesystem.
+        os.link(source, destination, follow_symlinks=False)
+    except FileExistsError as exc:
+        raise CollisionError(f"target changed during publication: {destination}") from exc
+    published.append(_published_identity(destination, is_directory=False))
+    try:
+        source.unlink()
+    except Exception:
+        _rollback_published(published)
+        raise
+    return published
+
+
 def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
     """Create a new generated skill and return its path."""
 
@@ -1271,7 +1687,7 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
     created_parents: list[Path] = []
     staging: Path | None = None
     target_reserved = False
-    moved_names: list[str] = []
+    published_entries: list[PublishedEntry] = []
     try:
         for directory, label in ((parent, ".agents"), (skills_parent, ".agents/skills")):
             if not _existing_directory(directory, f"output parent {label}"):
@@ -1300,10 +1716,7 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
         target_reserved = True
         for child in sorted(staging.iterdir(), key=lambda path: path.name):
             destination = target / child.name
-            if os.path.lexists(destination):
-                raise CollisionError(f"target changed during publication: {destination}")
-            child.rename(destination)
-            moved_names.append(child.name)
+            published_entries.extend(_publish_entry_no_replace(child, destination))
         staging.rmdir()
         staging = None
         return target
@@ -1311,8 +1724,7 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
         if staging is not None:
             _remove_path(staging)
         if target_reserved:
-            for name in reversed(moved_names):
-                _remove_path(target / name)
+            _rollback_published(published_entries)
             try:
                 target.rmdir()
             except OSError:

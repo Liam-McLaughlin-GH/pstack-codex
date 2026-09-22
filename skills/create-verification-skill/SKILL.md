@@ -55,12 +55,15 @@ Use structured command values throughout the JSON specification:
 
 Do not accept a shell command string. The helper renders argv with shell
 quoting for a reader, but does not execute it. Executables cannot contain shell
-syntax. Command arguments cannot use absolute paths or `..` to escape the
-project. An optional `cwd` is a relative project path rendered as a separate
-`Working directory` instruction beside the literal command. Cleanup may not
-use the evidence root or a path below it as its working directory. Keep
-disposable paths below `disposable_root`, evidence paths below `evidence_root`,
-and keep those roots separate.
+syntax, shell launchers such as `env`, `busybox`, and `xargs` are refused, and
+interpreter code-string forms such as `python -c` are refused. Command
+arguments cannot use absolute paths or `..` to escape the project. An optional
+`cwd` is a relative project path rendered as a separate `Working directory`
+instruction beside the literal command. Cleanup targets are normalized against
+that cwd and must be the disposable root or one of its declared disposable
+paths. Cleanup may not target the project root, the evidence root, or anything
+below the evidence root. Keep disposable paths below `disposable_root`, evidence
+paths below `evidence_root`, and keep those roots separate.
 
 The app specification also records `setup`, `environment`, `seed_auth`,
 `isolation`, `ownership`, `evidence_scope`, and `failure_signals`. Every
