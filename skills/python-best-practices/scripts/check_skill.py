@@ -27,6 +27,15 @@ SOURCE_LIKE_RE = re.compile(r"(?:web-app|web-k8s|showpass-frontend)@[0-9a-f]+:[^
 MARKER_RE = re.compile(r"\bSP-[A-Z0-9-]+\b")
 SAFE_COMMAND_STATUS = "VERIFIED / NOT RUN"
 UNSAFE_COMMAND_STATUS_RE = re.compile(r"^UNSAFE: \S(?:[^/\n]*\S)? / NOT RUN$")
+COMMAND_ROUTES = {
+    "general",
+    "web-app",
+    "showpass-frontend",
+    "web-k8s",
+    "unsafe/manual-review",
+}
+COMMAND_TABLE_HEADER = "| Status | Command | Route and source |"
+COMMAND_TABLE_SEPARATOR = "|---|---|---|"
 FRONTEND_BOUNDARY_SUPPORTED = (
     "Start with the `showpass-frontend` repository guidance for its web, mobile, "
     "and desktop apps built with React, Next.js, and React Native."
@@ -39,6 +48,12 @@ FAB_LIST_RE = re.compile(r"\bfab\s+--list(?:\s|$)")
 FABRIC3_RE = re.compile(r"\bfabric\s*3\b")
 FAB_ENVIRONMENT_RE = re.compile(
     r"\bfab\s+(?:demo|beta|live|prod|production)\b"
+)
+FABRIC_ENVIRONMENT_OPERATION_RE = re.compile(
+    r"(?:\b(?:fabric|fab)(?:\s*3)?\b[^\n]*\b(?:environment|cluster|"
+    r"beta|demo|live|prod|production|staging)\b|"
+    r"\b(?:environment|cluster|beta|demo|live|prod|production|staging)\b"
+    r"[^\n]*\b(?:fabric|fab)(?:\s*3)?\b)"
 )
 KUBECTL_MUTATION_RE = re.compile(
     r"\bkubectl\s+(?:apply|create|delete|patch|replace|rollout|scale|set)\b"
@@ -75,9 +90,25 @@ FRONTEND_CUE_RE = re.compile(
 FRONTEND_OWNER_CUE_RE = re.compile(
     r"\b(?:showpass-frontend|next(?:\.js|js)?|react(?:\s+native)?)\b"
 )
+FRONTEND_REPOSITORY_CUE_RE = re.compile(
+    r"\bshowpass-frontend\b|\bpackages/(?:core|next-app|mobile|desktop)\b"
+)
+SHOWPASS_PRODUCT_CUE_RE = re.compile(r"\bshowpass\b")
+SHOWPASS_UI_CUE_RE = re.compile(
+    r"\bshowpass\s+(?:web|mobile|desktop|frontend|ui|client)\b"
+)
+MODERN_UI_WORK_RE = re.compile(
+    r"\b(?:component|page|screen|hook|widget|modal|form|button|layout|"
+    r"style|styles|styling|css|tsx|user\s+interface|render(?:er|ing)?)\b|"
+    r"\b(?:modern\s+(?:ui|frontend|client)|(?:react|next(?:\.js|js)?)\s+"
+    r"(?:ui|frontend|client))\b"
+)
 LEGACY_UI_CUE_RE = re.compile(
-    r"\b(?:angularjs|angular\s+js|legacy\s+(?:ui|frontend|template|bridge|redirect)|"
-    r"(?:ui|frontend)\s+bridge|bridge\s+template|django\s+template|"
+    r"\b(?:next(?:\.js|js)?\s+(?:bridge|redirect|bridge[-\s]?route)|"
+    r"(?:bridge[-\s]?route|bridge|redirect)\s+(?:for|in|from|to)\s+"
+    r"next(?:\.js|js)?|bridge[-\s]?route|angularjs|angular\s+js|"
+    r"legacy\s+(?:ui|frontend|template|bridge|redirect)|(?:ui|frontend)\s+bridge|"
+    r"bridge\s+template|django\s+(?:template|redirect)|"
     r"apps/main/(?:static|templates)|gulp|embedded\s+page)\b"
 )
 
@@ -149,16 +180,33 @@ def repositories_for_task(task: str) -> Tuple[str, ...]:
     backend_cue = bool(BACKEND_CUE_RE.search(text))
     frontend_cue = bool(FRONTEND_CUE_RE.search(text))
     modern_frontend_cue = bool(FRONTEND_OWNER_CUE_RE.search(text))
+    showpass_ui_cue = bool(SHOWPASS_UI_CUE_RE.search(text))
+    explicit_frontend_cue = bool(FRONTEND_REPOSITORY_CUE_RE.search(text)) or bool(
+        SHOWPASS_PRODUCT_CUE_RE.search(text)
+        and (modern_frontend_cue or showpass_ui_cue)
+    )
     legacy_ui_cue = bool(LEGACY_UI_CUE_RE.search(text))
+    modern_ui_work = bool(MODERN_UI_WORK_RE.search(text))
 
     repositories: List[str] = []
     if backend_cue or legacy_ui_cue:
         repositories.append("web-app")
-    if modern_frontend_cue or (backend_cue and frontend_cue):
+    if (
+        (
+            explicit_frontend_cue
+            and (modern_frontend_cue or frontend_cue or showpass_ui_cue)
+        )
+        or (backend_cue and frontend_cue)
+        or (legacy_ui_cue and modern_ui_work)
+    ):
         repositories.append("showpass-frontend")
     if infrastructure:
         repositories.append("web-k8s")
     return tuple(dict.fromkeys(repositories))
+
+
+def _is_documented_read_only_fab_list(text: str) -> bool:
+    return bool(re.fullmatch(r"\s*fab\s+--list\s*", text))
 
 
 def route_for_task(task: str) -> str:
@@ -174,11 +222,18 @@ def route_for_task(task: str) -> str:
     )
     environment_mutation = bool(ENVIRONMENT_RE.search(text) and MUTATION_RE.search(text))
     deployment_mutation = bool(DEPLOYMENT_OPERATION_RE.search(text))
+    natural_fabric_environment_operation = bool(
+        FABRIC_ENVIRONMENT_OPERATION_RE.search(text)
+    )
     if (
         cluster_mutation
         or environment_mutation
         or deployment_mutation
         or _production_live_requires_review(text)
+        or (
+            natural_fabric_environment_operation
+            and not _is_documented_read_only_fab_list(text)
+        )
     ):
         return "unsafe"
 
@@ -314,6 +369,122 @@ def _validate_command_status(command: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _inline_code_cell(cell: str, field: str, errors: List[str]) -> Optional[str]:
+    value = cell.strip()
+    if len(value) < 2 or not value.startswith("`") or not value.endswith("`"):
+        errors.append("command table %s cell is not inline code: %s" % (field, cell))
+        return None
+    return value[1:-1]
+
+
+def _command_table_rows(skill_text: str) -> Tuple[List[Dict[str, str]], List[str]]:
+    """Parse the command table so its claims can be checked against the ledger."""
+
+    errors: List[str] = []
+    lines = skill_text.splitlines()
+    headers = [index for index, line in enumerate(lines) if line.strip() == COMMAND_TABLE_HEADER]
+    if len(headers) != 1:
+        errors.append("command table must have exactly one header")
+        return [], errors
+
+    header_index = headers[0]
+    if header_index + 1 >= len(lines) or lines[header_index + 1].strip() != COMMAND_TABLE_SEPARATOR:
+        errors.append("command table has an invalid separator")
+        return [], errors
+
+    rows: List[Dict[str, str]] = []
+    for line_number, line in enumerate(lines[header_index + 2 :], start=header_index + 3):
+        if not line.strip():
+            break
+        if not line.lstrip().startswith("|"):
+            break
+        cells = line.strip()[1:-1].split("|") if line.strip().endswith("|") else []
+        if len(cells) != 3:
+            errors.append("command table row %d must have three cells" % line_number)
+            continue
+
+        status = _inline_code_cell(cells[0], "status", errors)
+        command = _inline_code_cell(cells[1], "command", errors)
+        route_source = re.fullmatch(
+            r"`(?P<route>[^`]+)`\s*;\s*source:\s*`(?P<citation>[^`]+)`",
+            cells[2].strip(),
+        )
+        if route_source is None:
+            errors.append("command table route/source cell is malformed on row %d" % line_number)
+            continue
+        if status is None or command is None:
+            continue
+        rows.append({
+            "status": status,
+            "command": command,
+            "route": route_source.group("route"),
+            "citation": route_source.group("citation"),
+        })
+    return rows, errors
+
+
+def _validate_command_table(
+    skill_text: str,
+    ledger: Dict[str, Any],
+    rule_ids: set,
+    registered_citations: Dict[str, str],
+) -> List[str]:
+    errors: List[str] = []
+    rules_by_id = {rule.get("id"): rule for rule in ledger.get("rules", [])}
+    rows, parse_errors = _command_table_rows(skill_text)
+    errors.extend(parse_errors)
+
+    rows_by_command: Dict[str, Dict[str, str]] = {}
+    for row in rows:
+        command = row["command"]
+        if command in rows_by_command:
+            errors.append("command table contains duplicate command: %s" % command)
+        rows_by_command[command] = row
+
+    ledger_commands = ledger.get("commands", [])
+    ledger_command_names = set()
+    for command in ledger_commands:
+        value = command.get("command", "")
+        if value in ledger_command_names:
+            errors.append("source ledger contains duplicate command: %s" % value)
+        ledger_command_names.add(value)
+
+        status_error = _validate_command_status(command)
+        if status_error:
+            errors.append(status_error)
+        rule = command.get("rule")
+        if rule not in rule_ids:
+            errors.append("command references unknown rule: %s" % value)
+
+        route = command.get("route")
+        if route not in COMMAND_ROUTES:
+            errors.append("command has unknown route %r: %s" % (route, value))
+        source_route = rules_by_id.get(rule, {}).get("route")
+        if source_route in COMMAND_ROUTES and route != source_route:
+            errors.append("command route does not match its source rule: %s" % value)
+        citation = command.get("citation")
+        if not isinstance(citation, str) or not citation:
+            errors.append("command is missing a source citation: %s" % value)
+        elif registered_citations.get(citation) != rule:
+            errors.append("command citation is not registered for its rule: %s" % value)
+
+        row = rows_by_command.get(value)
+        if row is None:
+            errors.append("command is missing from SKILL.md command table: %s" % value)
+            continue
+        if row["status"] != command.get("status"):
+            errors.append("command status claim does not match the ledger: %s" % value)
+        if row["route"] != route:
+            errors.append("command route claim does not match the ledger: %s" % value)
+        if row["citation"] != citation:
+            errors.append("command source claim does not match the ledger: %s" % value)
+
+    for command in rows_by_command:
+        if command not in ledger_command_names:
+            errors.append("SKILL.md command table contains an unregistered command: %s" % command)
+    return errors
+
+
 def _validate_frontend_boundary(skill_text: str) -> List[str]:
     """Keep the frontend citation limited to the claims in AGENTS.md#L3-L7."""
 
@@ -357,7 +528,7 @@ def check_documents(skill_text: str, ledger: Dict[str, Any]) -> List[str]:
         errors.append("SKILL.md contains carriage returns")
 
     rule_ids = {rule.get("id") for rule in ledger.get("rules", [])}
-    _registered_citations(ledger, skill_text, errors)
+    registered_citations = _registered_citations(ledger, skill_text, errors)
     errors.extend(_validate_frontend_boundary(skill_text))
 
     for case in ledger.get("routing_cases", []):
@@ -371,15 +542,7 @@ def check_documents(skill_text: str, ledger: Dict[str, Any]) -> List[str]:
         if marker not in rule_ids:
             errors.append("SKILL.md contains an unregistered source marker %s" % marker)
 
-    for command in ledger.get("commands", []):
-        value = command.get("command", "")
-        if not value or value not in skill_text:
-            errors.append("command is missing from SKILL.md: %s" % value)
-        status_error = _validate_command_status(command)
-        if status_error:
-            errors.append(status_error)
-        if command.get("rule") not in rule_ids:
-            errors.append("command references unknown rule: %s" % value)
+    errors.extend(_validate_command_table(skill_text, ledger, rule_ids, registered_citations))
 
     if not SOURCE_RE.search(skill_text):
         errors.append("SKILL.md has no source citations")
@@ -411,7 +574,7 @@ def check_scenarios(ledger: Dict[str, Any], safety: Optional[str]) -> List[str]:
 
 
 def check_negative_cases(skill_text: str, ledger: Dict[str, Any]) -> List[str]:
-    """Prove that stale statuses and source-register drift fail closed."""
+    """Prove that stale document claims and source-register drift fail closed."""
 
     errors: List[str] = []
     for name, task, expected in ROUTING_GUARD_CASES:
@@ -426,6 +589,45 @@ def check_negative_cases(skill_text: str, ledger: Dict[str, Any]) -> List[str]:
         command["status"] = status
         if not check_documents(skill_text, candidate):
             errors.append("negative case was accepted: %s" % name)
+
+    first_command = ledger["commands"][0]
+    first_row = (
+        "| `{status}` | `{command}` | `{route}`; source: `{citation}` |".format(
+            **first_command
+        )
+    )
+    stale_status_row = first_row.replace(
+        "`%s`" % first_command["status"], "`UNSAFE: stale status / NOT RUN`", 1
+    )
+    stale_status = skill_text.replace(first_row, stale_status_row, 1)
+    if stale_status == skill_text or not check_documents(stale_status, ledger):
+        errors.append("negative case was accepted: stale-command-status-claim")
+
+    stale_route_row = first_row.replace("`%s`" % first_command["route"], "`web-k8s`", 1)
+    stale_route = skill_text.replace(first_row, stale_route_row, 1)
+    if stale_route == skill_text or not check_documents(stale_route, ledger):
+        errors.append("negative case was accepted: stale-command-route-claim")
+
+    stale_citation = ledger["rules"][1]["citations"][0]["citation"]
+    stale_source_row = first_row.replace(
+        first_command["citation"], stale_citation, 1
+    )
+    stale_source = skill_text.replace(first_row, stale_source_row, 1)
+    if stale_source == skill_text or not check_documents(stale_source, ledger):
+        errors.append("negative case was accepted: stale-command-source-claim")
+
+    unsafe_command = ledger["commands"][6]
+    unsafe_row = (
+        "| `{status}` | `{command}` | `{route}`; source: `{citation}` |".format(
+            **unsafe_command
+        )
+    )
+    contradictory_safety_row = unsafe_row.replace(
+        unsafe_command["status"], SAFE_COMMAND_STATUS, 1
+    )
+    contradictory_safety = skill_text.replace(unsafe_row, contradictory_safety_row, 1)
+    if contradictory_safety == skill_text or not check_documents(contradictory_safety, ledger):
+        errors.append("negative case was accepted: contradictory-command-safety-claim")
 
     unregistered = copy.deepcopy(ledger)
     unregistered_citation = (
@@ -477,7 +679,7 @@ def main() -> int:
     rule_count = len(ledger.get("rules", []))
     command_count = len(ledger.get("commands", []))
     if args.scenario == "negative":
-        case_count = len(NEGATIVE_STATUS_CASES) + len(ROUTING_GUARD_CASES) + 3
+        case_count = len(NEGATIVE_STATUS_CASES) + len(ROUTING_GUARD_CASES) + 7
     else:
         case_count = len(ledger.get("routing_cases", [])) if scenario is None else sum(
             case.get("safety") == scenario for case in ledger.get("routing_cases", [])

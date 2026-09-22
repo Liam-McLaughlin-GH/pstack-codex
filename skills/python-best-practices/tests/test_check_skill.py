@@ -60,6 +60,56 @@ class RoutingRegressionTests(unittest.TestCase):
         )
         self.assertEqual(CHECKER.route_for_task("fab --list"), "web-k8s")
 
+    def test_framework_only_component_requests_stay_general(self) -> None:
+        for request in (
+            "Change a React component",
+            "Change a Next.js component",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "general")
+
+    def test_showpass_or_repository_cues_route_modern_ui_to_frontend(self) -> None:
+        for request in (
+            "Change a Showpass Next.js component",
+            "Change a showpass-frontend React component",
+            "Change the packages/next-app component",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "showpass-frontend")
+
+    def test_nextjs_bridge_wording_routes_bridge_only_work_to_web_app(self) -> None:
+        for request in (
+            "Fix the Next.js bridge",
+            "Fix the Next.js redirect",
+            "Fix the Next.js bridge-route",
+            "Fix the Next.js bridge route",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "web-app")
+                self.assertEqual(CHECKER.repositories_for_task(request), ("web-app",))
+
+    def test_nextjs_bridge_with_modern_ui_work_keeps_both_owners(self) -> None:
+        for request in (
+            "Fix the Next.js bridge and update the React component",
+            "Fix the Next.js redirect and update the modern UI",
+            "Fix the Next.js bridge and update the React client",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "ambiguous")
+                self.assertEqual(
+                    CHECKER.repositories_for_task(request),
+                    ("web-app", "showpass-frontend"),
+                )
+
+    def test_natural_language_fabric_environment_operations_are_manual_review(self) -> None:
+        for request in (
+            "Run a Fabric operation in beta",
+            "Use Fabric against the live environment",
+            "Review a Fabric operation against production",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "unsafe")
+
 
 class LedgerRegistrationTests(unittest.TestCase):
     def test_new_routing_cases_name_registered_source_rules(self) -> None:
@@ -70,13 +120,66 @@ class LedgerRegistrationTests(unittest.TestCase):
         for name in (
             "fabric3-task",
             "fabric-3-task",
+            "fabric-beta-operation",
             "legacy-ui-bridge",
             "angularjs-bridge",
+            "nextjs-bridge-only",
+            "nextjs-redirect-only",
+            "nextjs-bridge-route-only",
+            "nextjs-bridge-modern-ui",
             "mixed-angularjs-react",
         ):
             with self.subTest(name=name):
                 self.assertIn("rule", cases[name])
                 self.assertIn(cases[name]["rule"], rule_ids)
+
+
+class CommandTableConsistencyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.skill_text = CHECKER.SKILL_PATH.read_text(encoding="utf-8")
+        self.ledger = CHECKER.load_ledger()
+
+    def _row(self, command: dict[str, str]) -> str:
+        return (
+            "| `{status}` | `{command}` | `{route}`; source: `{citation}` |".format(
+                **command
+            )
+        )
+
+    def test_status_claim_must_match_the_ledger(self) -> None:
+        command = self.ledger["commands"][0]
+        stale_row = self._row(command).replace(
+            "`%s`" % command["status"], "`UNSAFE: stale status / NOT RUN`", 1
+        )
+        candidate = self.skill_text.replace(self._row(command), stale_row, 1)
+
+        self.assertTrue(CHECKER.check_documents(candidate, self.ledger))
+
+    def test_safety_claim_must_match_the_ledger(self) -> None:
+        command = self.ledger["commands"][6]
+        contradictory_row = self._row(command).replace(
+            command["status"], CHECKER.SAFE_COMMAND_STATUS, 1
+        )
+        candidate = self.skill_text.replace(self._row(command), contradictory_row, 1)
+
+        self.assertTrue(CHECKER.check_documents(candidate, self.ledger))
+
+    def test_route_claim_must_match_the_ledger(self) -> None:
+        command = self.ledger["commands"][0]
+        stale_row = self._row(command).replace("`web-app`", "`web-k8s`", 1)
+        candidate = self.skill_text.replace(self._row(command), stale_row, 1)
+
+        self.assertTrue(CHECKER.check_documents(candidate, self.ledger))
+
+    def test_source_claim_must_match_the_ledger_even_when_citation_is_registered(self) -> None:
+        command = self.ledger["commands"][0]
+        registered_other_citation = self.ledger["rules"][1]["citations"][0]["citation"]
+        stale_row = self._row(command).replace(
+            command["citation"], registered_other_citation, 1
+        )
+        candidate = self.skill_text.replace(self._row(command), stale_row, 1)
+
+        self.assertTrue(CHECKER.check_documents(candidate, self.ledger))
 
 
 if __name__ == "__main__":
