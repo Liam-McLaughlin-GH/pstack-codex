@@ -3058,11 +3058,14 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
         )
         _assert_path_matches_descriptor(skills_parent, skills_parent_fd, "output parent")
         _assert_path_matches_descriptor(target, target_fd, "reserved target")
-        if staging_reservation is None or not _remove_reserved_directory_tree(staging_reservation):
+        if staging_reservation is None:
             staging_reservation = None
             raise CollisionError(f"staging directory changed during publication: {staging}")
-        _close_published(staging_child_reservations)
+        _rollback_published(staging_child_reservations, recursive=False)
         staging_child_reservations = []
+        if not _remove_reserved_empty_directory(staging_reservation):
+            staging_reservation = None
+            raise CollisionError(f"staging directory changed during publication: {staging}")
         staging_reservation = None
         staging = None
         if target_reservation is not None:

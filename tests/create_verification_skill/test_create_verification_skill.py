@@ -1305,6 +1305,42 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
             self.assertEqual((staging / "unexpected.txt").read_text(encoding="utf-8"), "competitor\n")
             self.assertEqual(outside.stat().st_nlink, 2)
 
+    def test_success_cleanup_preserves_an_unrecorded_staging_entry(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-success-cleanup-") as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            copy_fixture(project)
+            original_assert = scaffold_module._assert_reserved_target_identity
+            injected = False
+
+            def inject_competitor(
+                parent_fd: int,
+                target_name: str,
+                target: Path,
+                target_fd: int,
+                identity: tuple[int, int],
+            ) -> None:
+                nonlocal injected
+                original_assert(parent_fd, target_name, target, target_fd, identity)
+                if not injected and (target / "SKILL.md").exists():
+                    staging = next((project / ".agents" / "skills").glob(".verify-tiny-fixture.staging-*"))
+                    (staging / "unexpected.txt").write_text("competitor\n", encoding="utf-8")
+                    injected = True
+
+            with mock.patch.object(
+                scaffold_module,
+                "_assert_reserved_target_identity",
+                side_effect=inject_competitor,
+            ):
+                with self.assertRaises(CollisionError):
+                    scaffold_module.scaffold(spec_for(), project)
+
+            self.assertTrue(injected)
+            staging = next((project / ".agents" / "skills").glob(".verify-tiny-fixture.staging-*"))
+            self.assertEqual((staging / "unexpected.txt").read_text(encoding="utf-8"), "competitor\n")
+            self.assertFalse((project / ".agents" / "skills" / "verify-tiny-fixture").exists())
+
     def test_post_link_identity_failure_rolls_back_the_child(self) -> None:
         with tempfile.TemporaryDirectory(prefix="create-verification-post-link-identity-") as temporary:
             root = Path(temporary)
