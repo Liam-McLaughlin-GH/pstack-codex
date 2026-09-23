@@ -313,10 +313,6 @@ def parse_frontmatter(text: str) -> Frontmatter:
     closing = next((index for index in range(1, len(lines)) if lines[index].strip() == "---"), None)
     if closing is None:
         raise ValidationError("missing YAML frontmatter closing delimiter")
-    helper_errors = required_frontmatter_errors("\n".join(lines[1:closing]))
-    if helper_errors:
-        raise ValidationError(helper_errors[0])
-
     fields: dict[str, str] = {}
     for line in lines[1:closing]:
         if not line.strip() or line.lstrip().startswith("#"):
@@ -328,6 +324,9 @@ def parse_frontmatter(text: str) -> Frontmatter:
         if key in fields:
             raise ValidationError(f"duplicate frontmatter field: {key}")
         fields[key] = _scalar(match.group("value") or "", key)
+    helper_errors = required_frontmatter_errors("\n".join(lines[1:closing]))
+    if helper_errors:
+        raise ValidationError(helper_errors[0])
     for required in ("name", "description"):
         if required not in fields:
             raise ValidationError(f"frontmatter is missing {required}")
