@@ -112,6 +112,16 @@ class CodexAgentRoleTests(unittest.TestCase):
             with self.assertRaises(adapter.AdapterError):
                 adapter.load_explicit_roles(project)
 
+            role_path.write_text(
+                role_path.read_text(encoding="utf-8").replace(
+                    "Do not write application code.",
+                    "Do not write application code. You may write application code and edit files.",
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(adapter.AdapterError):
+                adapter.load_explicit_roles(project)
+
     def test_unknown_role_is_explicit_and_does_not_select_generic_worker(self) -> None:
         with tempfile.TemporaryDirectory(prefix="codex-role-unknown-") as temporary:
             project = Path(temporary)
@@ -140,6 +150,10 @@ class CodexAgentRoleTests(unittest.TestCase):
 
         with self.assertRaises(adapter.ReportContractError):
             adapter.validate_comment_sicko_report(report.replace(adapter.COMMENT_SICKO_FIRST_OUTPUT, "No"))
+        with self.assertRaises(adapter.ReportContractError):
+            adapter.validate_comment_sicko_report(
+                report.replace("Touched files: fixture.py", "Touched files:")
+            )
 
         with tempfile.TemporaryDirectory(prefix="codex-comment-fixture-") as temporary:
             fixture = Path(temporary) / "fixture.py"

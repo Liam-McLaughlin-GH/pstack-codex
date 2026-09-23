@@ -23,8 +23,8 @@ COMMENT_SICKO_REPORT_FIELDS = (
     "Skips:",
 )
 COMMENT_SICKO_REQUIRED_INSTRUCTIONS = (
-    f"Your first output must be exactly this single line:\n{COMMENT_SICKO_FIRST_OUTPUT}",
-    "Do not write application code.",
+    "Your first output must be exactly this single line:",
+    COMMENT_SICKO_FIRST_OUTPUT,
     *COMMENT_SICKO_REPORT_FIELDS,
 )
 VALID_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
@@ -118,15 +118,47 @@ def parse_role_file(path: Path) -> RoleDefinition:
     if role.name == "Comment Sicko":
         if sandbox_mode != "read-only":
             raise AdapterError(f"{path}: Comment Sicko requires sandbox_mode = 'read-only'")
+        instruction_lines = [line.strip() for line in role.developer_instructions.splitlines()]
+        expected_prefix = [
+            "Your first output must be exactly this single line:",
+            COMMENT_SICKO_FIRST_OUTPUT,
+        ]
+        if instruction_lines[:2] != expected_prefix:
+            raise AdapterError(
+                f"{path}: Comment Sicko must begin with its exact first-output contract"
+            )
         missing = [
             required
             for required in COMMENT_SICKO_REQUIRED_INSTRUCTIONS
-            if required not in role.developer_instructions
+            if required not in instruction_lines
         ]
+        if not any(
+            "Do not write application code." in line
+            for line in instruction_lines
+        ):
+            missing.append("Do not write application code.")
         if missing:
             raise AdapterError(
                 f"{path}: Comment Sicko is missing required report-only instructions: "
                 + "; ".join(missing)
+            )
+        unsafe_lines = [
+            line
+            for line in instruction_lines
+            if any(
+                phrase in line.casefold().replace("do not write application code.", "")
+                for phrase in (
+                    "write application code",
+                    "edit application code",
+                    "write files",
+                    "edit files",
+                )
+            )
+        ]
+        if unsafe_lines:
+            raise AdapterError(
+                f"{path}: Comment Sicko contains write-capable instructions: "
+                + "; ".join(unsafe_lines)
             )
     return role
 
@@ -358,6 +390,8 @@ def validate_comment_sicko_report(output: str) -> dict[str, str]:
                     sections[field] = f"{sections[field]}\n{value}"
                 else:
                     sections[field] = value
+                if not value:
+                    raise ReportContractError(f"Comment Sicko report leaves {field!r} empty")
                 break
     missing = [field for field in COMMENT_SICKO_REPORT_FIELDS if field not in sections]
     if missing:
