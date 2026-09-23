@@ -68,14 +68,21 @@ class RoutingRegressionTests(unittest.TestCase):
             with self.subTest(request=request):
                 self.assertEqual(CHECKER.route_for_task(request), "unsafe")
 
-    def test_frontend_repository_tokens_require_a_real_suffix_boundary(self) -> None:
-        for request in (
-            "Change packages/core-extra",
-            "Change showpass-frontend-extra",
+    def test_registered_repository_tokens_require_a_real_suffix_boundary(self) -> None:
+        for token in (
+            "web-app",
+            "web-k8s",
+            "showpass-frontend",
+            "packages/core",
+            "packages/next-app",
+            "packages/mobile",
+            "packages/desktop",
         ):
-            with self.subTest(request=request):
-                self.assertEqual(CHECKER.route_for_task(request), "general")
-                self.assertEqual(CHECKER.repositories_for_task(request), ())
+            for suffix in ("-extra", "_extra"):
+                request = f"Change {token}{suffix}"
+                with self.subTest(request=request):
+                    self.assertEqual(CHECKER.route_for_task(request), "general")
+                    self.assertEqual(CHECKER.repositories_for_task(request), ())
 
     def test_framework_only_component_requests_stay_general(self) -> None:
         for request in (

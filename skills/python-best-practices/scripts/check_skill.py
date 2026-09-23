@@ -36,6 +36,29 @@ COMMAND_ROUTES = {
 }
 COMMAND_TABLE_HEADER = "| Status | Command | Route and source |"
 COMMAND_TABLE_SEPARATOR = "|---|---|---|"
+REGISTERED_REPOSITORY_TOKENS = (
+    "web-app",
+    "web-k8s",
+    "showpass-frontend",
+    "packages/core",
+    "packages/next-app",
+    "packages/mobile",
+    "packages/desktop",
+)
+
+
+def _real_token_pattern(*tokens: str) -> str:
+    """Build alternatives that cannot match a hyphenated or underscored suffix."""
+
+    return "|".join(
+        r"(?<![a-z0-9_-])%s(?![a-z0-9_-])" % re.escape(token)
+        for token in tokens
+    )
+
+
+REPOSITORY_TOKEN_PATTERNS = {
+    token: _real_token_pattern(token) for token in REGISTERED_REPOSITORY_TOKENS
+}
 FRONTEND_BOUNDARY_SUPPORTED = (
     "Start with the `showpass-frontend` repository guidance for its web, mobile, "
     "and desktop apps built with React, Next.js, and React Native."
@@ -79,21 +102,28 @@ DEPLOYMENT_OPERATION_RE = re.compile(
 )
 PRODUCTION_LIVE_RE = re.compile(r"\b(?:production|prod|live)\b")
 BACKEND_CUE_RE = re.compile(
-    r"\b(?:showpass\s+backend|web-app|django|drf|orm|manage\.py|celery)\b"
+    r"(?:%s|\b(?:showpass\s+backend|django|drf|orm|manage\.py|celery)\b)"
+    % REPOSITORY_TOKEN_PATTERNS["web-app"]
 )
 FRONTEND_CUE_RE = re.compile(
-    r"(?<![a-z0-9_-])(?:showpass-frontend|next(?:\.js|js)?|"
-    r"react(?:\s+native)?|frontend|client)(?![a-z0-9_-])"
+    r"(?:%s|(?<![a-z0-9_-])(?:next(?:\.js|js)?|"
+    r"react(?:\s+native)?|frontend|client)(?![a-z0-9_-]))"
+    % REPOSITORY_TOKEN_PATTERNS["showpass-frontend"]
 )
 FRONTEND_OWNER_CUE_RE = re.compile(
-    r"(?<![a-z0-9_-])(?:showpass-frontend|next(?:\.js|js)?|"
-    r"react(?:\s+native)?)(?![a-z0-9_-])"
+    r"(?:%s|(?<![a-z0-9_-])(?:next(?:\.js|js)?|"
+    r"react(?:\s+native)?)(?![a-z0-9_-]))"
+    % REPOSITORY_TOKEN_PATTERNS["showpass-frontend"]
 )
 FRONTEND_REPOSITORY_CUE_RE = re.compile(
-    r"(?<![a-z0-9_-])(?:showpass-frontend|packages/(?:core|next-app|mobile|desktop))"
-    r"(?![a-z0-9_-])"
+    "|".join(
+        REPOSITORY_TOKEN_PATTERNS[token]
+        for token in REGISTERED_REPOSITORY_TOKENS
+        if token not in {"web-app", "web-k8s"}
+    )
 )
-SHOWPASS_PRODUCT_CUE_RE = re.compile(r"(?<![a-z0-9_-])showpass(?![a-z0-9_-])")
+INFRASTRUCTURE_REPOSITORY_CUE_RE = re.compile(REPOSITORY_TOKEN_PATTERNS["web-k8s"])
+SHOWPASS_PRODUCT_CUE_RE = re.compile(_real_token_pattern("showpass"))
 SHOWPASS_UI_CUE_RE = re.compile(
     r"\bshowpass\s+(?:web|mobile|desktop|frontend|ui|client)\b"
 )
@@ -159,13 +189,20 @@ ROUTING_GUARD_CASES = (
         "Fix the AngularJS bridge and update the React component",
         "ambiguous",
     ),
+    ("backend-repository-suffix", "Change web-app-extra", "general"),
+    ("backend-repository-underscore-suffix", "Change web-app_extra", "general"),
+    ("infrastructure-repository-suffix", "Change web-k8s-extra", "general"),
+    ("infrastructure-repository-underscore-suffix", "Change web-k8s_extra", "general"),
 )
 
 
 def _has_infrastructure_cue(text: str) -> bool:
-    return any(marker in text for marker in ("web-k8s", "kubectl", "gcloud")) or bool(
-        re.search(r"\bfab(?:\s|$)", text)
-    ) or "fabric" in text
+    return (
+        bool(INFRASTRUCTURE_REPOSITORY_CUE_RE.search(text))
+        or any(marker in text for marker in ("kubectl", "gcloud"))
+        or bool(re.search(r"\bfab(?:\s|$)", text))
+        or "fabric" in text
+    )
 
 
 def _production_live_requires_review(text: str) -> bool:
