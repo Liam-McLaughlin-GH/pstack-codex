@@ -313,6 +313,9 @@ def parse_frontmatter(text: str) -> Frontmatter:
     closing = next((index for index in range(1, len(lines)) if lines[index].strip() == "---"), None)
     if closing is None:
         raise ValidationError("missing YAML frontmatter closing delimiter")
+    helper_errors = required_frontmatter_errors("\n".join(lines[1:closing]))
+    if helper_errors:
+        raise ValidationError(helper_errors[0])
 
     fields: dict[str, str] = {}
     for line in lines[1:closing]:
