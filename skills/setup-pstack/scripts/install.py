@@ -25,6 +25,7 @@ if str(SCRIPT_DIRECTORY) not in sys.path:
 
 from safe_fs import (  # noqa: E402
     CleanupReceipt,
+    CleanupReceiptEntry,
     SafeFilesystemError,
     TreeSnapshot,
     atomic_rename_noreplace_at,
@@ -141,6 +142,33 @@ def _parent_cleanup_retry_hint(receipt: CleanupReceipt | None) -> str | None:
     if receipt.truncated:
         paths += ", ..."
     return f"inspect created-parent identities ({paths}) before retrying the original install command"
+
+
+def _ensure_recovery_receipt_entry(
+    receipt: CleanupReceipt | None,
+    required: CleanupReceiptEntry,
+) -> CleanupReceipt:
+    """Keep a required recovery identity in the bounded rollback receipt."""
+
+    if receipt is not None:
+        if any(
+            entry.path == required.path
+            and entry.expected_dev == required.expected_dev
+            and entry.expected_ino == required.expected_ino
+            for entry in receipt.entries
+        ):
+            return receipt
+        entries = list(receipt.entries)
+        truncated = receipt.truncated
+    else:
+        entries = []
+        truncated = False
+    if len(entries) >= 8:
+        entries = entries[:7]
+        truncated = True
+    entries.append(required)
+    entries.sort(key=lambda entry: (str(entry.path), entry.expected_dev, entry.expected_ino, entry.reason))
+    return CleanupReceipt(tuple(entries), truncated)
 
 
 def _source_snapshot(source: Path) -> TreeSnapshot:
@@ -440,12 +468,19 @@ def apply_install(source: Path, destination: Path) -> InstallPlan:
                         None,
                     )
                     residue = Path(residue_text) if residue_text else None
-                    if recovery_state == "rollback_parent_cleanup_pending":
-                        retry = _parent_cleanup_retry_hint(recovery_receipt)
+                    if residue is not None and staging_metadata is not None:
+                        recovery_receipt = _ensure_recovery_receipt_entry(
+                            recovery_receipt,
+                            CleanupReceiptEntry(
+                                residue,
+                                staging_metadata.st_dev,
+                                staging_metadata.st_ino,
+                                "staging-cleanup-pending",
+                            ),
+                        )
+                        retry = _cleanup_retry_hint(residue, staging_metadata)
                     else:
-                        retry = _cleanup_retry_hint(residue, staging_metadata) if residue is not None else None
-                        if retry is None:
-                            retry = _parent_cleanup_retry_hint(recovery_receipt)
+                        retry = _parent_cleanup_retry_hint(recovery_receipt)
                     message = f"install rollback cleanup is incomplete (status=cleanup_pending): {detail}"
                     if residue is not None and retry is not None:
                         message += f". Retry with {retry}"

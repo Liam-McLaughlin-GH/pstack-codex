@@ -309,9 +309,154 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertEqual(raised.exception.status, "cleanup_pending")
             self.assertEqual(raised.exception.recovery_state, "rollback_parent_cleanup_pending")
             self.assertIsNotNone(raised.exception.recovery_receipt)
-            self.assertIn("created-parent identities", raised.exception.retry or "")
+            self.assertIn("install.py cleanup --residue", raised.exception.retry or "")
+            self.assertIn("--expected-dev", raised.exception.retry or "")
             self.assertEqual((destination / "operator.txt").read_text(encoding="utf-8"), "keep me\n")
             self.assertTrue(expected_parent.is_dir())
+
+    def test_installer_rollback_preserves_staging_identity_when_parent_cleanup_also_fails(self) -> None:
+        module = load_module(INSTALLER, "install_for_composed_rollback_cleanup_test")
+        safe_fs = sys.modules["safe_fs"]
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-install-composed-rollback-test-") as temporary:
+            root = Path(temporary)
+            source = root / "source" / "setup-pstack"
+            write_skill(source)
+            destination = root / "new-root" / ".agents" / "skills"
+            original_publish = module.atomic_rename_noreplace_at
+            original_remove = module.remove_tree_at
+            original_parent_cleanup = module.cleanup_created_directories
+
+            def fail_publication(parent_fd: int, source_name: str, target_name: str) -> None:
+                raise OSError("injected publication failure")
+
+            def fail_staging_cleanup(parent_fd: int, name: str, **kwargs: object) -> None:
+                residue = kwargs["receipt_root"]
+                metadata = kwargs["expected_metadata"]
+                assert isinstance(residue, Path)
+                assert isinstance(metadata, os.stat_result)
+                child_metadata = os.lstat(residue / "SKILL.md")
+                receipt = safe_fs.CleanupReceipt.from_entries(
+                    [
+                        safe_fs.CleanupReceiptEntry(
+                            residue / "SKILL.md",
+                            child_metadata.st_dev,
+                            child_metadata.st_ino,
+                            "identity-delete-unavailable",
+                        )
+                    ]
+                )
+                raise safe_fs.SafeFilesystemError(
+                    "injected staging cleanup failure",
+                    cleanup_receipt=receipt,
+                    preserve_private=True,
+                )
+
+            def fail_parent_cleanup(created: list[object]) -> None:
+                entries = [
+                    safe_fs.CleanupReceiptEntry(
+                        entry.path,
+                        entry.metadata.st_dev,
+                        entry.metadata.st_ino,
+                        "cleanup-error",
+                    )
+                    for entry in created
+                ]
+                safe_fs.close_created_directories(created)
+                raise safe_fs.SafeFilesystemError(
+                    "injected parent cleanup failure",
+                    cleanup_receipt=safe_fs.CleanupReceipt.from_entries(entries),
+                )
+
+            module.atomic_rename_noreplace_at = fail_publication
+            module.remove_tree_at = fail_staging_cleanup
+            module.cleanup_created_directories = fail_parent_cleanup
+            try:
+                with self.assertRaises(module.InstallError) as raised:
+                    module.apply_install(source, destination)
+            finally:
+                module.atomic_rename_noreplace_at = original_publish
+                module.remove_tree_at = original_remove
+                module.cleanup_created_directories = original_parent_cleanup
+
+            error = raised.exception
+            self.assertEqual(error.status, "cleanup_pending")
+            self.assertEqual(error.recovery_state, "rollback_parent_cleanup_pending")
+            self.assertIsNotNone(error.residue)
+            residue = error.residue
+            assert residue is not None
+            residue_metadata = os.lstat(residue)
+            self.assertEqual(error.retry, module._cleanup_retry_hint(residue, residue_metadata))
+            self.assertIn("created parent cleanup", str(error))
+            self.assertIsNotNone(error.recovery_receipt)
+            self.assertTrue(
+                any(
+                    entry.path == residue
+                    and entry.expected_dev == residue_metadata.st_dev
+                    and entry.expected_ino == residue_metadata.st_ino
+                    for entry in error.recovery_receipt.entries
+                )
+            )
+
+    def test_linux_final_disposal_does_not_delete_a_replacement_after_private_name_swap(self) -> None:
+        safe_fs = load_module(SAFE_FS, "safe_fs_linux_final_disposal_race_test")
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-linux-final-disposal-race-test-") as temporary:
+            root = Path(temporary)
+            victim = root / "victim"
+            competitor = root / "competitor"
+            victim.write_text("expected\n", encoding="utf-8")
+            competitor.write_text("competitor\n", encoding="utf-8")
+            parent_fd = os.open(root, os.O_RDONLY)
+            original_platform = safe_fs.sys.platform
+            original_rename = safe_fs.atomic_rename_noreplace_at
+            original_cdll = safe_fs.ctypes.CDLL
+            unlink_attempted = False
+
+            class FakeUnlinkAt:
+                def __call__(self, directory_fd: int, encoded_name: bytes, flags: int) -> int:
+                    nonlocal unlink_attempted
+                    unlink_attempted = True
+                    name = os.fsdecode(encoded_name)
+                    os.rename(name, "expected-private", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                    os.rename(competitor, name, dst_dir_fd=directory_fd)
+                    os.unlink(name, dir_fd=directory_fd)
+                    return 0
+
+            class FakeLibc:
+                def __init__(self) -> None:
+                    self.unlinkat = FakeUnlinkAt()
+
+            def fallback_rename(directory_fd: int, source_name: str, target_name: str) -> None:
+                try:
+                    os.stat(target_name, dir_fd=directory_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    os.rename(source_name, target_name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                    return
+                raise FileExistsError(target_name)
+
+            safe_fs.sys.platform = "linux"
+            safe_fs.atomic_rename_noreplace_at = fallback_rename
+            safe_fs.ctypes.CDLL = lambda *args, **kwargs: FakeLibc()
+            try:
+                with self.assertRaises(safe_fs.SafeFilesystemError) as raised:
+                    safe_fs._native_unlink_at(
+                        parent_fd,
+                        "victim",
+                        is_directory=False,
+                        expected_metadata=safe_fs.lstat_at(parent_fd, "victim"),
+                        receipt_path=root / "receipt" / "victim",
+                    )
+            finally:
+                safe_fs.sys.platform = original_platform
+                safe_fs.atomic_rename_noreplace_at = original_rename
+                safe_fs.ctypes.CDLL = original_cdll
+                os.close(parent_fd)
+
+            self.assertFalse(unlink_attempted)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "expected\n")
+            self.assertEqual(competitor.read_text(encoding="utf-8"), "competitor\n")
+            receipt = raised.exception.cleanup_receipt
+            self.assertIsNotNone(receipt)
+            self.assertEqual(receipt.entries[-1].reason, "identity-delete-unavailable")
 
     def test_installer_rollback_reports_identity_bound_cleanup_receipt(self) -> None:
         module = load_module(INSTALLER, "install_for_cleanup_receipt_test")

@@ -608,6 +608,16 @@ def _native_unlink_at(
                 expected_metadata=expected_metadata,
                 reason="identity-delete-unavailable",
             )
+        if sys.platform.startswith("linux"):
+            raise _with_cleanup_receipt(
+                SafeFilesystemError(
+                    "Linux has no identity-bound final delete primitive; pathname fallback is disabled",
+                    preserve_private=True,
+                ),
+                path=receipt_path or Path(name),
+                expected_metadata=expected_metadata,
+                reason="identity-delete-unavailable",
+            )
         try:
             libc = ctypes.CDLL(None, use_errno=True)
             function = getattr(libc, "unlinkat")
@@ -1021,9 +1031,28 @@ def _delete_private_entry(
                         exc = SafeFilesystemError(f"{exc}; {restore_error}")
         if delete_name is not None and not preserve_private:
             try:
-                _restore_bound_entry(parent_fd, public_name, delete_name)
-            except SafeFilesystemError as restore_error:
-                exc = SafeFilesystemError(f"{exc}; {restore_error}")
+                private_metadata = lstat_at(parent_fd, delete_name)
+            except FileNotFoundError:
+                private_metadata = None
+            if private_metadata is not None:
+                try:
+                    lstat_at(parent_fd, public_name)
+                except FileNotFoundError:
+                    try:
+                        _restore_bound_entry(parent_fd, public_name, delete_name)
+                    except SafeFilesystemError as restore_error:
+                        exc = SafeFilesystemError(f"{exc}; {restore_error}")
+                else:
+                    # A competitor owns the public name, so restoration is
+                    # intentionally refused. Keep the private identity in the
+                    # receipt; otherwise cleanup recovery cannot find the
+                    # expected entry after a non-empty-directory race.
+                    exc = _with_cleanup_receipt(
+                        exc,
+                        path=(receipt_path or Path(public_name)).parent / delete_name,
+                        expected_metadata=private_metadata,
+                        reason="private-cleanup-pending",
+                    )
         if quarantine_name is not None:
             current_quarantine_metadata: os.stat_result | None = None
             try:
