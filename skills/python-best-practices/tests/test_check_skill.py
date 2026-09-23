@@ -110,6 +110,26 @@ class RoutingRegressionTests(unittest.TestCase):
             "gcloud scheduler jobs run job",
             "gcloud scheduler jobs pause job",
             "gcloud workflows run workflow",
+            "gcloud auth activate-refresh-token token",
+            "gcloud builds cancel build",
+            "gcloud components reinstall component",
+            "gcloud container clusters get-credentials cluster",
+            "gcloud container fleet rollouts pause rollout",
+            "gcloud app versions migrate service",
+            "gcloud compute config-ssh",
+            "gcloud dataflow jobs run job",
+            "gcloud deployment-manager deployments cancel-preview deployment",
+            "gcloud pubsub subscriptions seek subscription",
+            "gcloud sql instances failover instance",
+            "gcloud tasks queues purge queue",
+            "gcloud transfer jobs run job",
+            "gcloud compute backend-services edit service",
+            "gcloud run services ssh service",
+            "gcloud workflows executions cancel execution",
+            "gcloud artifacts repositories copy source target",
+            "gcloud spanner databases execute-sql database",
+            "gcloud operations cancel operation",
+            "gcloud meta apis methods call",
         ):
             with self.subTest(request=request):
                 self.assertEqual(CHECKER.route_for_task(request), "unsafe")
@@ -558,7 +578,14 @@ class DocumentIntegrityTests(unittest.TestCase):
                     errors = CHECKER.check_documents(candidate, self.ledger)
                 self.assertTrue(any(field in error for error in errors), errors)
 
-            for value in ("!!str []", "!!str {x: y}", "!<tag:yaml.org,2002:str> [x]"):
+            for value in (
+                "!!str []",
+                "!!str {x: y}",
+                "!<tag:yaml.org,2002:str> [x]",
+                "!!str *missing",
+                "!!str !!int 1",
+                "!!str # comment",
+            ):
                 with self.subTest(field=field, value=value):
                     candidate = self.skill_text.replace(
                         original,
@@ -632,6 +659,11 @@ class DocumentIntegrityTests(unittest.TestCase):
         self.assertFalse(
             CHECKER.required_frontmatter_errors(
                 "name: |2\n  value\n \ndescription: desc\n"
+            )
+        )
+        self.assertTrue(
+            CHECKER.required_frontmatter_errors(
+                "name: |2\n  value\n\t\ndescription: desc\n"
             )
         )
 

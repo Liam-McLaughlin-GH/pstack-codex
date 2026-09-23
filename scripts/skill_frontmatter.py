@@ -87,8 +87,14 @@ def _tagged_value_error(field: str, value: str) -> str | None:
     kind = _yaml_tag_kind(match.group("tag"))
     payload = (match.group("payload") or "").strip()
     if kind in YAML_STRING_TAGS:
+        payload = _without_inline_comment(payload)
+        anchor_match = re.fullmatch(r"&[A-Za-z_][A-Za-z0-9_-]*(?:[ \t]+(.*))?", payload)
+        if anchor_match is not None:
+            payload = (anchor_match.group(1) or "").strip()
         if not payload:
             return f"{field} must be a non-empty scalar string"
+        if payload.startswith("*") or payload.startswith("!"):
+            return f"{field} must be a scalar string, not an unresolved YAML alias or tag"
         if payload.startswith("[") or payload.startswith("{"):
             return f"{field} must be a scalar string, not a YAML collection"
         if payload[0] in {"'", '"'}:
@@ -182,13 +188,17 @@ def required_frontmatter_errors(metadata: str) -> list[str]:
             invalid_indent = False
             while index < len(lines):
                 next_line = lines[index]
-                if not next_line or not next_line.strip():
+                if not next_line:
                     content.append("")
                     index += 1
                     continue
                 whitespace_prefix = next_line[: len(next_line) - len(next_line.lstrip(" \t"))]
                 if "\t" in whitespace_prefix:
                     invalid_indent = True
+                    index += 1
+                    continue
+                if not next_line.strip():
+                    content.append("")
                     index += 1
                     continue
                 leading = len(next_line) - len(next_line.lstrip(" "))
