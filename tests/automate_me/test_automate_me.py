@@ -626,6 +626,46 @@ class AutomateMeBehaviorTests(unittest.TestCase):
             self.assertIn("Copyright (c) 2026 Lauren Tan", provenance)
             self.assertTrue((target / "agents" / "openai.yaml").is_file())
 
+    def test_skill_creator_scaffold_frontmatter_placeholder_is_a_string(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-scaffold-frontmatter-") as temp_dir:
+            skill = Path(temp_dir) / "safe-skill"
+            skill.mkdir()
+            (skill / "SKILL.md").write_text(
+                "---\n"
+                "name: safe-skill\n"
+                "description: [TODO: Complete and informative explanation of what the skill does and when to use it.]\n"
+                "---\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(validate_skill_tree(skill, require_provenance=False), ())
+
+    def test_skill_creator_scaffold_todo_prose_and_reference_definition_are_valid(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-scaffold-markdown-") as temp_dir:
+            skill = Path(temp_dir) / "safe-skill"
+            references = skill / "references"
+            references.mkdir(parents=True)
+            (references / "real.md").write_text("# Real\n", encoding="utf-8")
+            body = """[TODO: Choose the structure that best fits this skill's purpose. Common patterns:
+
+**1. Workflow-Based** (best for sequential processes)
+- Works well when there are clear step-by-step procedures
+
+[TODO: Add content here. See examples in existing skills:
+- Code samples for technical skills
+- References to scripts/templates/references as needed]
+
+Read [reference][reference-definition].
+
+[reference-definition]: references/real.md
+"""
+            (skill / "SKILL.md").write_text(
+                '---\nname: safe-skill\ndescription: "Safe"\n---\n\n' + body,
+                encoding="utf-8",
+            )
+            self.assertEqual(validate_skill_tree(skill, require_provenance=False), ())
+
     def test_create_invokes_the_required_skill_creator_initializer(self) -> None:
         initializer = skill_creator_initializer()
         if initializer is None:
@@ -938,6 +978,7 @@ Read [provenance](references/provenance.md).
             'Read [broken](references/real.md "unterminated)\n',
             "Read [broken](references/real.md trailing)\n",
             "Read [broken][real-ref\n",
+            "[real-ref: references/real.md\n",
             "[real-ref]: <references/real.md\n",
             '[real-ref]: references/real.md "unterminated\n',
             "[real-ref]: references/real.md trailing\n",

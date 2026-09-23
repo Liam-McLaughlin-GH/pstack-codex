@@ -54,6 +54,9 @@ FRONTMATTER_NON_STRING_RE = re.compile(
     r"\[.*\]|\{.*\}|[!&*].*)$",
     re.IGNORECASE,
 )
+FRONTMATTER_SKILL_CREATOR_PLACEHOLDER_RE = re.compile(
+    r"^\[TODO:\s[^\r\n]*\]$", re.IGNORECASE
+)
 STRUCTURED_SIGNAL_RE = re.compile(
     r"^\s*(preference(?:\s+(?:candidate|evidence))?|observed\s+preference|"
     r"confirmed\s+(?:preference|signal)|signal|evidence)\s*:\s*(.*?)\s*$",
@@ -2100,7 +2103,9 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
                 raise ValidationError(f"invalid quoted frontmatter value for {key}")
             value = value[1:-1].replace("''", "'")
         else:
-            if FRONTMATTER_NON_STRING_RE.fullmatch(value):
+            if FRONTMATTER_NON_STRING_RE.fullmatch(
+                value
+            ) and not FRONTMATTER_SKILL_CREATOR_PLACEHOLDER_RE.fullmatch(value):
                 raise ValidationError(f"frontmatter value must be a string: {key}")
         fields[key] = value
         index += 1
@@ -2351,10 +2356,13 @@ def _markdown_reference_definitions(text: str) -> dict[str, str]:
             continue
         close = _matching_markdown_delimiter(content, 0, "[", "]")
         if close is None:
-            if ":" in content:
+            if ":" in content and not content.casefold().startswith("[todo:"):
                 raise ValidationError(
                     "malformed Markdown reference definition has an unmatched label delimiter"
                 )
+            # The skill-creator scaffold deliberately includes multi-line TODO
+            # paragraphs with this shape; unlike a definition-looking line,
+            # they remain ordinary Markdown until a label is closed.
             continue
         if close + 1 >= len(content) or content[close + 1] != ":":
             continue
