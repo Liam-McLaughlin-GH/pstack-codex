@@ -215,13 +215,37 @@ def _command_basename(value: str) -> str:
     return re.split(r"[/\\]", value)[-1].casefold()
 
 
+COMMAND_FAMILIES = frozenset(
+    {
+        *SHELL_EXECUTABLES,
+        *INDIRECT_LAUNCHERS,
+        *INTERPRETER_CODE_FLAGS,
+        "python",
+    }
+)
+
+
+def _command_family(value: str) -> str:
+    """Normalize known command families across versions and Windows suffixes."""
+
+    basename = _command_basename(value)
+    if basename.endswith(".exe"):
+        basename = basename[:-4]
+    for family in sorted(COMMAND_FAMILIES, key=len, reverse=True):
+        if basename == family:
+            return family
+        if re.fullmatch(rf"{re.escape(family)}[0-9]+(?:\.[0-9]+)*", basename):
+            return family
+    return basename
+
+
 def _option_name(value: str) -> str:
     return value.split("=", 1)[0].casefold()
 
 
 def _interpreter_code_flags(executable: str) -> frozenset[str]:
-    basename = _command_basename(executable)
-    if re.fullmatch(r"python(?:[0-9]+(?:\.[0-9]+)*)?", basename):
+    basename = _command_family(executable)
+    if basename == "python":
         return frozenset({"-c", "--command"})
     return INTERPRETER_CODE_FLAGS.get(basename, frozenset())
 
@@ -242,7 +266,7 @@ def _matches_code_flag(value: str, flags: frozenset[str]) -> bool:
 def _validate_command_boundary(executable: str, argv: list[str], label: str) -> None:
     """Reject shell, launcher, and interpreter code-string boundaries."""
 
-    basename = _command_basename(executable)
+    basename = _command_family(executable)
     if basename in SHELL_EXECUTABLES:
         raise ScaffoldError(f"{label} must not introduce a free-form shell command")
     if basename in INDIRECT_LAUNCHERS:
@@ -250,7 +274,7 @@ def _validate_command_boundary(executable: str, argv: list[str], label: str) -> 
 
     tokens = [executable, *argv]
     for index, token in enumerate(tokens):
-        token_basename = _command_basename(token)
+        token_basename = _command_family(token)
         if token_basename in SHELL_EXECUTABLES:
             if any(_matches_code_flag(candidate, SHELL_COMMAND_FLAGS) for candidate in tokens[index + 1 :]):
                 raise ScaffoldError(f"{label} must not introduce a free-form shell command")
@@ -291,6 +315,19 @@ def _command_argument_candidates(argument: str) -> tuple[str, ...]:
     return tuple(candidates)
 
 
+def _validate_command_path_form(value: str, label: str, *, allow_absolute: bool = False) -> None:
+    if "\\" in value:
+        raise ScaffoldError(f"{label} must not contain Windows path separators")
+    if re.match(r"^[A-Za-z]:", value):
+        raise ScaffoldError(f"{label} must not contain a Windows drive path")
+    if value.startswith("//"):
+        raise ScaffoldError(f"{label} must not contain a UNC path")
+    if not allow_absolute and value.startswith(("/", "~")):
+        raise ScaffoldError(f"{label} must not contain an absolute path")
+    if ".." in PurePosixPath(value).parts:
+        raise ScaffoldError(f"{label} must not escape the project with '..'")
+
+
 def _validate_command(value: Any, label: str, *, forbidden_roots: tuple[str, ...] = ()) -> dict[str, Any]:
     command = _require_mapping(value, label)
     allowed_fields = {"executable", "argv", "cwd"}
@@ -302,23 +339,17 @@ def _validate_command(value: Any, label: str, *, forbidden_roots: tuple[str, ...
         raise ScaffoldError(
             f"{label}.executable must be an executable path or name, not shell syntax"
         )
+    _validate_command_path_form(executable, f"{label}.executable", allow_absolute=True)
     argv = command.get("argv")
     if not isinstance(argv, list):
         raise ScaffoldError(f"{label}.argv must be an array")
     for index, argument in enumerate(argv):
         argument = _require_text(argument, f"{label}.argv[{index}]")
         for candidate in _command_argument_candidates(argument):
-            if candidate.startswith(("/", "~", "//")) or re.match(r"^[A-Za-z]:[\\/]", candidate):
-                raise ScaffoldError(
-                    f"{label}.argv[{index}] must not contain an absolute path"
-                )
+            _validate_command_path_form(candidate, f"{label}.argv[{index}]")
             if candidate.casefold().startswith("file:"):
                 raise ScaffoldError(
                     f"{label}.argv[{index}] must not contain a file URI"
-                )
-            if "\\" not in candidate and ".." in PurePosixPath(candidate).parts:
-                raise ScaffoldError(
-                    f"{label}.argv[{index}] must not escape the project with '..'"
                 )
             for root in forbidden_roots:
                 if candidate == root or candidate.startswith(f"{root}/"):
@@ -377,10 +408,7 @@ def _normalize_cleanup_path(value: str, label: str) -> str:
         if part in {"", "."}:
             continue
         if part == "..":
-            if not parts:
-                raise ScaffoldError(f"{label} must not escape the project with '..'")
-            parts.pop()
-            continue
+            raise ScaffoldError(f"{label} must not contain traversal '..'")
         parts.append(part)
     return "/".join(parts)
 
@@ -389,7 +417,7 @@ def _cleanup_target_candidates(command: dict[str, Any]) -> list[tuple[int, str]]
     """Return argv values that a cleanup command treats as filesystem targets."""
 
     argv = command["argv"]
-    basename = _command_basename(command["executable"])
+    basename = _command_family(command["executable"])
     candidates: list[tuple[int, str]] = []
 
     if basename in DISPOSABLE_TARGET_EXECUTABLES:
@@ -403,22 +431,36 @@ def _cleanup_target_candidates(command: dict[str, Any]) -> list[tuple[int, str]]
             candidates.append((index, argument))
         return candidates
 
+    script_index = 0 if _interpreter_code_flags(command["executable"]) else None
+    consumed_values: set[int] = set()
+    after_options = False
     for index, argument in enumerate(argv):
+        if index in consumed_values:
+            continue
+        if after_options:
+            candidates.append((index, argument))
+            continue
+        if argument == "--":
+            after_options = True
+            continue
         if argument.startswith("-") and "=" in argument:
             option, value = argument.split("=", 1)
-            if option.casefold() in DISPOSABLE_PATH_OPTIONS and value:
+            if option.casefold() in DISPOSABLE_PATH_OPTIONS:
+                if not value:
+                    raise ScaffoldError(f"cleanup path option {option!r} must have a value")
                 candidates.append((index, value))
+                continue
         if _option_name(argument) in DISPOSABLE_PATH_OPTIONS:
-            if index + 1 < len(argv):
-                candidates.append((index + 1, argv[index + 1]))
+            if index + 1 >= len(argv) or argv[index + 1].startswith("-"):
+                raise ScaffoldError(f"cleanup path option {argument!r} must have a value")
+            consumed_values.add(index + 1)
+            candidates.append((index + 1, argv[index + 1]))
             continue
-        if index == 0 or argument.startswith("-"):
+        if index == script_index or argument.startswith("-"):
             continue
-        if (
-            "/" in argument
-            or argument.startswith(".")
-            or (index > 0 and argv[index - 1].casefold() in DISPOSABLE_COMMAND_WORDS)
-        ):
+        if argument.casefold() in DISPOSABLE_COMMAND_WORDS:
+            continue
+        if argument:
             candidates.append((index, argument))
 
     deduplicated: list[tuple[int, str]] = []
@@ -593,7 +635,7 @@ def validate_spec(spec: Any) -> dict[str, Any]:
 def load_spec(path: Path) -> dict[str, Any]:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ScaffoldError(f"could not read JSON spec {path}: {exc}") from exc
     return validate_spec(raw)
 
@@ -909,6 +951,8 @@ def _parse_frontmatter(path: Path) -> dict[str, str]:
             mapping: dict[Any, Any] = {}
             for key_node, value_node in node.value:
                 key = loader.construct_object(key_node, deep=deep)
+                if not isinstance(key, str):
+                    raise ScaffoldError("frontmatter mapping keys must be strings")
                 if key in mapping:
                     raise ScaffoldError(f"duplicate frontmatter field: {key}")
                 mapping[key] = loader.construct_object(value_node, deep=deep)
@@ -929,6 +973,8 @@ def _parse_frontmatter(path: Path) -> dict[str, str]:
     except Exception as exc:
         raise ScaffoldError(f"invalid YAML frontmatter: {exc}") from exc
 
+    if any(not isinstance(key, str) for key in fields):
+        raise ScaffoldError("frontmatter mapping keys must be strings")
     if set(fields) - {"name", "description"}:
         unknown = ", ".join(sorted(set(fields) - {"name", "description"}))
         raise ScaffoldError(f"unsupported frontmatter field(s): {unknown}")
@@ -1236,12 +1282,9 @@ def _validate_rendered_cleanup(
         return
     try:
         if disposable_root is None or evidence_root is None:
-            _validate_command(
-                command,
-                f"{location}.Command",
-                forbidden_roots=(evidence_root,) if evidence_root is not None else (),
+            raise ScaffoldError(
+                f"{location}.Command cleanup policy cannot be validated without both roots"
             )
-            return
         _validate_cleanup_command(
             command,
             f"{location}.Command",
@@ -1602,61 +1645,205 @@ def _existing_directory(path: Path, label: str) -> bool:
     return True
 
 
-PublishedEntry = tuple[Path, int, int, bool]
+PublishedEntry = tuple[int, str, int, int, bool]
 
 
-def _published_identity(path: Path, *, is_directory: bool) -> PublishedEntry:
-    identity = os.lstat(path)
-    return path, identity.st_dev, identity.st_ino, is_directory
+def _open_directory_descriptor(
+    name: Path | str,
+    label: str,
+    *,
+    dir_fd: int | None = None,
+    collision: bool = False,
+) -> int:
+    """Open a directory without following the final path component."""
+
+    directory_flag = getattr(os, "O_DIRECTORY", 0)
+    nofollow_flag = getattr(os, "O_NOFOLLOW", 0)
+    if not directory_flag or not nofollow_flag:
+        raise ScaffoldError("descriptor-bound publication is unavailable on this platform")
+    flags = os.O_RDONLY | directory_flag | nofollow_flag | getattr(os, "O_CLOEXEC", 0)
+    error_type = CollisionError if collision else ScaffoldError
+    try:
+        if dir_fd is None:
+            descriptor = os.open(os.fspath(name), flags)
+        else:
+            descriptor = os.open(os.fspath(name), flags, dir_fd=dir_fd)
+    except OSError as exc:
+        raise error_type(f"{label} cannot be opened without following symlinks: {name}") from exc
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise error_type(f"{label} is not a directory: {name}")
+    except Exception:
+        os.close(descriptor)
+        raise
+    return descriptor
 
 
-def _rollback_published(entries: list[PublishedEntry]) -> None:
-    for path, device, inode, is_directory in reversed(entries):
+def _published_identity(parent_fd: int, name: str, *, is_directory: bool) -> PublishedEntry:
+    identity = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if is_directory and not stat.S_ISDIR(identity.st_mode):
+        raise CollisionError(f"published entry is not a directory: {name}")
+    if not is_directory and not stat.S_ISREG(identity.st_mode):
+        raise CollisionError(f"published entry is not a regular file: {name}")
+    return os.dup(parent_fd), name, identity.st_dev, identity.st_ino, is_directory
+
+
+def _close_published(entries: list[PublishedEntry]) -> None:
+    for parent_fd, _, _, _, _ in entries:
         try:
-            current = os.lstat(path)
-        except FileNotFoundError:
-            continue
-        if current.st_dev != device or current.st_ino != inode:
-            continue
-        try:
-            if is_directory:
-                path.rmdir()
-            else:
-                path.unlink()
+            os.close(parent_fd)
         except OSError:
             pass
 
 
-def _publish_entry_no_replace(source: Path, destination: Path) -> list[PublishedEntry]:
-    """Publish one staged entry without ever replacing a destination entry."""
+def _rollback_published(entries: list[PublishedEntry]) -> None:
+    for parent_fd, name, device, inode, is_directory in reversed(entries):
+        try:
+            try:
+                current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            if current.st_dev != device or current.st_ino != inode:
+                continue
+            try:
+                if is_directory:
+                    os.rmdir(name, dir_fd=parent_fd)
+                else:
+                    os.unlink(name, dir_fd=parent_fd)
+            except OSError:
+                pass
+        finally:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
 
+
+def _assert_reserved_target_identity(
+    parent_fd: int,
+    target_name: str,
+    target: Path,
+    target_fd: int,
+    identity: tuple[int, int],
+) -> None:
+    """Refuse publication if the reserved target path no longer names its inode."""
+
+    try:
+        current = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+        current_fd = os.fstat(target_fd)
+    except OSError as exc:
+        raise CollisionError(f"target changed during publication: {target}") from exc
+    if (
+        not stat.S_ISDIR(current.st_mode)
+        or (current.st_dev, current.st_ino) != identity
+        or (current_fd.st_dev, current_fd.st_ino) != identity
+    ):
+        raise CollisionError(f"target changed during publication: {target}")
+
+
+def _remove_reserved_target(parent_fd: int, target_name: str, identity: tuple[int, int]) -> None:
+    """Remove only the inode reserved by this run, never a replacement entry."""
+
+    try:
+        current = os.stat(target_name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return
+    if not stat.S_ISDIR(current.st_mode) or (current.st_dev, current.st_ino) != identity:
+        return
+    try:
+        os.rmdir(target_name, dir_fd=parent_fd)
+    except OSError:
+        pass
+
+
+def _publish_entry_no_replace(
+    source: Path,
+    destination: Path,
+    *,
+    destination_dir_fd: int,
+) -> list[PublishedEntry]:
+    """Publish one staged entry through a reserved directory descriptor."""
+
+    # Keep this lexical probe for collision races, but never use the path for a
+    # write. The descriptor below remains bound to the reserved directory.
     if os.path.lexists(destination):
         raise CollisionError(f"target changed during publication: {destination}")
+    destination_name = destination.name
+    try:
+        os.stat(destination_name, dir_fd=destination_dir_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise CollisionError(f"target changed during publication: {destination}") from exc
+    else:
+        raise CollisionError(f"target changed during publication: {destination}")
+
     source_mode = os.lstat(source).st_mode
     published: list[PublishedEntry] = []
     if stat.S_ISDIR(source_mode):
         try:
-            os.mkdir(destination)
+            os.mkdir(destination_name, dir_fd=destination_dir_fd)
         except FileExistsError as exc:
             raise CollisionError(f"target changed during publication: {destination}") from exc
-        published.append(_published_identity(destination, is_directory=True))
+        try:
+            child_fd: int | None = None
+            child_fd = _open_directory_descriptor(
+                destination_name,
+                "published directory",
+                dir_fd=destination_dir_fd,
+                collision=True,
+            )
+            published.append(
+                _published_identity(destination_dir_fd, destination_name, is_directory=True)
+            )
+        except Exception:
+            if child_fd is not None:
+                try:
+                    os.close(child_fd)
+                except OSError:
+                    pass
+            try:
+                os.rmdir(destination_name, dir_fd=destination_dir_fd)
+            except OSError:
+                pass
+            raise
         try:
             for child in sorted(source.iterdir(), key=lambda path: path.name):
-                published.extend(_publish_entry_no_replace(child, destination / child.name))
+                published.extend(
+                    _publish_entry_no_replace(
+                        child,
+                        destination / child.name,
+                        destination_dir_fd=child_fd,
+                    )
+                )
             source.rmdir()
             return published
         except Exception:
             _rollback_published(published)
             raise
+        finally:
+            if child_fd is not None:
+                try:
+                    os.close(child_fd)
+                except OSError:
+                    pass
     if not stat.S_ISREG(source_mode):
         raise ScaffoldError(f"staging contains a non-regular entry: {source}")
 
     try:
-        # A hard link is an atomic no-replace publication on the same filesystem.
-        os.link(source, destination, follow_symlinks=False)
+        # A hard link through the reserved descriptor is an atomic no-replace
+        # publication that cannot follow a replacement target symlink.
+        os.link(
+            source,
+            destination_name,
+            dst_dir_fd=destination_dir_fd,
+            follow_symlinks=False,
+        )
     except FileExistsError as exc:
         raise CollisionError(f"target changed during publication: {destination}") from exc
-    published.append(_published_identity(destination, is_directory=False))
+    published.append(
+        _published_identity(destination_dir_fd, destination_name, is_directory=False)
+    )
     try:
         source.unlink()
     except Exception:
@@ -1688,6 +1875,9 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
     staging: Path | None = None
     target_reserved = False
     published_entries: list[PublishedEntry] = []
+    skills_parent_fd: int | None = None
+    target_fd: int | None = None
+    target_identity: tuple[int, int] | None = None
     try:
         for directory, label in ((parent, ".agents"), (skills_parent, ".agents/skills")):
             if not _existing_directory(directory, f"output parent {label}"):
@@ -1697,6 +1887,7 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
                     _existing_directory(directory, f"output parent {label}")
                 else:
                     created_parents.append(directory)
+        skills_parent_fd = _open_directory_descriptor(skills_parent, "output parent .agents/skills")
         staging = Path(tempfile.mkdtemp(prefix=f".verify-{spec['app']['name']}.staging-", dir=skills_parent))
         _write_tree(spec, staging)
         errors = validate_generated_skill(
@@ -1710,27 +1901,82 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
         # Reserve the final directory with an exclusive mkdir. Unlike rename,
         # this cannot replace a target that appeared after the initial check.
         try:
-            os.mkdir(target)
+            if skills_parent_fd is None:
+                raise ScaffoldError("output parent descriptor is unavailable")
+            os.mkdir(target.name, dir_fd=skills_parent_fd)
         except FileExistsError as exc:
             raise CollisionError(f"output appeared during generation: {target}") from exc
         target_reserved = True
+        target_fd = _open_directory_descriptor(
+            target.name,
+            "reserved target",
+            dir_fd=skills_parent_fd,
+            collision=True,
+        )
+        target_stat = os.fstat(target_fd)
+        target_identity = (target_stat.st_dev, target_stat.st_ino)
+        _assert_reserved_target_identity(
+            skills_parent_fd,
+            target.name,
+            target,
+            target_fd,
+            target_identity,
+        )
         for child in sorted(staging.iterdir(), key=lambda path: path.name):
+            _assert_reserved_target_identity(
+                skills_parent_fd,
+                target.name,
+                target,
+                target_fd,
+                target_identity,
+            )
             destination = target / child.name
-            published_entries.extend(_publish_entry_no_replace(child, destination))
+            published_entries.extend(
+                _publish_entry_no_replace(
+                    child,
+                    destination,
+                    destination_dir_fd=target_fd,
+                )
+            )
+            _assert_reserved_target_identity(
+                skills_parent_fd,
+                target.name,
+                target,
+                target_fd,
+                target_identity,
+            )
+        _assert_reserved_target_identity(
+            skills_parent_fd,
+            target.name,
+            target,
+            target_fd,
+            target_identity,
+        )
         staging.rmdir()
         staging = None
+        _close_published(published_entries)
+        published_entries = []
         return target
     except Exception:
         if staging is not None:
             _remove_path(staging)
         if target_reserved:
             _rollback_published(published_entries)
-            try:
-                target.rmdir()
-            except OSError:
-                pass
+            if skills_parent_fd is not None and target_identity is not None:
+                _remove_reserved_target(skills_parent_fd, target.name, target_identity)
         _remove_empty_parents(created_parents)
         raise
+    finally:
+        if target_fd is not None:
+            try:
+                os.close(target_fd)
+            except OSError:
+                pass
+        if skills_parent_fd is not None:
+            try:
+                os.close(skills_parent_fd)
+            except OSError:
+                pass
 
 
 def _cli_scaffold(args: argparse.Namespace) -> int:

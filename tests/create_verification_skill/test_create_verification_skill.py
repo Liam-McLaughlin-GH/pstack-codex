@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
@@ -418,6 +419,10 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
             ["-rf", "."],
             ["-rf", "unrelated"],
             ["-rf", "scratch/other"],
+            ["-rf", "scratch/../scratch"],
+            ["-rf", r"scratch\state.txt"],
+            ["-rf", "C:relative-state"],
+            ["-rf", "//server/share/state.txt"],
         )
         for argv in rejected:
             with self.subTest(argv=argv):
@@ -479,6 +484,115 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
                 spec["app"]["doctor"] = {"executable": executable, "argv": argv}  # type: ignore[index]
                 with self.assertRaises(ScaffoldError):
                     validate_spec(spec)
+
+    def test_versioned_and_platform_suffixed_command_boundaries_are_rejected(self) -> None:
+        cases = (
+            ("pypy3", ["-c", "unsafe"]),
+            ("ruby3.2", ["-e", "unsafe"]),
+            ("python3.exe", ["-c", "unsafe"]),
+            ("bash.exe", []),
+            ("powershell.exe", ["-command", "unsafe"]),
+            ("env.exe", ["python3.exe", "-c", "unsafe"]),
+        )
+        for executable, argv in cases:
+            with self.subTest(executable=executable):
+                spec = spec_for()
+                spec["app"]["doctor"] = {"executable": executable, "argv": argv}  # type: ignore[index]
+                with self.assertRaises(ScaffoldError):
+                    validate_spec(spec)
+
+    def test_command_arguments_reject_windows_and_traversal_path_forms(self) -> None:
+        unsafe_values = (
+            r"scratch\state.txt",
+            "C:relative-state",
+            "C:/absolute-state",
+            r"\\server\share\state.txt",
+            "//server/share/state.txt",
+            "../outside/state.txt",
+            "scratch/../outside/state.txt",
+        )
+        for value in unsafe_values:
+            with self.subTest(value=value):
+                spec = spec_for()
+                spec["app"]["doctor"] = command("doctor", "--state", value)  # type: ignore[index]
+                with self.assertRaises(ScaffoldError):
+                    validate_spec(spec)
+
+    def test_optional_yaml_non_string_mapping_keys_are_bounded_errors(self) -> None:
+        class FakeSafeLoader:
+            @classmethod
+            def add_constructor(cls, *_args: object) -> None:
+                return None
+
+        fake_yaml = SimpleNamespace(
+            SafeLoader=FakeSafeLoader,
+            resolver=SimpleNamespace(BaseResolver=SimpleNamespace(DEFAULT_MAPPING_TAG="mapping")),
+            load=lambda _source, Loader: {
+                1: "not a valid frontmatter key",
+                "name": "verify-tiny-fixture",
+                "description": "bounded test",
+            },
+        )
+        with tempfile.TemporaryDirectory(prefix="create-verification-frontmatter-key-") as temporary:
+            root = Path(temporary)
+            skill_root, _ = self.create_skill(root)
+            with mock.patch.dict(sys.modules, {"yaml": fake_yaml}):
+                errors = scaffold_module.validate_generated_skill(skill_root)
+            self.assertTrue(
+                any("frontmatter mapping keys must be strings" in error for error in errors),
+                errors,
+            )
+            self.assertFalse(any("Traceback" in error for error in errors), errors)
+
+    def test_invalid_utf8_json_spec_is_a_bounded_scaffold_error(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-invalid-json-") as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            spec_path = root / "invalid.json"
+            spec_path.write_bytes(b"{\xff")
+            result = run_helper(
+                "scaffold",
+                "--spec",
+                str(spec_path),
+                "--project-root",
+                str(project),
+            )
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("could not read JSON spec", result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_cleanup_rejects_unrecognized_bare_arguments_for_new_and_existing_specs(self) -> None:
+        rejected_argv = (
+            ["tiny_app.py", "cleanup", "scratch/state.txt", "unrelated"],
+            ["tiny_app.py", "cleanup", "scratch", "unrelated"],
+            ["tiny_app.py", "cleanup", "--state", "scratch/state.txt", "unrelated"],
+        )
+        for argv in rejected_argv:
+            with self.subTest(argv=argv):
+                spec = spec_for()
+                spec["app"]["cleanup"] = {"executable": sys.executable, "argv": argv}  # type: ignore[index]
+                with self.assertRaises(ScaffoldError):
+                    validate_spec(spec)
+
+        with tempfile.TemporaryDirectory(prefix="create-verification-cleanup-bare-") as temporary:
+            root = Path(temporary)
+            skill_root, _ = self.create_skill(root)
+            skill_file = skill_root / "SKILL.md"
+            original = skill_file.read_text(encoding="utf-8")
+            cleanup_line = next(
+                line
+                for line in _generated_section_body(original, "Cleanup").splitlines()
+                if line.strip().startswith("- Command: ")
+            )
+            rendered = f"{shlex.quote(sys.executable)} tiny_app.py cleanup --state scratch/state.txt unrelated"
+            skill_file.write_text(
+                original.replace(cleanup_line, f"- Command: `{rendered}`", 1),
+                encoding="utf-8",
+            )
+            errors = scaffold_module.validate_generated_skill(skill_root)
+            self.assertTrue(any("must target declared disposable state" in error for error in errors), errors)
+
 
     def test_existing_tree_rejects_blank_context_and_evidence_proof(self) -> None:
         with tempfile.TemporaryDirectory(prefix="create-verification-context-validation-") as temporary:
@@ -584,6 +698,41 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
                 else:
                     self.assertTrue(competing.is_symlink())
                     self.assertEqual(os.readlink(competing), str(attacker_file))
+
+    def test_target_symlink_swap_during_publication_never_writes_attacker_tree(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-target-race-") as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            copy_fixture(project)
+            outside = root / "attacker"
+            outside.mkdir()
+            sentinel = outside / "sentinel.txt"
+            sentinel.write_text("preserve\n", encoding="utf-8")
+            target = project / ".agents" / "skills" / "verify-tiny-fixture"
+            detached = root / "detached-reservation"
+            swapped = False
+            original_lexists = os.path.lexists
+
+            def swap_target_after_probe(path: str | os.PathLike[str]) -> bool:
+                nonlocal swapped
+                present = original_lexists(path)
+                if Path(path) == target / "SKILL.md" and not present and not swapped:
+                    swapped = True
+                    target.rename(detached)
+                    os.symlink(outside, target, target_is_directory=True)
+                return present
+
+            with mock.patch.object(os.path, "lexists", side_effect=swap_target_after_probe):
+                with self.assertRaises(CollisionError):
+                    scaffold_module.scaffold(spec_for(), project)
+
+            self.assertTrue(swapped)
+            self.assertTrue(target.is_symlink())
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve\n")
+            self.assertFalse((outside / "SKILL.md").exists())
+            self.assertFalse((outside / "features").exists())
+            self.assertFalse((detached / "SKILL.md").exists())
 
     def test_existing_tree_revalidates_all_emitted_command_contracts(self) -> None:
         with tempfile.TemporaryDirectory(prefix="create-verification-command-validation-") as temporary:
