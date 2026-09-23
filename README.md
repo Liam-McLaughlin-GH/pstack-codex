@@ -39,6 +39,7 @@ The following 10 skills are present as Codex-native rewrites.
 | `show-me-your-work` | Keeps an optional append-only decision trail. |
 | `no-comments` | Provides a Codex-compatible review pass for stale or misleading comments. |
 | `reflect` | Reviews one explicit transcript through three bounded lenses, records source evidence and uncertainty, compares proposals, and uses a manifest-driven delegation contract with sequential fallback. |
+| `make-bot-ui` | Builds and verifies a UI relay with explicit local and remote boundaries. |
 
 The port preserves the names of these workflows where possible. In Codex, invoke them as skills such as `$poteto-mode`, `$how`, `$architect`, or `$tdd`.
 
@@ -50,7 +51,6 @@ The following 7 upstream skills are not active in the port.
 - `create-verification-skill`. Its feature-map workflow assumes Cursor control skills and `.cursor/skills`.
 - `figure-it-out`. Its playbook routing and subagent instructions need a Codex-specific rewrite.
 - `maintain-verification-skill`. It assumes the same Cursor verification-skill layout.
-- `make-bot-ui`. It depends on Cursor UI and control tooling.
 - `recall`. It reads Cursor agent transcripts.
 - `setup-pstack`. It writes Cursor model configuration to `~/.cursor/rules/pstack-models.mdc`.
 
@@ -62,7 +62,7 @@ The upstream agent and runtime pieces are also not ported.
 
 - `agents/poteto-agent.md` is not converted to a Codex agent configuration.
 - `agents/comment-sicko.md` is not converted to a Codex agent configuration.
-- The 21 pstack scripts are not copied. This includes the PR watcher, worktree audit, plan checker, and orchestration helper.
+- The 20 pstack scripts are not copied. This includes the PR watcher, worktree audit, plan checker, and orchestration helper.
 - `automations/benny/` is not copied. It is a Cursor automation pack with Cursor UI adapters.
 - Cursor model names and model-specific routing are not preserved.
 - Cursor transcript paths under `~/.cursor/projects/.../agent-transcripts` are not preserved.
