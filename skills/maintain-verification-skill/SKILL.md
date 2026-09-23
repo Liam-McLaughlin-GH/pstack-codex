@@ -226,4 +226,3 @@ harness correction follows the same source and live proof rules as a map edit.
 ## References
 
 - [Maintenance receipt schema](references/maintenance-report-schema.md)
-- [Upstream provenance and license](references/upstream-provenance.md)
