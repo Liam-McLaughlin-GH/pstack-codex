@@ -84,6 +84,16 @@ class RoutingRegressionTests(unittest.TestCase):
             with self.subTest(request=request):
                 self.assertEqual(CHECKER.route_for_task(request), "unsafe")
 
+        for request in (
+            "gcloud dns record-sets transaction execute",
+            "gcloud run jobs execute job",
+            "gcloud scheduler jobs run job",
+            "gcloud scheduler jobs pause job",
+            "gcloud workflows run workflow",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "unsafe")
+
     def test_legacy_bridge_signals_route_to_web_app(self) -> None:
         for request in (
             "Fix the legacy UI bridge",
@@ -461,6 +471,11 @@ class DocumentIntegrityTests(unittest.TestCase):
                 "!<tag:yaml.org,2002:int> 1",
                 "!<tag:yaml.org,2002:float> .5",
                 "!<tag:yaml.org,2002:bool> true",
+                "y",
+                "Y",
+                "n",
+                "N",
+                "0_1",
             ):
                 with self.subTest(field=field, value=value):
                     candidate = self.skill_text.replace(
@@ -491,6 +506,35 @@ class DocumentIntegrityTests(unittest.TestCase):
                         errors,
                     )
 
+    def test_valid_block_scalars_and_string_aliases_are_accepted(self) -> None:
+        name_line = "name: python-best-practices"
+        description_line = next(
+            line
+            for line in self.skill_text.splitlines()
+            if line.startswith("description:")
+        )
+        block = self.skill_text.replace(
+            name_line,
+            "name: |\n  python-best-practices",
+            1,
+        ).replace(
+            description_line,
+            "description: >\n  Apply practical Python guidance.",
+            1,
+        )
+        self.assertFalse(CHECKER.check_documents(block, self.ledger))
+
+        anchored = self.skill_text.replace(
+            name_line,
+            "name: &skill_name python-best-practices",
+            1,
+        ).replace(
+            description_line,
+            "description: *skill_name",
+            1,
+        )
+        self.assertFalse(CHECKER.check_documents(anchored, self.ledger))
+
     def test_shared_port_boundary_rejects_non_scalar_required_frontmatter(self) -> None:
         for field in ("name", "description"):
             for value in (
@@ -508,6 +552,11 @@ class DocumentIntegrityTests(unittest.TestCase):
                 "!<tag:yaml.org,2002:int> 1",
                 "!<tag:yaml.org,2002:float> .5",
                 "!<tag:yaml.org,2002:bool> true",
+                "y",
+                "Y",
+                "n",
+                "N",
+                "0_1",
             ):
                 with self.subTest(field=field, value=value):
                     metadata = f"{field}: {value}\n"
@@ -663,6 +712,17 @@ class DocumentIntegrityTests(unittest.TestCase):
                     any("does not match the task owners" in error for error in errors),
                     errors,
                 )
+
+    def test_owner_bearing_cases_require_owner_lists_and_compatible_rules(self) -> None:
+        missing = copy.deepcopy(self.ledger)
+        missing["routing_cases"][7].pop("repositories")
+        errors = CHECKER.check_documents(self.skill_text, missing)
+        self.assertTrue(any("repositories is required for task owners" in error for error in errors), errors)
+
+        wrong_rule = copy.deepcopy(self.ledger)
+        wrong_rule["routing_cases"][7]["rule"] = "SP-FRONTEND-PACKAGES"
+        errors = CHECKER.check_documents(self.skill_text, wrong_rule)
+        self.assertTrue(any("rule is incompatible with task owners" in error for error in errors), errors)
 
     def test_scenario_checker_rejects_malformed_ledger_shapes(self) -> None:
         for field, value in (

@@ -6,7 +6,7 @@ import re
 
 
 REQUIRED_FIELDS = ("name", "description")
-NULL_VALUES = {"", "~", "null", "true", "false", "yes", "no", "on", "off"}
+NULL_VALUES = {"", "~", "null", "true", "false", "yes", "no", "on", "off", "y", "n"}
 YAML_DECIMAL_DIGITS = r"[0-9]+(?:_[0-9]+)*"
 YAML_HEX_DIGITS = r"[0-9a-fA-F]+(?:_[0-9a-fA-F]+)*"
 YAML_OCTAL_DIGITS = r"[0-7]+(?:_[0-7]+)*"
@@ -22,7 +22,7 @@ YAML_NUMBER_RE = re.compile(
 YAML_BASE_PREFIX_RE = re.compile(
     rf"[-+]?(?:0[xX]{YAML_HEX_DIGITS}|0[oO]{YAML_OCTAL_DIGITS}|0[bB]{YAML_BINARY_DIGITS})"
 )
-YAML_LEGACY_OCTAL_RE = re.compile(rf"[-+]?0{YAML_OCTAL_DIGITS}")
+YAML_LEGACY_OCTAL_RE = re.compile(rf"[-+]?0(?:{YAML_OCTAL_DIGITS}|_{YAML_OCTAL_DIGITS})")
 YAML_SEXAGESIMAL_RE = re.compile(
     rf"[-+]?{YAML_DECIMAL_DIGITS}(?::[0-5]?[0-9])+(?:\.{YAML_DECIMAL_DIGITS})?"
 )
@@ -124,7 +124,7 @@ def _scalar_value_error(field: str, raw_value: str) -> str | None:
 
     lowered = value.lower()
     if lowered in NULL_VALUES:
-        if lowered in {"true", "false", "yes", "no", "on", "off"}:
+        if lowered in {"true", "false", "yes", "no", "on", "off", "y", "n"}:
             return f"{field} must be a scalar string, not a boolean"
         return f"{field} must be a non-null scalar string"
     if (
@@ -145,22 +145,61 @@ def required_frontmatter_errors(metadata: str) -> list[str]:
     """Return readable errors for required top-level scalar frontmatter fields."""
 
     values: dict[str, str] = {}
+    block_fields: set[str] = set()
+    anchors: dict[str, str] = {}
     errors: list[str] = []
-    for line in metadata.splitlines():
+    lines = metadata.splitlines()
+    index = 0
+    while index < len(lines):
         match = re.fullmatch(
-            r"(?P<field>name|description):(?:[ \t]*(?P<value>.*))?", line
+            r"(?P<field>name|description):(?:[ \t]*(?P<value>.*))?", lines[index]
         )
         if match is None:
+            index += 1
             continue
         field = match.group("field")
-        if field in values:
+        if field in values or field in block_fields:
             errors.append(f"{field} is duplicated")
+            index += 1
             continue
-        values[field] = match.group("value") or ""
+        raw_value = (match.group("value") or "").strip()
+        indicator = _without_inline_comment(raw_value)
+        if re.fullmatch(r"[|>][1-9]?[+-]?", indicator):
+            block_fields.add(field)
+            index += 1
+            content: list[str] = []
+            while index < len(lines):
+                next_line = lines[index]
+                if next_line and not next_line[0].isspace() and re.match(r"^[^:#]+:", next_line):
+                    break
+                content.append(next_line.lstrip() if next_line else "")
+                index += 1
+            if not any(part.strip() for part in content):
+                errors.append(f"{field} must be a non-empty scalar string")
+            continue
+
+        raw_value = indicator
+        anchor_match = re.fullmatch(r"&(?P<name>[A-Za-z_][A-Za-z0-9_-]*)(?:[ \t]+(?P<value>.*))?", raw_value)
+        if anchor_match is not None:
+            raw_value = anchor_match.group("value") or ""
+            anchors[anchor_match.group("name")] = raw_value
+        else:
+            alias_match = re.fullmatch(r"\*(?P<name>[A-Za-z_][A-Za-z0-9_-]*)", raw_value)
+            if alias_match is not None:
+                anchor_value = anchors.get(alias_match.group("name"))
+                if anchor_value is None:
+                    errors.append(f"{field} references an unknown YAML alias")
+                    raw_value = ""
+                else:
+                    raw_value = anchor_value
+        values[field] = raw_value
+        index += 1
 
     for field in REQUIRED_FIELDS:
-        if field not in values:
+        if field not in values and field not in block_fields:
             errors.append(f"{field} is missing")
+            continue
+        if field in block_fields:
             continue
         value_error = _scalar_value_error(field, values[field])
         if value_error:

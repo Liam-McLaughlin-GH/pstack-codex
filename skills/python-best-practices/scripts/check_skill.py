@@ -250,6 +250,12 @@ GCLOUD_MUTATION_RE = re.compile(
         r"(?![a-z0-9_-])"
     )
 )
+GCLOUD_EFFECTFUL_RE = re.compile(
+    _real_token_expression("gcloud")
+    + r"[^\n]*?(?:dns\s+record-sets\s+transaction\s+execute|"
+    + r"run\s+jobs\s+execute|scheduler\s+jobs\s+(?:run|pause)|"
+    + r"workflows\s+run)(?![a-z0-9_-])"
+)
 DEPLOYMENT_OPERATION_RE = re.compile(
     r"(?<![a-z0-9])(?:deploy(?:ed|ing|ment)?|promote|provision|publish|release|"
     r"roll(?:out|ing)?|rolling|scale)"
@@ -552,6 +558,7 @@ def route_for_task(task: str) -> str:
         or _has_fabric_mutation(text)
         or KUBECTL_MUTATION_RE.search(text)
         or GCLOUD_MUTATION_RE.search(text)
+        or GCLOUD_EFFECTFUL_RE.search(text)
     )
     environment_mutation = bool(ENVIRONMENT_RE.search(text) and MUTATION_RE.search(text))
     deployment_mutation = bool(DEPLOYMENT_OPERATION_RE.search(text))
@@ -836,12 +843,32 @@ def _validate_routing_case_records(ledger: Dict[str, Any]) -> List[str]:
         elif safety == "safe" and expected == "unsafe":
             errors.append("%s safe cases cannot expect unsafe" % context)
 
+        expected_repositories = (
+            repositories_for_task(case["input"])
+            if isinstance(case.get("input"), str)
+            else ()
+        )
+        if expected_repositories and "repositories" not in case:
+            errors.append(
+                "%s.repositories is required for task owners: expected %r"
+                % (context, expected_repositories)
+            )
+
         if "rule" in case:
             rule = case.get("rule")
             if not isinstance(rule, str) or not rule.strip():
                 errors.append("%s.rule must be a non-empty source rule id" % context)
             elif rule not in known_rules:
                 errors.append("%s references unknown rule: %s" % (context, rule))
+            elif (
+                expected_repositories
+                and rule != "SP-K8S-SAFETY"
+                and EXPECTED_RULE_REPOSITORIES[rule] not in expected_repositories
+            ):
+                errors.append(
+                    "%s.rule is incompatible with task owners: expected one of %r, got %r"
+                    % (context, expected_repositories, EXPECTED_RULE_REPOSITORIES[rule])
+                )
         elif safety == "unsafe":
             errors.append("%s unsafe cases must include a source rule" % context)
         if "repositories" in case:
@@ -863,13 +890,11 @@ def _validate_routing_case_records(ledger: Dict[str, Any]) -> List[str]:
                         )
                     if isinstance(repository, str) and repository in EXPECTED_REPOSITORIES:
                         seen_repositories.add(repository)
-                if isinstance(case.get("input"), str):
-                    expected_repositories = repositories_for_task(case["input"])
-                    if tuple(repositories) != expected_repositories:
-                        errors.append(
-                            "%s.repositories does not match the task owners: expected %r, got %r"
-                            % (context, expected_repositories, tuple(repositories))
-                        )
+                if tuple(repositories) != expected_repositories:
+                    errors.append(
+                        "%s.repositories does not match the task owners: expected %r, got %r"
+                        % (context, expected_repositories, tuple(repositories))
+                    )
     return errors
 
 
