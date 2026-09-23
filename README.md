@@ -40,6 +40,7 @@ The following 10 skills are present as Codex-native rewrites.
 | `no-comments` | Provides a Codex-compatible review pass for stale or misleading comments. |
 | `reflect` | Reviews one explicit transcript through three bounded lenses, records source evidence and uncertainty, compares proposals, and uses a manifest-driven delegation contract with sequential fallback. |
 | `make-bot-ui` | Builds and verifies a UI relay with explicit local and remote boundaries. |
+| `repo-best-practices` | Routes Showpass repository work using source-backed ownership, safe command boundaries, and explicit drift limits. |
 
 The port preserves the names of these workflows where possible. In Codex, invoke them as skills such as `$poteto-mode`, `$how`, `$architect`, or `$tdd`.
 
