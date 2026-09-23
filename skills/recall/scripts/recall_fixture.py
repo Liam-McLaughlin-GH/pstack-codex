@@ -738,7 +738,11 @@ def iter_text_lines(text: str) -> Iterable[str]:
                 if fence_character is None:
                     fence_character = character
                     fence_length = delimiter_length
-                elif character == fence_character and delimiter_length >= fence_length:
+                elif (
+                    character == fence_character
+                    and delimiter_length >= fence_length
+                    and all(char in " \t" for char in stripped[delimiter_length:])
+                ):
                     fence_character = None
                     fence_length = 0
                 continue

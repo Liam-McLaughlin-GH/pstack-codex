@@ -707,18 +707,127 @@ visible after close
                 )
 
     def test_fence_closer_must_be_at_least_as_long_as_opener(self) -> None:
-        text = """````text
+        cases = (
+            (
+                "backtick",
+                """````text
 hidden before short closer
 ```
 hidden after short closer
 ````
 visible after close
-"""
-
-        self.assertEqual(
-            list(RECALL_FIXTURE.iter_text_lines(text)),
-            ["visible after close"],
+""",
+            ),
+            (
+                "tilde",
+                """~~~~text
+hidden before short closer
+~~~
+hidden after short closer
+~~~~
+visible after close
+""",
+            ),
         )
+
+        for name, text in cases:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    list(RECALL_FIXTURE.iter_text_lines(text)),
+                    ["visible after close"],
+                )
+
+    def test_fence_closer_allows_only_space_and_tab_trailers(self) -> None:
+        cases = (
+            ("backtick", "```text\nhidden\n``` \t\nvisible after close\n"),
+            ("tilde", "~~~text\nhidden\n~~~ \t\nvisible after close\n"),
+        )
+
+        for name, text in cases:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    list(RECALL_FIXTURE.iter_text_lines(text)),
+                    ["visible after close"],
+                )
+
+    def test_malformed_fence_closers_do_not_expose_structured_records(self) -> None:
+        cases = (
+            (
+                "backtick trailing text",
+                """```text
+```info
+Codex-Recall-Export: 1
+ID: hidden-backtick-text
+Modified at: 2026-01-14T11:00:00Z
+Status: [open PR #17]
+Summary: must remain hidden
+Next: must remain hidden
+```
+""",
+            ),
+            (
+                "tilde trailing text",
+                """~~~text
+~~~info
+Codex-Recall-Export: 1
+ID: hidden-tilde-text
+Modified at: 2026-01-14T11:00:00Z
+Status: [open PR #18]
+Summary: must remain hidden
+Next: must remain hidden
+~~~
+""",
+            ),
+            (
+                "backtick mixed trailing symbols",
+                """```text
+```~`
+Codex-Recall-Export: 1
+ID: hidden-backtick-mixed
+Modified at: 2026-01-14T11:00:00Z
+Status: [open PR #19]
+Summary: must remain hidden
+Next: must remain hidden
+```
+""",
+            ),
+            (
+                "tilde mixed trailing symbols",
+                """~~~text
+~~~`~
+Codex-Recall-Export: 1
+ID: hidden-tilde-mixed
+Modified at: 2026-01-14T11:00:00Z
+Status: [open PR #20]
+Summary: must remain hidden
+Next: must remain hidden
+~~~
+""",
+            ),
+        )
+
+        for name, text in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                artifact = workspace / "malformed-fence.md"
+                artifact.write_text(text, encoding="utf-8")
+                result = run_helper(
+                    workspace,
+                    "--topic",
+                    "payments",
+                    "--as-of",
+                    "2026-01-15T12:00:00Z",
+                    "--artifact",
+                    str(artifact),
+                    "--artifact-origin",
+                    "user",
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("opaque document bodies read: 1", result.stdout)
+                self.assertIn("No structured record matched", result.stdout)
+                self.assertNotIn("must remain hidden", result.stdout)
+                self.assertNotIn("[open PR #", result.stdout)
 
     def test_rejects_unsafe_topic_and_workspace_identifiers(self) -> None:
         cases = (
