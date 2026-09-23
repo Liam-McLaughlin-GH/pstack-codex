@@ -96,10 +96,16 @@ class RoutingRegressionTests(unittest.TestCase):
             "gcloud components install kubectl",
             "gcloud config configurations activate production",
             "gcloud container fleet memberships register membership",
+            "gcloud container fleet memberships unregister membership",
             "gcloud container operations cancel operation",
+            "gcloud compute copy-files local instance:/tmp/file",
             "gcloud compute disks snapshot disk",
+            "gcloud compute scp local instance:/tmp/file",
+            "gcloud compute ssh instance --command=\"sudo reboot\"",
             "gcloud dns record-sets transaction execute",
             "gcloud dns record-sets transaction abort",
+            "gcloud functions call function",
+            "gcloud logging write log-entry message",
             "gcloud run jobs execute job",
             "gcloud scheduler jobs run job",
             "gcloud scheduler jobs pause job",
@@ -487,6 +493,9 @@ class DocumentIntegrityTests(unittest.TestCase):
                 "-10",
                 "10.0",
                 "00.1",
+                "09.1",
+                "08.1",
+                "099.1",
                 "01.0",
                 "!<tag:yaml.org,2002:int> 1",
                 "!<tag:yaml.org,2002:float> .5",
@@ -526,7 +535,7 @@ class DocumentIntegrityTests(unittest.TestCase):
                         errors,
                     )
 
-            for value in ("09", "08"):
+            for value in ("09", "08", "09e1", "08e1", "09_1", "08_1", "0e1", "00e1"):
                 with self.subTest(field=field, value=value):
                     candidate = self.skill_text.replace(
                         original,
@@ -540,6 +549,16 @@ class DocumentIntegrityTests(unittest.TestCase):
                     )
 
             for value in ("0o12", "0O12"):
+                with self.subTest(field=field, value=value):
+                    candidate = self.skill_text.replace(
+                        original,
+                        f"{field}: {value}",
+                        1,
+                    )
+                    errors = CHECKER.check_documents(candidate, self.ledger)
+                self.assertTrue(any(field in error for error in errors), errors)
+
+            for value in ("!!str []", "!!str {x: y}", "!<tag:yaml.org,2002:str> [x]"):
                 with self.subTest(field=field, value=value):
                     candidate = self.skill_text.replace(
                         original,
@@ -600,6 +619,21 @@ class DocumentIntegrityTests(unittest.TestCase):
             1,
         )
         self.assertFalse(CHECKER.check_documents(top_level_comment, self.ledger))
+
+        for indicator, body in (("|", "  value\n # comment"), ("|2", "  value\n\n")):
+            with self.subTest(indicator=indicator):
+                valid_block = self.skill_text.replace(
+                    name_line,
+                    f"name: {indicator}\n{body}",
+                    1,
+                )
+                self.assertFalse(CHECKER.check_documents(valid_block, self.ledger))
+
+        self.assertFalse(
+            CHECKER.required_frontmatter_errors(
+                "name: |2\n  value\n \ndescription: desc\n"
+            )
+        )
 
         tab_indented = self.skill_text.replace(
             name_line,

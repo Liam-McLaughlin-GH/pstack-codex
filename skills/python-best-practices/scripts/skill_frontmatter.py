@@ -13,9 +13,9 @@ YAML_OCTAL_DIGITS = r"[0-7]+(?:_[0-7]+)*"
 YAML_BINARY_DIGITS = r"[01]+(?:_[01]+)*"
 YAML_NUMBER_RE = re.compile(
     rf"""[-+]?(?:
-        (?:{YAML_DECIMAL_DIGITS})(?:\.(?:{YAML_DECIMAL_DIGITS})?)?
-        (?:[eE][-+]?{YAML_DECIMAL_DIGITS})?
+        (?:{YAML_DECIMAL_DIGITS})\.(?:{YAML_DECIMAL_DIGITS})?(?:[eE][-+]?{YAML_DECIMAL_DIGITS})?
         |\.{YAML_DECIMAL_DIGITS}(?:[eE][-+]?{YAML_DECIMAL_DIGITS})?
+        |(?:{YAML_DECIMAL_DIGITS})
     )""",
     re.VERBOSE,
 )
@@ -24,7 +24,7 @@ YAML_BASE_PREFIX_RE = re.compile(
 )
 YAML_OCTAL_PREFIX_RE = re.compile(rf"[-+]?0[oO]{YAML_OCTAL_DIGITS}")
 YAML_LEGACY_OCTAL_RE = re.compile(rf"[-+]?0(?:{YAML_OCTAL_DIGITS}|_{YAML_OCTAL_DIGITS})")
-YAML_INVALID_LEGACY_OCTAL_RE = re.compile(r"[-+]?0[0-9_]*[89][0-9_]*(?:\.[0-9_]*)?(?:[eE][-+]?\d+)?")
+YAML_INVALID_LEGACY_OCTAL_RE = re.compile(r"[-+]?0[0-9_]*[89][0-9_]*")
 YAML_SEXAGESIMAL_RE = re.compile(
     rf"[-+]?{YAML_DECIMAL_DIGITS}(?::[0-5]?[0-9])+(?:\.{YAML_DECIMAL_DIGITS})?"
 )
@@ -89,6 +89,8 @@ def _tagged_value_error(field: str, value: str) -> str | None:
     if kind in YAML_STRING_TAGS:
         if not payload:
             return f"{field} must be a non-empty scalar string"
+        if payload.startswith("[") or payload.startswith("{"):
+            return f"{field} must be a scalar string, not a YAML collection"
         if payload[0] in {"'", '"'}:
             return _scalar_value_error(field, payload)
         return None
@@ -180,7 +182,7 @@ def required_frontmatter_errors(metadata: str) -> list[str]:
             invalid_indent = False
             while index < len(lines):
                 next_line = lines[index]
-                if not next_line:
+                if not next_line or not next_line.strip():
                     content.append("")
                     index += 1
                     continue
@@ -194,6 +196,13 @@ def required_frontmatter_errors(metadata: str) -> list[str]:
                     if next_line.startswith("#") or re.match(r"^[A-Za-z_][A-Za-z0-9_-]*:", next_line):
                         break
                     invalid_indent = True
+                    index += 1
+                    continue
+                if block_indent is not None and leading < block_indent and next_line.lstrip().startswith("#"):
+                    index += 1
+                    continue
+                if block_indent is not None and leading < block_indent and not next_line.strip():
+                    content.append("")
                     index += 1
                     continue
                 if block_indent is None:
