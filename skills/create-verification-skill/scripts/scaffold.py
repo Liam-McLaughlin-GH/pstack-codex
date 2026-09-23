@@ -892,7 +892,15 @@ def _write_file_at(parent_fd: int, name: str, text: str) -> None:
         os.close(descriptor)
 
 
-def _write_tree(spec: dict[str, Any], root: Path, root_fd: int | None = None) -> None:
+def _write_tree(
+    spec: dict[str, Any],
+    root: Path,
+    root_fd: int | None = None,
+    *,
+    reservations: list[PublishedEntry] | None = None,
+) -> None:
+    if reservations is None:
+        reservations = _RESERVATION_SINK
     app = spec["app"]
     owned_root_fd = root_fd is None
     if root_fd is None:
@@ -916,10 +924,13 @@ def _write_tree(spec: dict[str, Any], root: Path, root_fd: int | None = None) ->
             )
     finally:
         if features_reservation is not None:
-            try:
-                os.close(features_reservation[0])
-            except OSError:
-                pass
+            if reservations is not None:
+                reservations.append(features_reservation)
+            else:
+                try:
+                    os.close(features_reservation[0])
+                except OSError:
+                    pass
         if features_fd is not None:
             try:
                 os.close(features_fd)
@@ -1682,6 +1693,7 @@ def validate_generated_skill(
 
 
 PublishedEntry = tuple[int, str, int | None, int | None, bool]
+_RESERVATION_SINK: list[PublishedEntry] | None = None
 
 
 def _descriptor_identity(descriptor: int, label: str, *, is_directory: bool) -> tuple[int, int]:
@@ -1827,7 +1839,18 @@ def _bind_created_directory(
 ) -> tuple[int, PublishedEntry]:
     descriptor: int | None = None
     reservation: PublishedEntry | None = None
+    path_identity: tuple[int, int] | None = None
+    path_stat_error: OSError | None = None
     try:
+        try:
+            path_stat = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            path_stat = None
+            path_stat_error = exc
+        if path_stat is not None:
+            if not stat.S_ISDIR(path_stat.st_mode):
+                raise ScaffoldError(f"{label} is not a directory")
+            path_identity = (path_stat.st_dev, path_stat.st_ino)
         descriptor = _open_directory_descriptor(
             name,
             label,
@@ -1835,6 +1858,8 @@ def _bind_created_directory(
             collision=True,
         )
         identity = _descriptor_identity(descriptor, label, is_directory=True)
+        if path_stat_error is not None:
+            raise ScaffoldError(f"{label} identity could not be captured") from path_stat_error
         reservation = (reservation_parent_fd, name, identity[0], identity[1], True)
         observed = _published_identity(
             parent_fd,
@@ -1845,6 +1870,14 @@ def _bind_created_directory(
         _close_published([observed])
         return descriptor, reservation
     except BaseException:
+        if reservation is None and path_identity is not None:
+            reservation = (
+                reservation_parent_fd,
+                name,
+                path_identity[0],
+                path_identity[1],
+                True,
+            )
         if descriptor is not None and reservation is None:
             try:
                 identity = os.fstat(descriptor)
@@ -1869,8 +1902,9 @@ def _bind_created_directory(
                 name,
                 (reservation[2], reservation[3]),
             )
-        else:
-            _remove_unrecorded_directory(parent_fd, name)
+        # If identity capture failed, the current public name is unowned from
+        # this process's perspective. Leave it in place rather than reacquiring
+        # a name-only identity and risking a competitor's deletion.
         try:
             os.close(reservation_parent_fd)
         except OSError:
@@ -2005,36 +2039,56 @@ def _native_unlink_at(
     is_directory: bool,
     expected_identity: tuple[int, int] | None = None,
 ) -> None:
-    """Remove an entry relative to a held directory descriptor."""
+    """Claim an entry with a no-replace rename before removing it."""
 
-    if expected_identity is not None:
-        try:
-            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError as exc:
-            raise CollisionError(f"entry changed during cleanup: {name}") from exc
-        if (current.st_dev, current.st_ino) != expected_identity:
-            raise CollisionError(f"entry changed during cleanup: {name}")
-        if is_directory and not stat.S_ISDIR(current.st_mode):
-            raise CollisionError(f"entry is not a directory during cleanup: {name}")
-        if not is_directory and not stat.S_ISREG(current.st_mode):
-            raise CollisionError(f"entry is not a regular file during cleanup: {name}")
+    if expected_identity is None:
+        raise ScaffoldError("identity-bound cleanup requires an expected identity")
 
     try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        function = getattr(libc, "unlinkat")
-    except AttributeError as exc:
-        raise ScaffoldError("identity-bound cleanup is unavailable on this platform") from exc
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise CollisionError(f"entry changed during cleanup: {name}") from exc
+    if (current.st_dev, current.st_ino) != expected_identity:
+        raise CollisionError(f"entry changed during cleanup: {name}")
+    if is_directory and not stat.S_ISDIR(current.st_mode):
+        raise CollisionError(f"entry is not a directory during cleanup: {name}")
+    if not is_directory and not stat.S_ISREG(current.st_mode):
+        raise CollisionError(f"entry is not a regular file during cleanup: {name}")
 
-    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-    function.restype = ctypes.c_int
-    flags = (0x00000080 if sys.platform == "darwin" else 0x00000200) if is_directory else 0
-    result = function(parent_fd, os.fsencode(name), flags)
-    if result == 0:
-        return
-    error_number = ctypes.get_errno()
-    if error_number in {errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EINVAL}:
-        raise ScaffoldError("identity-bound cleanup is unavailable on this platform")
-    raise OSError(error_number, os.strerror(error_number), name)
+    claimed_name = _unique_private_name(parent_fd, ".verify-unlink-")
+    _atomic_rename_noreplace(parent_fd, name, parent_fd, claimed_name)
+    try:
+        claimed = os.stat(claimed_name, dir_fd=parent_fd, follow_symlinks=False)
+        if (claimed.st_dev, claimed.st_ino) != expected_identity:
+            raise CollisionError(f"entry changed during cleanup: {name}")
+        if is_directory and not stat.S_ISDIR(claimed.st_mode):
+            raise CollisionError(f"entry is not a directory during cleanup: {name}")
+        if not is_directory and not stat.S_ISREG(claimed.st_mode):
+            raise CollisionError(f"entry is not a regular file during cleanup: {name}")
+
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            function = getattr(libc, "unlinkat")
+        except AttributeError as exc:
+            raise ScaffoldError("identity-bound cleanup is unavailable on this platform") from exc
+
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        function.restype = ctypes.c_int
+        # Darwin uses AT_REMOVEDIR=0x80; Linux uses AT_REMOVEDIR=0x200.
+        flags = (0x00000080 if sys.platform == "darwin" else 0x00000200) if is_directory else 0
+        result = function(parent_fd, os.fsencode(claimed_name), flags)
+        if result == 0:
+            return
+        error_number = ctypes.get_errno()
+        if error_number in {errno.ENOSYS, errno.EOPNOTSUPP, errno.ENOTSUP, errno.EINVAL}:
+            raise ScaffoldError("identity-bound cleanup is unavailable on this platform")
+        raise OSError(error_number, os.strerror(error_number), claimed_name)
+    except BaseException:
+        try:
+            _atomic_rename_noreplace(parent_fd, claimed_name, parent_fd, name)
+        except (OSError, ScaffoldError):
+            pass
+        raise
 
 
 def _unique_private_name(parent_fd: int, prefix: str = ".verify-cleanup-") -> str:
@@ -2048,7 +2102,20 @@ def _unique_private_name(parent_fd: int, prefix: str = ".verify-cleanup-") -> st
     raise ScaffoldError("could not reserve a private cleanup name")
 
 
-def _create_private_directory(parent_fd: int) -> tuple[str, int]:
+class _PrivateDirectory:
+    def __init__(self, name: str, descriptor: int, identity: tuple[int, int]) -> None:
+        self.name = name
+        self.descriptor = descriptor
+        self.identity = identity
+
+    def __iter__(self):
+        # Keep the small helper's historical two-value unpacking contract for
+        # focused tests and callers while retaining the bound identity.
+        yield self.name
+        yield self.descriptor
+
+
+def _create_private_directory(parent_fd: int) -> _PrivateDirectory:
     """Create a mode-700 directory and retain its descriptor as a quarantine."""
 
     for _ in range(100):
@@ -2066,7 +2133,7 @@ def _create_private_directory(parent_fd: int) -> tuple[str, int]:
             os.close(reservation[0])
         except OSError:
             pass
-        return name, descriptor
+        return _PrivateDirectory(name, descriptor, (reservation[2], reservation[3]))
     raise ScaffoldError("could not reserve a private cleanup directory")
 
 
@@ -2147,11 +2214,15 @@ def _delete_quarantined_entry(
         claimed = os.stat(delete_name, dir_fd=parent_fd, follow_symlinks=False)
         if not _same_identity(claimed, (device, inode)):
             raise CollisionError(f"private cleanup entry changed: {private_name}")
-        quarantine_name, quarantine_fd = _create_private_directory(parent_fd)
-        quarantine_stat = os.fstat(quarantine_fd)
-        if not stat.S_ISDIR(quarantine_stat.st_mode):
-            raise CollisionError(f"private cleanup directory changed: {quarantine_name}")
-        quarantine_identity = (quarantine_stat.st_dev, quarantine_stat.st_ino)
+        quarantine_directory = _create_private_directory(parent_fd)
+        if isinstance(quarantine_directory, tuple):
+            quarantine_name, quarantine_fd = quarantine_directory
+            quarantine_stat = os.stat(quarantine_name, dir_fd=parent_fd, follow_symlinks=False)
+            quarantine_identity = (quarantine_stat.st_dev, quarantine_stat.st_ino)
+        else:
+            quarantine_name = quarantine_directory.name
+            quarantine_fd = quarantine_directory.descriptor
+            quarantine_identity = quarantine_directory.identity
         quarantine_entry_name = _unique_private_name(
             quarantine_fd,
             ".verify-entry-",
@@ -2457,6 +2528,7 @@ def _publish_entry_no_replace(
     destination_dir_fd: int,
     source_dir_fd: int | None = None,
     source_name: str | None = None,
+    reservation_sink: list[PublishedEntry] | None = None,
 ) -> list[PublishedEntry]:
     """Publish one staged entry through a reserved directory descriptor."""
 
@@ -2535,6 +2607,20 @@ def _publish_entry_no_replace(
         raise
 
     published: list[PublishedEntry] = []
+
+    def record(entry: PublishedEntry) -> None:
+        published.append(entry)
+        if reservation_sink is not None:
+            reservation_sink.append(
+                (
+                    os.dup(entry[0]),
+                    entry[1],
+                    entry[2],
+                    entry[3],
+                    entry[4],
+                )
+            )
+
     if stat.S_ISDIR(source_mode):
         child_fd: int | None = None
         child_reservation: PublishedEntry | None = None
@@ -2554,7 +2640,7 @@ def _publish_entry_no_replace(
         if child_fd is None or child_reservation is None:
             os.close(source_descriptor)
             raise ScaffoldError(f"published directory reservation is unavailable: {destination}")
-        published.append(child_reservation)
+        record(child_reservation)
         try:
             with os.scandir(source_descriptor) as entries:
                 child_names = sorted(entry.name for entry in entries)
@@ -2567,6 +2653,7 @@ def _publish_entry_no_replace(
                         destination_dir_fd=child_fd,
                         source_dir_fd=source_descriptor,
                         source_name=child_name,
+                        reservation_sink=reservation_sink,
                     )
                 )
             # Keep the staged source intact until the top-level reservation is
@@ -2598,7 +2685,7 @@ def _publish_entry_no_replace(
         source_identity[1],
         False,
     )
-    published.append(destination_reservation)
+    record(destination_reservation)
 
     temporary_descriptor: int | None = None
     try:
@@ -2628,18 +2715,30 @@ def _publish_entry_no_replace(
             dir_fd=destination_dir_fd,
             follow_symlinks=False,
         )
-        published[-1] = (
-            destination_reservation[0],
-            temporary_name,
-            temporary_stat.st_dev,
-            temporary_stat.st_ino,
-            False,
-        )
         if not stat.S_ISREG(temporary_stat.st_mode) or (
             temporary_stat.st_dev,
             temporary_stat.st_ino,
         ) != source_identity:
             raise CollisionError(f"staging source changed during publication: {source}")
+        # Keep the original source identity in the rollback reservation until
+        # the temporary entry has passed the source check. A raced replacement
+        # must never become the object rollback is authorized to remove.
+        published[-1] = (
+            destination_reservation[0],
+            temporary_name,
+            source_identity[0],
+            source_identity[1],
+            False,
+        )
+        if reservation_sink is not None:
+            sink_parent_fd = reservation_sink[-1][0]
+            reservation_sink[-1] = (
+                sink_parent_fd,
+                published[-1][1],
+                published[-1][2],
+                published[-1][3],
+                published[-1][4],
+            )
         temporary_descriptor = _open_regular_descriptor(
             temporary_name,
             "published file",
@@ -2668,6 +2767,15 @@ def _publish_entry_no_replace(
             source_identity[1],
             False,
         )
+        if reservation_sink is not None:
+            sink_parent_fd = reservation_sink[-1][0]
+            reservation_sink[-1] = (
+                sink_parent_fd,
+                published[-1][1],
+                published[-1][2],
+                published[-1][3],
+                published[-1][4],
+            )
         observed = _published_identity(
             destination_dir_fd,
             destination_name,
@@ -2699,9 +2807,10 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
     if _symlink_component_errors(project_root):
         raise ScaffoldError("project root or one of its parents is a symlink")
     try:
-        project_mode = os.lstat(project_root).st_mode
+        project_stat = os.lstat(project_root)
     except OSError as exc:
         raise ScaffoldError(f"project root cannot be inspected: {exc}") from exc
+    project_mode = project_stat.st_mode
     if stat.S_ISLNK(project_mode) or not stat.S_ISDIR(project_mode):
         raise ScaffoldError("project root must be an existing non-symlink directory")
 
@@ -2720,11 +2829,18 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
     target_reserved = False
     target_reservation: PublishedEntry | None = None
     published_entries: list[PublishedEntry] = []
+    staging_child_reservations: list[PublishedEntry] = []
     skills_parent_fd: int | None = None
     target_fd: int | None = None
     target_identity: tuple[int, int] | None = None
     try:
         project_fd = _open_directory_descriptor(project_root, "project root")
+        opened_project = os.fstat(project_fd)
+        if (opened_project.st_dev, opened_project.st_ino) != (
+            project_stat.st_dev,
+            project_stat.st_ino,
+        ):
+            raise CollisionError(f"project root changed during publication: {project_root}")
         parent_fd, parent_created, parent_reservation = _open_or_create_directory(
             project_fd,
             ".agents",
@@ -2750,7 +2866,13 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
         )
         staging = skills_parent / staging_name
         _assert_path_matches_descriptor(staging, staging_fd, "staging directory")
-        _write_tree(spec, staging, root_fd=staging_fd)
+        global _RESERVATION_SINK
+        previous_reservation_sink = _RESERVATION_SINK
+        _RESERVATION_SINK = staging_child_reservations
+        try:
+            _write_tree(spec, staging, root_fd=staging_fd)
+        finally:
+            _RESERVATION_SINK = previous_reservation_sink
         _assert_path_matches_descriptor(skills_parent, skills_parent_fd, "output parent")
         _assert_path_matches_descriptor(staging, staging_fd, "staging directory")
         errors = validate_generated_skill(
@@ -2800,14 +2922,13 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
             )
             child = staging / child_name
             destination = target / child_name
-            published_entries.extend(
-                _publish_entry_no_replace(
-                    child,
-                    destination,
-                    destination_dir_fd=target_fd,
-                    source_dir_fd=staging_fd,
-                    source_name=child_name,
-                )
+            _publish_entry_no_replace(
+                child,
+                destination,
+                destination_dir_fd=target_fd,
+                source_dir_fd=staging_fd,
+                source_name=child_name,
+                reservation_sink=published_entries,
             )
             _assert_reserved_target_identity(
                 skills_parent_fd,
@@ -2828,6 +2949,8 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
         if staging_reservation is None or not _remove_reserved_directory_tree(staging_reservation):
             staging_reservation = None
             raise CollisionError(f"staging directory changed during publication: {staging}")
+        _close_published(staging_child_reservations)
+        staging_child_reservations = []
         staging_reservation = None
         staging = None
         if target_reservation is not None:
@@ -2839,9 +2962,19 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
         created_parent_entries = []
         return target
     except Exception:
+        staging_cleanup_succeeded = True
         if staging_reservation is not None:
-            _remove_reserved_directory_tree(staging_reservation)
+            staging_cleanup_succeeded = _remove_reserved_directory_tree(staging_reservation)
             staging_reservation = None
+        if staging_child_reservations:
+            if staging_cleanup_succeeded:
+                _rollback_published(staging_child_reservations)
+            else:
+                # The staging root moved away, so its child reservations refer
+                # to the detached owned tree. Close those handles without
+                # reacquiring names under the replacement root.
+                _close_published(staging_child_reservations)
+            staging_child_reservations = []
         if target_reserved:
             _rollback_published(published_entries)
             if target_reservation is not None:
