@@ -894,8 +894,16 @@ def _write_file_at(parent_fd: int, name: str, text: str) -> tuple[int, int]:
         return identity.st_dev, identity.st_ino
     except BaseException:
         try:
-            os.unlink(name, dir_fd=parent_fd)
-        except OSError:
+            written_identity = os.fstat(descriptor)
+            if stat.S_ISDIR(written_identity.st_mode):
+                raise ScaffoldError(f"generated file became a directory: {name}")
+            _native_unlink_at(
+                parent_fd,
+                name,
+                is_directory=False,
+                expected_identity=(written_identity.st_dev, written_identity.st_ino),
+            )
+        except (OSError, ScaffoldError):
             pass
         raise
     finally:
@@ -2094,8 +2102,8 @@ def _native_unlink_at(
         raise CollisionError(f"entry changed during cleanup: {name}")
     if is_directory and not stat.S_ISDIR(current.st_mode):
         raise CollisionError(f"entry is not a directory during cleanup: {name}")
-    if not is_directory and not stat.S_ISREG(current.st_mode):
-        raise CollisionError(f"entry is not a regular file during cleanup: {name}")
+    if not is_directory and stat.S_ISDIR(current.st_mode):
+        raise CollisionError(f"entry is a directory during cleanup: {name}")
 
     claimed_name = _unique_private_name(parent_fd, ".verify-unlink-")
     _atomic_rename_noreplace(parent_fd, name, parent_fd, claimed_name)
@@ -2105,8 +2113,8 @@ def _native_unlink_at(
             raise CollisionError(f"entry changed during cleanup: {name}")
         if is_directory and not stat.S_ISDIR(claimed.st_mode):
             raise CollisionError(f"entry is not a directory during cleanup: {name}")
-        if not is_directory and not stat.S_ISREG(claimed.st_mode):
-            raise CollisionError(f"entry is not a regular file during cleanup: {name}")
+        if not is_directory and stat.S_ISDIR(claimed.st_mode):
+            raise CollisionError(f"entry is a directory during cleanup: {name}")
 
         try:
             libc = ctypes.CDLL(None, use_errno=True)
@@ -2810,30 +2818,32 @@ def _publish_entry_no_replace(
             dir_fd=destination_dir_fd,
             follow_symlinks=False,
         )
-        if not stat.S_ISREG(temporary_stat.st_mode) or (
-            temporary_stat.st_dev,
-            temporary_stat.st_ino,
-        ) != source_identity:
-            raise CollisionError(f"staging source changed during publication: {source}")
-        # Keep the original source identity in the rollback reservation until
-        # the temporary entry has passed the source check. A raced replacement
-        # must never become the object rollback is authorized to remove.
+        temporary_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
+        # The private name was created by this call even when the source path
+        # changed between validation and os.link(). Bind rollback to the
+        # identity actually created so a failed race cannot strand our private
+        # entry, while still refusing to touch a later replacement.
         published[-1] = (
             destination_reservation[0],
             temporary_name,
-            source_identity[0],
-            source_identity[1],
+            temporary_identity[0],
+            temporary_identity[1],
             False,
         )
         if reservation_sink is not None:
             sink_parent_fd = reservation_sink[-1][0]
             reservation_sink[-1] = (
                 sink_parent_fd,
-                published[-1][1],
-                published[-1][2],
-                published[-1][3],
-                published[-1][4],
+                temporary_name,
+                temporary_identity[0],
+                temporary_identity[1],
+                False,
             )
+        if not stat.S_ISREG(temporary_stat.st_mode) or temporary_identity != source_identity:
+            raise CollisionError(f"staging source changed during publication: {source}")
+        # Keep the original source identity in the rollback reservation until
+        # the temporary entry has passed the source check. A raced replacement
+        # must never become the object rollback is authorized to remove.
         temporary_descriptor = _open_regular_descriptor(
             temporary_name,
             "published file",

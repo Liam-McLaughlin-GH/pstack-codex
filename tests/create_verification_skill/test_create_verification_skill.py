@@ -1347,6 +1347,90 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
             self.assertFalse(target.exists())
             self.assertFalse((project / ".agents").exists())
 
+    def test_write_failure_does_not_remove_same_name_replacement(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-write-race-") as temporary:
+            root = Path(temporary)
+            parent = root / "parent"
+            parent.mkdir()
+            generated = parent / "generated.txt"
+            competitor = root / "competitor.txt"
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            def race_write(descriptor: int, data: bytes) -> int:
+                generated.unlink()
+                competitor.write_text("competitor\n", encoding="utf-8")
+                os.link(competitor, generated)
+                raise OSError(errno.EIO, "forced write failure")
+
+            try:
+                with mock.patch.object(scaffold_module.os, "write", side_effect=race_write):
+                    with self.assertRaises(OSError):
+                        scaffold_module._write_file_at(parent_fd, "generated.txt", "owned\n")
+            finally:
+                os.close(parent_fd)
+
+            self.assertEqual(generated.read_text(encoding="utf-8"), "competitor\n")
+            self.assertEqual(competitor.stat().st_nlink, 2)
+
+    def test_source_swap_after_link_removes_only_private_competitor_link(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-link-race-") as temporary:
+            root = Path(temporary)
+            source_dir = root / "source"
+            destination_dir = root / "destination"
+            source_dir.mkdir()
+            destination_dir.mkdir()
+            source_path = source_dir / "source.txt"
+            source_path.write_text("original\n", encoding="utf-8")
+            competitor = root / "competitor.txt"
+            competitor.write_text("competitor\n", encoding="utf-8")
+            original_metadata = os.lstat(source_path)
+            source_fd = os.open(
+                source_dir,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            destination_fd = os.open(
+                destination_dir,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            original_link = scaffold_module.os.link
+            injected = False
+
+            def race_link(*args: object, **kwargs: object) -> object:
+                nonlocal injected
+                if not injected:
+                    injected = True
+                    source_path.unlink()
+                    os.link(competitor, source_path)
+                return original_link(*args, **kwargs)
+
+            try:
+                with mock.patch.object(scaffold_module.os, "link", side_effect=race_link):
+                    with self.assertRaises(CollisionError):
+                        scaffold_module._publish_entry_no_replace(
+                            source_path,
+                            destination_dir / "published.txt",
+                            destination_dir_fd=destination_fd,
+                            source_dir_fd=source_fd,
+                            source_name="source.txt",
+                            source_metadata=original_metadata,
+                        )
+            finally:
+                os.close(source_fd)
+                os.close(destination_fd)
+
+            self.assertTrue(injected)
+            self.assertEqual(source_path.read_text(encoding="utf-8"), "competitor\n")
+            self.assertEqual(competitor.stat().st_nlink, 2)
+            self.assertEqual(list(destination_dir.iterdir()), [])
+
     def test_source_replacement_after_descriptor_binding_never_publishes_competitor(self) -> None:
         for kind in ("hardlink", "symlink", "fifo"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory(
