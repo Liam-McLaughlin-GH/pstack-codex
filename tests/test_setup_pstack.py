@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import errno
 import os
 import shutil
 import subprocess
@@ -14,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "skills" / "setup-pstack" / "scripts" / "install.py"
 CONFIGURER = ROOT / "skills" / "setup-pstack" / "scripts" / "configure.py"
+SAFE_FS = ROOT / "skills" / "setup-pstack" / "scripts" / "safe_fs.py"
 VERIFY = ROOT / "scripts" / "verify_port.py"
 
 
@@ -1347,6 +1349,51 @@ class SetupPstackBehaviorTests(unittest.TestCase):
                 else:
                     self.assertTrue(preserved_competitor.is_dir())
                     self.assertEqual(list(preserved_competitor.iterdir()), [])
+
+    def test_status_minus_47_fallback_does_not_delete_a_replacement_after_claim(self) -> None:
+        safe_fs = load_module(SAFE_FS, "safe_fs_minus_47_fallback_race_test")
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-minus-47-race-test-") as temporary:
+            root = Path(temporary)
+            victim = root / "victim"
+            competitor = root / "competitor"
+            victim.write_text("expected\n", encoding="utf-8")
+            competitor.write_text("competitor\n", encoding="utf-8")
+            parent_fd = os.open(root, os.O_RDONLY)
+            original_lstat = safe_fs.lstat_at
+            original_delete = safe_fs._darwin_delete_reference
+            swapped = False
+
+            def fail_reference(reference: object, name: str) -> None:
+                raise OSError(errno.EIO, "FSDeleteObject failed with status -47", name)
+
+            def swap_after_first_claim(directory_fd: int, name: str) -> os.stat_result:
+                nonlocal swapped
+                metadata = original_lstat(directory_fd, name)
+                if name.startswith(".pstack-unlink-") and not swapped:
+                    swapped = True
+                    os.rename(name, "expected-private", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                    os.rename(competitor, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                return metadata
+
+            safe_fs._darwin_delete_reference = fail_reference
+            safe_fs.lstat_at = swap_after_first_claim
+            try:
+                with self.assertRaises(safe_fs.SafeFilesystemError):
+                    safe_fs._native_unlink_at(
+                        parent_fd,
+                        "victim",
+                        is_directory=False,
+                        expected_metadata=original_lstat(parent_fd, "victim"),
+                        identity_reference=safe_fs._DarwinFSRef(),
+                    )
+            finally:
+                safe_fs.lstat_at = original_lstat
+                safe_fs._darwin_delete_reference = original_delete
+                os.close(parent_fd)
+
+            self.assertTrue(swapped)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "competitor\n")
+            self.assertEqual((root / "expected-private").read_text(encoding="utf-8"), "expected\n")
 
     def test_created_parent_recovery_receipt_is_bounded_and_deterministic(self) -> None:
         module = load_module(CONFIGURER, "configure_for_bounded_cleanup_receipt_test")

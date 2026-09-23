@@ -530,7 +530,19 @@ def _native_unlink_at(
     try:
         claimed_metadata = lstat_at(parent_fd, claimed_name)
         if not _same_entry(claimed_metadata, expected_metadata):
-            raise SafeFilesystemError(f"entry identity changed during removal: {name}")
+            raise SafeFilesystemError(f"entry identity changed during removal: {name}", preserve_private=True)
+        # Make a second atomic claim before the pathname delete.  The first
+        # private name is observable to cleanup hooks and tests, so a
+        # replacement can appear after its identity check.  Rebinding the
+        # entry to a fresh name and checking that name closes that race for
+        # the fallback used when the native identity primitive returns
+        # Darwin status -47.
+        final_name = unique_entry_name(parent_fd, ".pstack-delete-")
+        atomic_rename_noreplace_at(parent_fd, claimed_name, final_name)
+        claimed_name = final_name
+        claimed_metadata = lstat_at(parent_fd, claimed_name)
+        if not _same_entry(claimed_metadata, expected_metadata):
+            raise SafeFilesystemError(f"entry identity changed during removal: {name}", preserve_private=True)
         try:
             libc = ctypes.CDLL(None, use_errno=True)
             function = getattr(libc, "unlinkat")
