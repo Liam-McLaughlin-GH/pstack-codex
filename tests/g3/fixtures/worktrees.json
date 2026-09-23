@@ -1,0 +1,35 @@
+{
+  "main_worktree": "/fixtures/repo",
+  "worktrees": [
+    {
+      "path": "/fixtures/repo",
+      "branch": "main",
+      "head": "abc123",
+      "dirty": "clean",
+      "remote": "pushed",
+      "pr": null,
+      "merged": true,
+      "activity": {"status": "known", "at": "2026-01-05T00:00:00Z", "source": "fixture"}
+    },
+    {
+      "path": "/fixtures/repo-g3",
+      "branch": "feature/g3",
+      "head": "def456",
+      "dirty": "wip",
+      "remote": "ahead1",
+      "pr": {"number": 24, "state": "OPEN"},
+      "merged": false,
+      "activity": null
+    },
+    {
+      "path": "/fixtures/repo-old",
+      "branch": "feature/old",
+      "head": "ghi789",
+      "dirty": "clean",
+      "remote": null,
+      "pr": null,
+      "merged": null,
+      "activity": null
+    }
+  ]
+}
