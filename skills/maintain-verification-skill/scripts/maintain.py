@@ -1692,7 +1692,7 @@ def _cleanup_protected_roots(project_root: Path, skill_root: Path | None) -> lis
     roots = [project_root]
     if skill_root is not None:
         roots.append(skill_root)
-    for relative in (".agents/skills", ".cursor/skills", ".codex/skills"):
+    for relative in (".agents/skills", ".cursor/skills", ".codex/skills"):  # UNSUPPORTED-SEAM: cursor path is a protected competitor directory literal
         candidate = project_root / relative
         if candidate.is_dir() and not candidate.is_symlink():
             roots.append(candidate.resolve())

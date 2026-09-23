@@ -272,13 +272,32 @@ def _scalar(value: str, field: str) -> str:
             index += 2 + width
         raise ValidationError(f"frontmatter field {field!r} has an unterminated quote")
 
+    explicit_string_tag = re.match(
+        r"^(?:!!str|!<tag:yaml\.org,2002:str>)(?:[ \t]+(?P<payload>.*))?$",
+        value,
+        re.IGNORECASE,
+    )
+    if explicit_string_tag is not None:
+        payload = (explicit_string_tag.group("payload") or "").strip()
+        anchor_match = re.fullmatch(r"&[A-Za-z_][A-Za-z0-9_-]*(?:[ \t]+(.*))?", payload)
+        if anchor_match is not None:
+            payload = (anchor_match.group(1) or "").strip()
+        if not payload:
+            raise ValidationError(f"frontmatter field {field!r} is empty")
+        if payload.startswith(("*", "!", "[", "{")):
+            raise ValidationError(f"frontmatter field {field!r} is not a supported scalar")
+        if payload[0] in {"'", '"'}:
+            return _scalar(payload, field)
+        return payload
     if value.startswith(("[", "{", "&", "*", "!", "|", ">", "%", "@", "`", "#")):
         raise ValidationError(f"frontmatter field {field!r} is not a supported scalar")
     if re.search(r":(?:[ \t]|$)", value):
         raise ValidationError(f"frontmatter field {field!r} has unsupported mapping syntax")
-    if value.casefold() in {"null", "~", "true", "false", "yes", "no", "on", "off"}:
+    if value.casefold() in {"null", "~", "true", "false", "yes", "no", "on", "off", "y", "n"}:
         raise ValidationError(f"frontmatter field {field!r} is not a string scalar")
-    if re.fullmatch(r"[-+]?(?:0|[1-9][0-9_]*)(?:\.[0-9_]+)?(?:[eE][-+]?[0-9]+)?", value):
+    if re.fullmatch(r"[-+]?(?:0|[1-9][0-9_]*)(?:\.[0-9_]*)?(?:[eE][-+]?[0-9_]+)?", value):
+        raise ValidationError(f"frontmatter field {field!r} is not a string scalar")
+    if re.fullmatch(r"[-+]?\.[0-9_]+|[-+]?0_[0-9_]+|[-+]?\.(?:inf|nan)", value, re.IGNORECASE):
         raise ValidationError(f"frontmatter field {field!r} is not a string scalar")
     if re.fullmatch(r"[-+]?0x[0-9A-Fa-f_]+|[-+]?0o[0-7_]+|[-+]?0b[01_]+", value):
         raise ValidationError(f"frontmatter field {field!r} is not a string scalar")
@@ -294,7 +313,6 @@ def parse_frontmatter(text: str) -> Frontmatter:
     closing = next((index for index in range(1, len(lines)) if lines[index].strip() == "---"), None)
     if closing is None:
         raise ValidationError("missing YAML frontmatter closing delimiter")
-
     fields: dict[str, str] = {}
     for line in lines[1:closing]:
         if not line.strip() or line.lstrip().startswith("#"):
@@ -306,10 +324,32 @@ def parse_frontmatter(text: str) -> Frontmatter:
         if key in fields:
             raise ValidationError(f"duplicate frontmatter field: {key}")
         fields[key] = _scalar(match.group("value") or "", key)
+    helper_errors = required_frontmatter_errors("\n".join(lines[1:closing]))
+    if helper_errors:
+        raise ValidationError(helper_errors[0])
     for required in ("name", "description"):
         if required not in fields:
             raise ValidationError(f"frontmatter is missing {required}")
     return Frontmatter(fields, closing + 1)
+
+
+_FRONTMATTER_HELPER = None
+
+
+def required_frontmatter_errors(metadata: str) -> list[str]:
+    """Keep the repository frontmatter helper importable for skill-level tests."""
+
+    global _FRONTMATTER_HELPER
+    if _FRONTMATTER_HELPER is None:
+        helper_path = ROOT / "scripts" / "skill_frontmatter.py"
+        helper_spec = importlib.util.spec_from_file_location("pstack_frontmatter_helper", helper_path)
+        if helper_spec is None or helper_spec.loader is None:
+            raise RuntimeError("could not load the shared frontmatter helper")
+        helper = importlib.util.module_from_spec(helper_spec)
+        sys.modules[helper_spec.name] = helper
+        helper_spec.loader.exec_module(helper)
+        _FRONTMATTER_HELPER = helper
+    return _FRONTMATTER_HELPER.required_frontmatter_errors(metadata)
 
 
 def _reference_label(label: str) -> str:

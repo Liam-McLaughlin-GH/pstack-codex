@@ -25,6 +25,7 @@ PORT_SPEC = importlib.util.spec_from_file_location(
 if PORT_SPEC is None or PORT_SPEC.loader is None:
     raise RuntimeError("could not load the shared port checker")
 PORT_CHECKER = importlib.util.module_from_spec(PORT_SPEC)
+sys.modules[PORT_SPEC.name] = PORT_CHECKER
 PORT_SPEC.loader.exec_module(PORT_CHECKER)
 
 
