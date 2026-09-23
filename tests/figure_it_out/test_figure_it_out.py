@@ -1575,6 +1575,28 @@ class WorkflowBehaviorTests(unittest.TestCase):
             with self.assertRaises(figure_it_out.StateError):
                 figure_it_out.Workflow.load(nested_path, workspace_root=root)
 
+    def test_schema_two_refusal_rejects_forged_reason_and_next_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            with self.assertRaises(figure_it_out.ScopeRefusal):
+                workflow.guard_action("deploy", "production")
+            state_path = root / "run.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            refusal_event = next(event for event in state["events"] if event["event"] == "action_refused")
+            refusal_event["reason"] = "secret@host"
+            refusal_event["next_action"] = "send secret@host"
+            refusal_event["decision"]["why"] = refusal_event["reason"]
+            refusal_event["decision"]["reason"] = refusal_event["reason"]
+            refusal_event["decision"]["next_action"] = refusal_event["next_action"]
+            state["decisions"][0]["why"] = refusal_event["reason"]
+            state["decisions"][0]["reason"] = refusal_event["reason"]
+            state["decisions"][0]["next_action"] = refusal_event["next_action"]
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(state_path, workspace_root=root)
+
     def test_persisted_allowed_actions_must_match_lifecycle_status(self):
         def failed(workflow):
             workflow.start_phase()

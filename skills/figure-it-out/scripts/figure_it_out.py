@@ -36,6 +36,14 @@ CHECK_STATUSES = {"verified", "failed", "blocked", "not_run", "inconclusive"}
 RUN_STATUSES = {"planned", "running", "failed", "interrupted", "blocked", "completed"}
 PHASE_STATUSES = {"pending", "in_progress", "passed", "failed", "interrupted", "blocked"}
 ACTION_REFUSAL_STATUSES = {"failed", "interrupted", "blocked", "completed"}
+REFUSAL_NEXT_ACTION = "choose a declared local action or replan with owner approval"
+SCOPE_REFUSAL_REASON = "action was refused by scope validation"
+LIFECYCLE_REFUSAL_REASONS = {
+    "failed": "run is failed; replan before authorizing another action",
+    "interrupted": "run is stopped; resume before authorizing another action",
+    "blocked": "run is blocked; resolve the recorded blocker before authorizing another action",
+    "completed": "run is completed; its terminal state is immutable",
+}
 LIFECYCLE_EVENTS = {
     "phase_started",
     "checkpoint",
@@ -817,6 +825,9 @@ def _validate_lifecycle_graph_v2(
                 fail(f"events[{index}].action_refused action is not normalized")
             reason = event_text(event, index, "reason", max_length=1000)
             next_action = event_text(event, index, "next_action", max_length=1000)
+            expected_reason = LIFECYCLE_REFUSAL_REASONS.get(run_status, SCOPE_REFUSAL_REASON)
+            if reason != expected_reason or next_action != REFUSAL_NEXT_ACTION:
+                fail(f"events[{index}] refusal metadata is not canonical")
             if event.get("target") is not None:
                 _state_text(event["target"], f"events[{index}].target", max_length=500)
             if decision is None or decision.get("status") != "refused" or decision.get("result") != "blocked":
@@ -1833,15 +1844,15 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             "at": _now(),
             "phase": record.get("phase") if record.get("phase") in phase_by_id else "run",
             "decision": f"refused action {action_reference}",
-            "why": "legacy refusal",
+            "why": SCOPE_REFUSAL_REASON,
             "evidence": [
                 {"kind": "reference", "ref": f"scope:{action_reference}"},
                 {"kind": "reference", "ref": "target:provided" if target_provided else "target:none"},
             ],
             "result": "blocked",
             "status": "refused",
-            "reason": "legacy refusal",
-            "next_action": "choose a declared local action or replan with owner approval",
+            "reason": SCOPE_REFUSAL_REASON,
+            "next_action": REFUSAL_NEXT_ACTION,
         }
 
     def refusal_action_reference(event: Mapping[str, Any]) -> str:
@@ -1881,10 +1892,8 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                 if decision.get("decision") == f"refused action {action_reference}" and decision.get("result") == "blocked":
                     refusal = deepcopy(decision)
                     refusal["status"] = "refused"
-                    refusal["reason"] = event.get("reason", "legacy refusal")
-                    refusal["next_action"] = event.get(
-                        "next_action", "choose a declared local action or replan with owner approval"
-                    )
+                    refusal["reason"] = SCOPE_REFUSAL_REASON
+                    refusal["next_action"] = REFUSAL_NEXT_ACTION
                     return refusal, index
             if event_name == "action_refused" and decision.get("status") == "refused" and decision.get("phase") == phase:
                 return decision, index
@@ -1952,12 +1961,12 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                 make_decision(
                     phase,
                     f"refused action {action_reference}",
-                    "legacy refusal",
+                    SCOPE_REFUSAL_REASON,
                     evidence,
                     "blocked",
                     status="refused",
-                    reason="legacy refusal",
-                    next_action="choose a declared local action or replan with owner approval",
+                    reason=SCOPE_REFUSAL_REASON,
+                    next_action=REFUSAL_NEXT_ACTION,
                 )
             ), False
         raise StateError(f"invalid state: schema-1 has an unsupported decision event {event_name!r}")
@@ -2009,8 +2018,8 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                         )
         if event_name == "action_refused":
             event["target"] = _sanitize_refusal_target(event.get("target"))
-            event["reason"] = "legacy refusal"
-            event["next_action"] = "choose a declared local action or replan with owner approval"
+            event["reason"] = SCOPE_REFUSAL_REASON
+            event["next_action"] = REFUSAL_NEXT_ACTION
         if event_name == "checkpoint":
             checkpoint_id = event.get("checkpoint")
             if not isinstance(checkpoint_id, str):
@@ -2128,8 +2137,8 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                     event["phase"] = record.get("phase", "run")
                     event["action"] = refusal_action_reference(event)
                     event["target"] = _sanitize_refusal_target(event.get("target"))
-                    event["reason"] = "legacy refusal"
-                    event["next_action"] = "choose a declared local action or replan with owner approval"
+                    event["reason"] = SCOPE_REFUSAL_REASON
+                    event["next_action"] = REFUSAL_NEXT_ACTION
                     event.pop("evidence", None)
                     event.pop("why", None)
                     event.pop("result", None)
@@ -3046,10 +3055,10 @@ class Workflow:
         return deepcopy(self.state)
 
     def _refuse_action(self, action: str, target: str | None, reason: str) -> None:
-        next_action = "choose a declared local action or replan with owner approval"
+        next_action = REFUSAL_NEXT_ACTION
         action_reference = action if SAFE_ACTION.fullmatch(action) else "invalid-action"
         target = _sanitize_refusal_target(target)
-        safe_reason = reason if action_reference != "invalid-action" else "action was refused by scope validation"
+        safe_reason = LIFECYCLE_REFUSAL_REASONS.get(self.state["status"], SCOPE_REFUSAL_REASON)
         refusal = {
             "at": _now(),
             "status": "refused",
