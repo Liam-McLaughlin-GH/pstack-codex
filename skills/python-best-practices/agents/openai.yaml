@@ -1,0 +1,4 @@
+interface:
+  display_name: "Python Best Practices"
+  short_description: "Apply general Python and source-backed Showpass Python guidance"
+  default_prompt: "Use $python-best-practices to choose the right Python, Django, ORM, test, and deployment guidance for this task."

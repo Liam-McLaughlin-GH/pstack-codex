@@ -1,0 +1,4 @@
+interface:
+  display_name: "Set up pstack"
+  short_description: "Discover Codex models and configure pstack agents safely"
+  default_prompt: "Use $setup-pstack to inspect available Codex models and preview a pstack agent configuration."
