@@ -450,15 +450,42 @@ def validate_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _state_path(path: str | os.PathLike[str], workspace_root: str | os.PathLike[str] | None) -> tuple[Path, Path]:
+def _workspace_root(path: str | os.PathLike[str]) -> Path:
+    root = Path(path).absolute()
+    try:
+        root_mode = root.lstat().st_mode
+    except FileNotFoundError:
+        root_mode = None
+    except OSError as exc:
+        raise StateError(f"workspace root could not be inspected: {root}") from exc
+    if root_mode is not None and not stat.S_ISDIR(root_mode) and not stat.S_ISLNK(root_mode):
+        raise StateError(f"workspace root must be a directory: {root}")
+
+    root = root.resolve(strict=False)
+    try:
+        resolved_mode = root.lstat().st_mode
+    except FileNotFoundError:
+        return root
+    except OSError as exc:
+        raise StateError(f"workspace root could not be inspected: {root}") from exc
+    if not stat.S_ISDIR(resolved_mode):
+        raise StateError(f"workspace root must be a directory: {root}")
+    return root
+
+
+def _state_path(
+    path: str | os.PathLike[str],
+    workspace_root: str | os.PathLike[str] | None,
+    *,
+    require_regular: bool = False,
+) -> tuple[Path, Path]:
     raw = Path(path)
     if workspace_root is not None:
-        root = Path(workspace_root)
+        root = _workspace_root(workspace_root)
     elif raw.is_absolute():
-        root = raw.parent
+        root = _workspace_root(raw.parent)
     else:
-        root = Path.cwd()
-    root = root.absolute().resolve()
+        root = _workspace_root(Path.cwd())
     candidate = raw if raw.is_absolute() else root / raw
     candidate = candidate.absolute()
     if candidate.is_symlink():
@@ -466,6 +493,15 @@ def _state_path(path: str | os.PathLike[str], workspace_root: str | os.PathLike[
             "state path must not be a symlink",
             {"status": "refused", "reason": "state path is a symlink", "next_action": "choose a regular local state path"},
         )
+    if require_regular:
+        try:
+            candidate_mode = candidate.lstat().st_mode
+        except FileNotFoundError:
+            candidate_mode = None
+        except OSError as exc:
+            raise StateError(f"state path could not be inspected: {candidate}") from exc
+        if candidate_mode is not None and not stat.S_ISREG(candidate_mode):
+            raise StateError(f"state path must be a regular file: {candidate}")
     candidate = candidate.resolve(strict=False)
     try:
         candidate.relative_to(root)
@@ -1688,7 +1724,7 @@ class Workflow:
         workspace_root: str | os.PathLike[str] | None = None,
     ) -> "Workflow":
         contract = validate_plan(plan)
-        path, root = _state_path(state_path, workspace_root)
+        path, root = _state_path(state_path, workspace_root, require_regular=True)
         try:
             existing_mode = path.lstat().st_mode
         except FileNotFoundError:
@@ -1747,7 +1783,7 @@ class Workflow:
         *,
         workspace_root: str | os.PathLike[str] | None = None,
     ) -> "Workflow":
-        path, root = _state_path(state_path, workspace_root)
+        path, root = _state_path(state_path, workspace_root, require_regular=True)
         try:
             state_mode = path.lstat().st_mode
         except FileNotFoundError as exc:

@@ -1129,6 +1129,36 @@ class WorkflowBehaviorTests(unittest.TestCase):
                     self.assertNotIn("Traceback", result.stderr)
                     self.assertTrue(json.loads(result.stderr)["error"])
 
+            plan_path = root / "valid-plan.json"
+            plan_path.write_text(json.dumps(make_plan(phase_count=1)), encoding="utf-8")
+            workspace_destinations = {"file": root / "workspace-file", "fifo": root / "workspace-fifo"}
+            workspace_destinations["file"].write_text("workspace", encoding="utf-8")
+            os.mkfifo(workspace_destinations["fifo"])
+            for kind, destination in workspace_destinations.items():
+                with self.subTest(input=f"workspace-{kind}"):
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(SCRIPT),
+                            "init",
+                            "--plan",
+                            str(plan_path),
+                            "--state",
+                            "run.json",
+                            "--workspace-root",
+                            str(destination),
+                        ],
+                        cwd=ROOT,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        timeout=2,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertNotIn("Traceback", result.stderr)
+                    error = json.loads(result.stderr)
+                    self.assertIn("workspace root must be a directory", error["error"])
+
             plan_destinations = {"directory": root / "plan-directory", "fifo": root / "plan-fifo"}
             plan_destinations["directory"].mkdir()
             os.mkfifo(plan_destinations["fifo"])
