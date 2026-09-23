@@ -446,7 +446,22 @@ class DocumentIntegrityTests(unittest.TestCase):
             ),
         }
         for field, original in replacements.items():
-            for value in ("", "null", "~", "[]", "{}", "0x10", ".inf", "!!int 1"):
+            for value in (
+                "",
+                "null",
+                "~",
+                "[]",
+                "{}",
+                "0x10",
+                ".inf",
+                "!!int 1",
+                "1.",
+                ".5",
+                "1_000",
+                "!<tag:yaml.org,2002:int> 1",
+                "!<tag:yaml.org,2002:float> .5",
+                "!<tag:yaml.org,2002:bool> true",
+            ):
                 with self.subTest(field=field, value=value):
                     candidate = self.skill_text.replace(
                         original,
@@ -457,14 +472,63 @@ class DocumentIntegrityTests(unittest.TestCase):
                     self.assertTrue(errors)
                     self.assertTrue(any(field in error for error in errors))
 
+            for value in (
+                '"1."',
+                "'.5'",
+                '"1_000"',
+                '"!<tag:yaml.org,2002:int> 1"',
+                "!<tag:yaml.org,2002:str> 1",
+            ):
+                with self.subTest(field=field, value=value):
+                    candidate = self.skill_text.replace(
+                        original,
+                        f"{field}: {value}",
+                        1,
+                    )
+                    errors = CHECKER.check_documents(candidate, self.ledger)
+                    self.assertFalse(
+                        any(field in error for error in errors),
+                        errors,
+                    )
+
     def test_shared_port_boundary_rejects_non_scalar_required_frontmatter(self) -> None:
         for field in ("name", "description"):
-            for value in ("", "null", "~", "[]", "{}", "0x10", ".inf", "!!int 1"):
+            for value in (
+                "",
+                "null",
+                "~",
+                "[]",
+                "{}",
+                "0x10",
+                ".inf",
+                "!!int 1",
+                "1.",
+                ".5",
+                "1_000",
+                "!<tag:yaml.org,2002:int> 1",
+                "!<tag:yaml.org,2002:float> .5",
+                "!<tag:yaml.org,2002:bool> true",
+            ):
                 with self.subTest(field=field, value=value):
                     metadata = f"{field}: {value}\n"
                     errors = PORT_CHECKER.required_frontmatter_errors(metadata)
                     self.assertTrue(errors)
                     self.assertTrue(any(field in error for error in errors))
+
+            for value in (
+                '"1."',
+                "'.5'",
+                '"1_000"',
+                '"!<tag:yaml.org,2002:int> 1"',
+                "!<tag:yaml.org,2002:str> 1",
+            ):
+                with self.subTest(field=field, value=value):
+                    metadata = f"{field}: {value}\n"
+                    errors = PORT_CHECKER.required_frontmatter_errors(metadata)
+                    self.assertFalse(
+                        any(field in error for error in errors),
+                        errors,
+                    )
 
     def test_malformed_ledger_records_are_rejected_with_readable_errors(self) -> None:
         mutations = (
