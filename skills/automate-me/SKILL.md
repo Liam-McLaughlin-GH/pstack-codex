@@ -25,11 +25,13 @@ into a skill or script.
 Require an explicit artifact request before choosing a personal mode. A
 dark-mode fix, a review, a request to use an existing workflow, or a bare
 `<name>-mode` mention is not a mode-creation request. Treat `automate me`
-without a handle, output path, or create/update choice as a confirmation
-request. Treat a request that says both "create" and "update" as ambiguous.
-Ask the user instead of guessing. Treat negated `automate me` requests as
-no-artifact requests, including negation separated from the phrase by
-punctuation or a short intervening clause.
+without an explicit artifact action as no-artifact wording. Treat a
+project-local request with positive artifact intent as project-local even when
+it mentions a personal mode; negated or explanatory project-local wording is
+no-artifact. Treat a request that says both "create" and "update" as
+ambiguous. Ask the user instead of guessing. Treat negated `automate me`
+requests as no-artifact requests, including negation separated from the phrase
+by punctuation or a short intervening clause.
 
 Discover existing skills only under the active workspace's direct `skills/`
 children. A repeat create request remains `create` and must refuse the

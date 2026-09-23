@@ -243,6 +243,28 @@ class AutomateMeBehaviorTests(unittest.TestCase):
         )
         self.assertEqual(positive_clause.target, "skills/alex-mode")
 
+    def test_project_local_intent_beats_personal_mode_and_explanations_are_inert(self) -> None:
+        project_request = route_request(
+            "Create a project-local verification skill named checkout-verification "
+            "for my alex-mode conventions."
+        )
+        self.assertEqual(project_request.category, "project-skill")
+        self.assertEqual(project_request.target, "skills/checkout-verification")
+
+        for request in (
+            "Do not create a project-local verification skill for my alex-mode conventions.",
+            "Explain how to create a project-local verification skill for my alex-mode conventions.",
+            "What is a project-local verification skill?",
+        ):
+            with self.subTest(request=request):
+                decision = route_request(request)
+                self.assertEqual(decision.artifact, "none")
+                self.assertEqual(decision.operation, "none")
+
+        for request in ("Automate me.", "Please automate-me."):
+            with self.subTest(request=request):
+                self.assertEqual(route_request(request).artifact, "none")
+
     def test_preference_interaction_requires_bounded_questions_and_response_states(self) -> None:
         with self.assertRaises(ValidationError):
             PreferenceQuestion(
@@ -876,6 +898,21 @@ Read [provenance](references/provenance.md).
             )
             errors = validate_skill_tree(skill, require_provenance=False)
             self.assertTrue(any("missing.md" in error for error in errors))
+
+    def test_markdown_link_scanner_ignores_frontmatter_and_preserves_body_links(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-frontmatter-links-") as temp_dir:
+            skill = Path(temp_dir) / "safe-skill"
+            references = skill / "references"
+            references.mkdir(parents=True)
+            (references / "real.md").write_text("# Real\n", encoding="utf-8")
+            (skill / "SKILL.md").write_text(
+                '---\nname: safe-skill\n'
+                'description: "Ignore [frontmatter](missing.md) while scanning links"\n'
+                '---\n\n'
+                "Read [real](references/real.md 'a valid title').\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(validate_skill_tree(skill, require_provenance=False), ())
 
     def test_frontmatter_fallback_rejects_non_strings_and_unterminated_quotes(self) -> None:
         cases = (
@@ -1640,6 +1677,71 @@ Read [style](references/style.md) and [provenance](references/provenance.md).
             self.assertEqual((backups[0] / "SKILL.md").read_text(), "changed rollback state\n")
             self.assertIsNotNone(error.recovery_path)
             self.assertTrue(Path(error.recovery_path).is_dir())
+
+    def test_rollback_cleanup_preserves_in_place_edit_and_reports_recovery(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-rollback-content-race-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            evidence = self._write_evidence(workspace)
+            target = workspace / "skills" / "alex-mode"
+            initial = SkillDraft(
+                name="alex-mode",
+                description="Apply the original Alex conventions.",
+                rules=("Keep replies short.",),
+                evidence=evidence,
+            )
+            updated = SkillDraft(
+                name="alex-mode",
+                description="Apply the updated Alex conventions.",
+                rules=("Keep handoffs explicit.",),
+                evidence=evidence,
+            )
+            write_generated_skill(
+                target,
+                initial,
+                workspace_root=workspace,
+                operation="create",
+                approval=self._approval("create"),
+            )
+
+            original_remove_entries = automate_me._remove_owned_entries
+            mutated = False
+
+            def edit_backup_before_cleanup(directory_fd, snapshot, prefix=(), **kwargs):
+                nonlocal mutated
+                if not mutated:
+                    backup = next(target.parent.glob(".alex-mode.backup-*"))
+                    backup_skill = (backup / "SKILL.md").read_text(encoding="utf-8")
+                    concurrent_edit = backup_skill.replace("Alex", "alex", 1)
+                    (backup / "SKILL.md").write_text(concurrent_edit, encoding="utf-8")
+                    mutated = True
+                return original_remove_entries(
+                    directory_fd, snapshot, prefix, **kwargs
+                )
+
+            with patch.object(
+                automate_me,
+                "_remove_owned_entries",
+                side_effect=edit_backup_before_cleanup,
+            ):
+                with self.assertRaises(PublicationRecoveryError) as raised:
+                    write_generated_skill(
+                        target,
+                        updated,
+                        workspace_root=workspace,
+                        operation="update",
+                        approval=self._approval("update"),
+                    )
+
+            self.assertTrue(mutated)
+            error = raised.exception
+            self.assertEqual(error.cleanup_status, "hidden_backup_preserved")
+            self.assertEqual(
+                error.recovery_status,
+                "rollback_backup_changed_recovery_preserved",
+            )
+            backups = list(target.parent.glob(".alex-mode.backup-*"))
+            self.assertEqual(len(backups), 1)
+            self.assertIn("original alex conventions", (backups[0] / "SKILL.md").read_text())
 
     def test_removed_recovery_state_is_not_reported_after_failed_restore(self) -> None:
         with tempfile.TemporaryDirectory(prefix="automate-me-removed-recovery-") as temp_dir:

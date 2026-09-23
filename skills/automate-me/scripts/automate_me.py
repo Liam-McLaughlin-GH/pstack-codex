@@ -88,6 +88,21 @@ NEGATED_AUTOMATE_ME_RE = re.compile(
     + r"(?:[\s,;:!?()[\]{}\u2013\u2014-]+)\bme\b",
     re.IGNORECASE,
 )
+EXPLANATORY_PREFIX_RE = re.compile(
+    r"^(?:explain|describe|define|summari[sz]e|outline|clarify|"
+    r"what|how|why|when|where|which|whether)\b",
+    re.IGNORECASE,
+)
+EXPLANATORY_LEAD_RE = re.compile(
+    r"^(?:please\s+)?(?:tell\s+me|show\s+me|walk\s+me\s+through|"
+    r"help\s+me\s+understand)\b",
+    re.IGNORECASE,
+)
+EXPLANATORY_PHRASE_RE = re.compile(
+    r"\b(?:explain|describe|define|clarify|tell\s+me|show\s+me|"
+    r"walk\s+me\s+through|help\s+me\s+understand)\b",
+    re.IGNORECASE,
+)
 NOFOLLOW_FLAGS = getattr(os, "O_NOFOLLOW", 0)
 DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_CLOEXEC
 if not NOFOLLOW_FLAGS:
@@ -535,6 +550,36 @@ def _operation_for(text: str) -> str:
     return "confirm"
 
 
+def _is_explanatory_request(text: str) -> bool:
+    """Recognize questions or explanations that mention an artifact action."""
+
+    clean = _without_quoted_text(text).strip()
+    if not clean:
+        return False
+    if EXPLANATORY_PREFIX_RE.match(clean) or EXPLANATORY_LEAD_RE.match(clean):
+        return True
+
+    first_action = re.search(
+        r"\b(?:" + "|".join(re.escape(word) for word in ACTION_WORDS + UPDATE_WORDS) + r")\b",
+        clean,
+        re.IGNORECASE,
+    )
+    leading_text = clean if first_action is None else clean[: first_action.start()]
+    if EXPLANATORY_PHRASE_RE.search(leading_text):
+        return True
+    return bool(re.match(r"^(?:do|does|did|is|are)\b", clean, re.IGNORECASE))
+
+
+def _no_artifact_route(reason: str) -> RouteDecision:
+    return RouteDecision(
+        artifact="none",
+        category="route-elsewhere",
+        operation="none",
+        target=None,
+        reason=reason,
+    )
+
+
 def _slug_from_request(text: str, default: str) -> str:
     named = NAMED_RE.search(text)
     candidate = named.group(1).rstrip(".") if named else default
@@ -585,20 +630,46 @@ def route_request(request: str) -> RouteDecision:
     unquoted_text = _without_quoted_text(text)
     has_positive_action = _has_positive_action(text)
     if NEGATED_AUTOMATE_ME_RE.search(unquoted_text) and not has_positive_action:
-        return RouteDecision(
-            artifact="none",
-            category="route-elsewhere",
-            operation="none",
-            target=None,
-            reason="negated automate-me intent is not an artifact request",
-        )
+        return _no_artifact_route("negated automate-me intent is not an artifact request")
     if _has_negated_artifact_intent(text):
+        return _no_artifact_route(
+            "negated artifact intent is not a request to create or update"
+        )
+
+    script_signal = _has_any(unquoted_text, ("script", "helper", "command")) and (
+        "project-local" in unquoted_text
+        or "repository" in unquoted_text
+        or "repo" in unquoted_text
+    )
+    project_skill_signal = (
+        "verification skill" in unquoted_text
+        or "task skill" in unquoted_text
+        or ("project-local" in unquoted_text and "skill" in unquoted_text)
+    )
+    if script_signal or project_skill_signal:
+        if not has_positive_action or _is_explanatory_request(unquoted_text):
+            return _no_artifact_route(
+                "project-local wording is explanatory or lacks positive artifact intent"
+            )
+        if script_signal:
+            operation = _operation_for(text)
+            slug = _slug_from_request(unquoted_text, "project-helper")
+            return RouteDecision(
+                artifact="script",
+                category="project-helper",
+                operation=operation,
+                target=f"scripts/{slug}.py",
+                reason="an explicitly requested deterministic helper belongs in a script",
+            )
+        operation = _operation_for(text)
+        default = "project-verification" if "verification" in text else "project-task"
+        slug = _slug_from_request(unquoted_text, default)
         return RouteDecision(
-            artifact="none",
-            category="route-elsewhere",
-            operation="none",
-            target=None,
-            reason="negated artifact intent is not a request to create or update",
+            artifact="skill",
+            category="project-skill",
+            operation=operation,
+            target=f"skills/{slug}",
+            reason="repository-specific repeatable behavior belongs in a local skill",
         )
 
     mode_signal = MODE_RE.search(unquoted_text) is not None
@@ -606,7 +677,7 @@ def route_request(request: str) -> RouteDecision:
     named = NAMED_RE.search(unquoted_text)
     automate_signal = _has_automate_me_invocation(unquoted_text)
     personal_signal = (
-        automate_signal
+        (automate_signal and has_positive_action and not _is_explanatory_request(unquoted_text))
         or (
             has_positive_action
             and mode_signal
@@ -659,46 +730,7 @@ def route_request(request: str) -> RouteDecision:
             confirmation_required=True,
         )
 
-    script_signal = _has_any(unquoted_text, ("script", "helper", "command")) and (
-        "project-local" in unquoted_text
-        or "repository" in unquoted_text
-        or "repo" in unquoted_text
-    )
-    if script_signal:
-        operation = _operation_for(text)
-        slug = _slug_from_request(unquoted_text, "project-helper")
-        return RouteDecision(
-            artifact="script",
-            category="project-helper",
-            operation=operation,
-            target=f"scripts/{slug}.py",
-            reason="an explicitly requested deterministic helper belongs in a script",
-        )
-
-    project_skill_signal = (
-        "verification skill" in unquoted_text
-        or "task skill" in unquoted_text
-        or ("project-local" in unquoted_text and "skill" in unquoted_text)
-    )
-    if project_skill_signal:
-        operation = _operation_for(text)
-        default = "project-verification" if "verification" in text else "project-task"
-        slug = _slug_from_request(unquoted_text, default)
-        return RouteDecision(
-            artifact="skill",
-            category="project-skill",
-            operation=operation,
-            target=f"skills/{slug}",
-            reason="repository-specific repeatable behavior belongs in a local skill",
-        )
-
-    return RouteDecision(
-        artifact="none",
-        category="route-elsewhere",
-        operation="none",
-        target=None,
-        reason="the request does not ask for a new artifact",
-    )
+    return _no_artifact_route("the request does not ask for a new artifact")
 
 
 def _resolved_root(workspace_root: Path | str) -> Path:
@@ -968,6 +1000,38 @@ def _snapshot_state_matches(info: os.stat_result, state: object) -> bool:
     )
 
 
+def _snapshot_file_content_matches(
+    directory_fd: int,
+    name: str,
+    entry_info: os.stat_result,
+    expected_entry: tuple[object, ...],
+) -> bool:
+    """Confirm that an owned file still has its recorded content before unlinking."""
+
+    if len(expected_entry) < 4 or expected_entry[1] != "file":
+        return False
+    if not _snapshot_state_matches(entry_info, expected_entry[2]):
+        return False
+    expected_digest = expected_entry[3]
+    if not isinstance(expected_digest, str):
+        return False
+    try:
+        data, read_info = _read_relative_bytes_at(
+            directory_fd,
+            (name,),
+            max_bytes=MAX_ARTIFACT_BYTES,
+            label="owned cleanup file",
+        )
+    except ScopeError:
+        return False
+    if not _same_file_state(entry_info, read_info):
+        return False
+    if hashlib.sha256(data).hexdigest() != expected_digest:
+        return False
+    current_info = _stat_at(directory_fd, name)
+    return current_info is not None and _same_file_state(current_info, read_info)
+
+
 def _snapshot_content(
     snapshot: tuple[tuple[object, ...], ...]
 ) -> tuple[tuple[object, ...], ...]:
@@ -999,7 +1063,9 @@ def _remove_owned_entries(
     directory_fd: int,
     snapshot: tuple[tuple[object, ...], ...],
     prefix: tuple[str, ...] = (),
-) -> None:
+    *,
+    compare_file_contents: bool = False,
+) -> bool:
     """Remove only entries recorded in a snapshot, preserving competitors."""
 
     expected = {
@@ -1010,49 +1076,75 @@ def _remove_owned_entries(
     try:
         entries = list(os.scandir(directory_fd))
     except OSError:
-        return
+        return False
+    cleanup_safe = True
     for entry in entries:
         relative = prefix + (entry.name,)
         expected_entry = expected.get(relative)
         if expected_entry is None:
+            cleanup_safe = False
             continue
         try:
             entry_info = entry.stat(follow_symlinks=False)
         except OSError:
+            cleanup_safe = False
             continue
         if not _snapshot_state_matches(entry_info, expected_entry[2]):
+            cleanup_safe = False
             continue
         if expected_entry[1] == "file":
             current_info = _stat_at(directory_fd, entry.name)
-            if current_info is None or not _same_file_identity(entry_info, current_info):
+            if (
+                current_info is None
+                or not _same_file_identity(entry_info, current_info)
+                or (
+                    compare_file_contents
+                    and not _snapshot_file_content_matches(
+                        directory_fd, entry.name, entry_info, expected_entry
+                    )
+                )
+            ):
+                cleanup_safe = False
                 continue
             try:
                 os.unlink(entry.name, dir_fd=directory_fd)
             except OSError:
-                pass
+                cleanup_safe = False
             continue
         if expected_entry[1] != "directory" or not stat.S_ISDIR(entry_info.st_mode):
+            cleanup_safe = False
             continue
         try:
             child_fd = _open_directory_at(
                 directory_fd, entry.name, label="owned cleanup directory"
             )
         except ScopeError:
+            cleanup_safe = False
             continue
         try:
             opened_info = os.fstat(child_fd)
             if _same_file_identity(entry_info, opened_info):
-                _remove_owned_entries(child_fd, snapshot, relative)
+                if not _remove_owned_entries(
+                    child_fd,
+                    snapshot,
+                    relative,
+                    compare_file_contents=compare_file_contents,
+                ):
+                    cleanup_safe = False
+            else:
+                cleanup_safe = False
         finally:
             os.close(child_fd)
         current_info = _stat_at(directory_fd, entry.name)
         if current_info is None or not _same_file_identity(entry_info, current_info):
+            cleanup_safe = False
             continue
         try:
             os.rmdir(entry.name, dir_fd=directory_fd)
         except OSError:
             # A new child or a changed child keeps this directory in place.
-            pass
+            cleanup_safe = False
+    return cleanup_safe
 
 
 def _remove_owned_directory_status(
@@ -1093,7 +1185,12 @@ def _remove_owned_directory_status(
                     return "changed"
             except ScopeError:
                 return "changed"
-        _remove_owned_entries(directory_fd, expected_snapshot)
+        if not _remove_owned_entries(
+            directory_fd,
+            expected_snapshot,
+            compare_file_contents=require_snapshot_match or compare_snapshot_contents,
+        ):
+            return "preserved"
     finally:
         os.close(directory_fd)
     current_info = _stat_at(parent_fd, name)
@@ -1905,6 +2002,20 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
     return fields
 
 
+def _markdown_without_frontmatter(text: str) -> str:
+    """Mask YAML frontmatter while preserving the Markdown body byte-for-byte."""
+
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
+        return text
+    offset = len(lines[0])
+    for line in lines[1:]:
+        if line.rstrip("\r\n") == "---":
+            return _blank_markdown_line(text[:offset]) + text[offset + len(line) :]
+        offset += len(line)
+    return text
+
+
 def _blank_markdown_line(line: str) -> str:
     return "".join(
         "\n" if character == "\n" else "\r" if character == "\r" else " "
@@ -2118,7 +2229,7 @@ def _markdown_reference_definitions(text: str) -> dict[str, str]:
 def _markdown_link_targets(text: str) -> Iterator[str]:
     """Yield local link destinations outside code with bounded delimiter scans."""
 
-    masked = _markdown_without_fenced_code(text)
+    masked = _markdown_without_fenced_code(_markdown_without_frontmatter(text))
     definitions = _markdown_reference_definitions(masked)
     bracket_pairs = _markdown_bracket_pairs(masked)
     for destination in definitions.values():
