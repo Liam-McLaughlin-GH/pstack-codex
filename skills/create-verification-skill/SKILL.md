@@ -183,5 +183,3 @@ selectors, fixtures, or expected results.
 
 - Read [feature-map-schema.md](references/feature-map-schema.md) when creating
   or maintaining a feature map.
-- Read [upstream-provenance.md](references/upstream-provenance.md) for the
-  pinned source and retained license notice.
