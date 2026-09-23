@@ -37,6 +37,7 @@ from pstack_g3_helpers.orch import (  # noqa: E402
     UnsupportedSideEffect,
 )
 from pstack_g3_helpers.plan_checker import (  # noqa: E402
+    FileRule,
     PlanProfile,
     check_plan,
     completion_profile,
@@ -63,7 +64,7 @@ from pstack_g3_helpers.worktree_audit import (  # noqa: E402
     audit_worktrees,
     load_metadata,
 )
-from log import append_row  # noqa: E402
+from log import AuditLogError, append_row  # noqa: E402
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -238,6 +239,22 @@ class G3PlanAndAuditTests(unittest.TestCase):
             self.assertIn("Local marker", messages)
             self.assertIn("unchecked box", messages)
 
+    def test_nested_plan_symlink_is_not_followed(self) -> None:
+        profile = PlanProfile(
+            "nested-link",
+            ("linked/plan.md",),
+            (FileRule("linked/plan.md", required_markers=("ok",)),),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.mkdir()
+            (target / "plan.md").write_text("# Plan\n\nok\n")
+            (root / "linked").symlink_to(target, target_is_directory=True)
+            report = check_plan(root, profile)
+            self.assertFalse(report.ok)
+            self.assertIn("required file pattern has no matches", report.issues[0].message)
+
 
 class G3WorktreeAndLogTests(unittest.TestCase):
     def test_worktree_audit_reports_unknown_activity_without_fetch_or_scan(self) -> None:
@@ -270,6 +287,15 @@ class G3WorktreeAndLogTests(unittest.TestCase):
                 "'@open",
             ])
             self.assertTrue(all(len(line.split("\t")) == 6 for line in lines))
+
+    def test_log_symlink_parent_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.mkdir()
+            (root / "link").symlink_to(target, target_is_directory=True)
+            with self.assertRaises(AuditLogError):
+                append_row(root / "link" / "audit.tsv", "phase", "ok", "why", "proof", "PASS")
 
 
 if __name__ == "__main__":

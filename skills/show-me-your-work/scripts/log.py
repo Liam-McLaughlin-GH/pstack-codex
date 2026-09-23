@@ -57,6 +57,8 @@ def append_row(
     path = Path(logfile)
     if path.is_symlink():
         raise AuditLogError(f"audit log must not be a symlink: {path}")
+    if path.parent.is_symlink():
+        raise AuditLogError(f"audit log parent must not be a symlink: {path.parent}")
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and not path.is_file():
         raise AuditLogError(f"audit log must be a regular file: {path}")

@@ -151,7 +151,19 @@ def _safe_root(path: str | Path) -> Path:
 def _relative_files(root: Path, pattern: str) -> list[Path]:
     if Path(pattern).is_absolute() or ".." in Path(pattern).parts:
         raise PlanInputError(f"profile pattern must stay below the plan root: {pattern}")
-    matches = sorted(path for path in root.glob(pattern) if path.is_file() and not path.is_symlink())
+    matches = []
+    for path in sorted(root.glob(pattern)):
+        if not path.is_file() or path.is_symlink():
+            continue
+        current = root
+        escaped = False
+        for part in path.relative_to(root).parts:
+            current /= part
+            if current.is_symlink():
+                escaped = True
+                break
+        if not escaped:
+            matches.append(path)
     return matches
 
 
