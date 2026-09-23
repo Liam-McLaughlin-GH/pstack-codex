@@ -11,6 +11,12 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+PORT_SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "scripts"
+if str(PORT_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(PORT_SCRIPTS_DIR))
+
+from skill_frontmatter import required_frontmatter_errors
+
 
 SKILL_DIR = Path(__file__).resolve().parents[1]
 SKILL_PATH = SKILL_DIR / "SKILL.md"
@@ -83,6 +89,35 @@ COMMAND_ROUTES = {
 }
 COMMAND_TABLE_HEADER = "| Status | Command | Route and source |"
 COMMAND_TABLE_SEPARATOR = "|---|---|---|"
+LEDGER_REQUIRED_KEYS = {
+    "upstream_sha_checked",
+    "repositories",
+    "rules",
+    "commands",
+    "routing_cases",
+}
+REPOSITORY_REQUIRED_KEYS = {"sha", "root"}
+RULE_REQUIRED_KEYS = {
+    "id",
+    "route",
+    "repo",
+    "path",
+    "lines",
+    "citation",
+    "citations",
+}
+CITATION_REQUIRED_KEYS = {"path", "lines", "citation"}
+COMMAND_REQUIRED_KEYS = {"command", "status", "safety", "route", "citation", "rule"}
+ROUTING_CASE_REQUIRED_KEYS = {"name", "safety", "input", "expected"}
+ROUTING_CASE_OPTIONAL_KEYS = {"rule", "repositories"}
+ROUTING_CASE_ROUTES = {
+    "general",
+    "web-app",
+    "showpass-frontend",
+    "web-k8s",
+    "ambiguous",
+    "unsafe",
+}
 REGISTERED_REPOSITORY_TOKENS = (
     "web-app",
     "web-k8s",
@@ -205,7 +240,15 @@ ENVIRONMENT_RE = re.compile(
 )
 MUTATION_RE = re.compile(MUTATION_TOKEN)
 GCLOUD_MUTATION_RE = re.compile(
-    _real_token_expression("gcloud") + r"[^\n]*" + MUTATION_TOKEN
+    _real_token_expression("gcloud")
+    + r"[^\n]*?"
+    + (
+        r"(?<![a-z0-9])(?:add|apply|attach|change|connect|create|cp|delete|destroy|"
+        r"detach|disable|enable|export|import|login|move|modify|mv|patch|remove|"
+        r"replace|reset|resize|restore|restart|revoke|rm|rollback|set|start|stop|"
+        r"suspend|resume|undelete|unset|update|upgrade)(?:-[a-z0-9-]+)?"
+        r"(?![a-z0-9_-])"
+    )
 )
 DEPLOYMENT_OPERATION_RE = re.compile(
     r"(?<![a-z0-9])(?:deploy(?:ed|ing|ment)?|promote|provision|publish|release|"
@@ -470,7 +513,7 @@ def repositories_for_task(task: str) -> Tuple[str, ...]:
     repositories: List[str] = []
     if legacy_ui_cue:
         repositories.append("web-app")
-        if modern_ui_work:
+        if modern_ui_work or explicit_repository_cue:
             repositories.append("showpass-frontend")
     elif backend_cue:
         repositories.append("web-app")
@@ -538,31 +581,79 @@ def route_for_task(task: str) -> str:
     return "general"
 
 
-def load_ledger() -> Dict[str, Any]:
+def load_ledger() -> Any:
     return json.loads(LEDGER_PATH.read_text(encoding="utf-8"))
 
 
-def _validate_ledger_metadata(ledger: Dict[str, Any]) -> List[str]:
-    """Fail closed when pinned ledger identity or rule ownership drifts."""
+def _record_key_errors(
+    context: str,
+    record: Any,
+    required: set,
+    optional: Optional[set] = None,
+) -> List[str]:
+    """Validate an object boundary without assuming JSON supplied a mapping."""
 
+    if not isinstance(record, dict):
+        return ["%s must be an object" % context]
+
+    allowed = required | (optional or set())
     errors: List[str] = []
-    if ledger.get("upstream_sha_checked") != EXPECTED_UPSTREAM_SHA:
-        errors.append("source ledger has an unexpected upstream SHA")
+    for field in sorted(required - set(record), key=repr):
+        errors.append("%s is missing required field: %s" % (context, field))
+    for field in sorted(set(record) - allowed, key=repr):
+        errors.append("%s contains unknown field: %r" % (context, field))
+    return errors
 
+
+def _required_string_error(context: str, field: str, value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return "%s.%s must be a non-empty string" % (context, field)
+    if not value.strip():
+        return "%s.%s must be a non-empty string" % (context, field)
+    return None
+
+
+def _validate_citation_record(context: str, citation: Any) -> List[str]:
+    errors = _record_key_errors(context, citation, CITATION_REQUIRED_KEYS)
+    if not isinstance(citation, dict):
+        return errors
+    for field in CITATION_REQUIRED_KEYS:
+        error = _required_string_error(context, field, citation.get(field))
+        if error:
+            errors.append(error)
+    lines = citation.get("lines")
+    if isinstance(lines, str):
+        match = re.fullmatch(r"([1-9][0-9]*)-([1-9][0-9]*)", lines)
+        if match is None:
+            errors.append("%s.lines must use START-END line syntax" % context)
+        elif int(match.group(1)) > int(match.group(2)):
+            errors.append("%s.lines must not be reversed" % context)
+    return errors
+
+
+def _validate_repository_records(ledger: Dict[str, Any]) -> List[str]:
+    errors: List[str] = []
     repositories = ledger.get("repositories")
     if not isinstance(repositories, dict):
-        return errors + ["source ledger repositories must be an object"]
-    expected_repository_names = set(EXPECTED_REPOSITORIES)
-    actual_repository_names = set(repositories)
-    for missing in sorted(expected_repository_names - actual_repository_names):
+        return errors
+
+    expected_names = set(EXPECTED_REPOSITORIES)
+    actual_names = set(repositories)
+    for missing in sorted(expected_names - actual_names):
         errors.append("source ledger is missing repository metadata: %s" % missing)
-    for unexpected in sorted(actual_repository_names - expected_repository_names):
-        errors.append("source ledger contains unknown repository metadata: %s" % unexpected)
+    for unexpected in sorted(actual_names - expected_names, key=repr):
+        errors.append("source ledger contains unknown repository metadata: %r" % unexpected)
+
     for repository, expected in EXPECTED_REPOSITORIES.items():
         metadata = repositories.get(repository)
+        context = "repository metadata %s" % repository
+        errors.extend(_record_key_errors(context, metadata, REPOSITORY_REQUIRED_KEYS))
         if not isinstance(metadata, dict):
-            errors.append("source ledger repository metadata is malformed: %s" % repository)
             continue
+        for field in REPOSITORY_REQUIRED_KEYS:
+            error = _required_string_error(context, field, metadata.get(field))
+            if error:
+                errors.append(error)
         for field in ("sha", "root"):
             if metadata.get(field) != expected[field]:
                 errors.append(
@@ -577,47 +668,250 @@ def _validate_ledger_metadata(ledger: Dict[str, Any]) -> List[str]:
             or ".." in Path(root).parts
         ):
             errors.append("source ledger repository root is unsafe: %s" % repository)
-        if not re.fullmatch(r"[0-9a-f]{40}", metadata.get("sha", "")):
+        sha = metadata.get("sha")
+        if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha):
             errors.append("source ledger repository SHA is invalid: %s" % repository)
+    return errors
 
+
+def _validate_rule_records(ledger: Dict[str, Any]) -> List[str]:
+    errors: List[str] = []
     rules = ledger.get("rules")
     if not isinstance(rules, list):
-        return errors + ["source ledger rules must be a list"]
-    actual_rule_ids = {
-        rule.get("id") for rule in rules if isinstance(rule, dict)
-    }
-    expected_rule_ids = set(EXPECTED_RULE_REPOSITORIES)
-    for missing in sorted(expected_rule_ids - actual_rule_ids):
-        errors.append("source ledger is missing source rule: %s" % missing)
-    for unexpected in sorted(actual_rule_ids - expected_rule_ids):
-        errors.append("source ledger contains unknown source rule: %s" % unexpected)
+        return errors
 
-    for rule in rules:
+    expected_rule_ids = set(EXPECTED_RULE_REPOSITORIES)
+    seen_ids = set()
+    for index, rule in enumerate(rules):
+        context = "source rule %d" % (index + 1)
+        errors.extend(_record_key_errors(context, rule, RULE_REQUIRED_KEYS))
         if not isinstance(rule, dict):
-            errors.append("source ledger contains a malformed source rule")
             continue
-        rule_id = rule.get("id", "<unknown rule>")
+        rule_id = rule.get("id")
+        id_error = _required_string_error(context, "id", rule_id)
+        if id_error:
+            errors.append(id_error)
+            continue
+        if rule_id in seen_ids:
+            errors.append("duplicate source rule: %s" % rule_id)
+        seen_ids.add(rule_id)
+        if rule_id not in expected_rule_ids:
+            errors.append("source ledger contains unknown source rule: %s" % rule_id)
+
         expected_repository = EXPECTED_RULE_REPOSITORIES.get(rule_id)
-        if expected_repository is None:
-            continue
-        if rule.get("repo") != expected_repository:
+        expected_route = EXPECTED_RULE_ROUTES.get(rule_id)
+        repo = rule.get("repo")
+        route = rule.get("route")
+        if not isinstance(repo, str) or repo not in EXPECTED_REPOSITORIES:
+            errors.append("%s.repo has an unknown repository: %r" % (context, repo))
+        elif expected_repository is not None and repo != expected_repository:
             errors.append("%s has unexpected repository ownership" % rule_id)
-        if rule.get("route") != EXPECTED_RULE_ROUTES[rule_id]:
+        if not isinstance(route, str) or route not in COMMAND_ROUTES:
+            errors.append("%s.route has an unknown route: %r" % (context, route))
+        elif expected_route is not None and route != expected_route:
             errors.append("%s has an unexpected route" % rule_id)
+
+        path_error = _required_string_error(context, "path", rule.get("path"))
+        if path_error:
+            errors.append(path_error)
+        lines_error = _required_string_error(context, "lines", rule.get("lines"))
+        if lines_error:
+            errors.append(lines_error)
+        citation_error = _required_string_error(context, "citation", rule.get("citation"))
+        if citation_error:
+            errors.append(citation_error)
 
         citations = rule.get("citations")
         if not isinstance(citations, list) or not citations:
             errors.append("%s must contain a non-empty citation register" % rule_id)
             continue
+        seen_citations = set()
+        for citation_index, citation in enumerate(citations):
+            citation_context = "%s citation %d" % (context, citation_index + 1)
+            errors.extend(_validate_citation_record(citation_context, citation))
+            if not isinstance(citation, dict):
+                continue
+            citation_value = citation.get("citation")
+            if isinstance(citation_value, str):
+                if citation_value in seen_citations:
+                    errors.append("%s contains a duplicate citation" % context)
+                seen_citations.add(citation_value)
         primary = citations[0]
-        if not isinstance(primary, dict):
-            errors.append("%s has a malformed primary citation" % rule_id)
-            continue
-        for field in ("path", "lines", "citation"):
-            if rule.get(field) != primary.get(field):
-                errors.append("%s primary %s disagrees with its citation register" % (rule_id, field))
+        if isinstance(primary, dict):
+            for field in ("path", "lines", "citation"):
+                if rule.get(field) != primary.get(field):
+                    errors.append(
+                        "%s primary %s disagrees with its citation register"
+                        % (rule_id, field)
+                    )
 
+    for missing in sorted(expected_rule_ids - seen_ids):
+        errors.append("source ledger is missing source rule: %s" % missing)
     return errors
+
+
+def _validate_command_records(ledger: Dict[str, Any]) -> List[str]:
+    errors: List[str] = []
+    commands = ledger.get("commands")
+    if not isinstance(commands, list):
+        return errors
+
+    seen_commands = set()
+    known_rules = set(EXPECTED_RULE_REPOSITORIES)
+    for index, command in enumerate(commands):
+        context = "command %d" % (index + 1)
+        errors.extend(_record_key_errors(context, command, COMMAND_REQUIRED_KEYS))
+        if not isinstance(command, dict):
+            continue
+        value = command.get("command")
+        for field in ("command", "status", "safety", "route", "citation", "rule"):
+            error = _required_string_error(context, field, command.get(field))
+            if error:
+                errors.append(error)
+        if isinstance(value, str):
+            if value in seen_commands:
+                errors.append("source ledger contains duplicate command: %s" % value)
+            seen_commands.add(value)
+
+        safety = command.get("safety")
+        status = command.get("status")
+        if safety not in ("safe", "unsafe"):
+            errors.append("command has unknown safety classification: %s" % value)
+        elif isinstance(status, str):
+            if safety == "safe" and status != SAFE_COMMAND_STATUS:
+                errors.append("safe command must use %r: %s" % (SAFE_COMMAND_STATUS, value))
+            if safety == "unsafe" and UNSAFE_COMMAND_STATUS_RE.fullmatch(status) is None:
+                errors.append(
+                    "unsafe command must use 'UNSAFE: <reason> / NOT RUN': %s" % value
+                )
+        route = command.get("route")
+        if not isinstance(route, str) or route not in COMMAND_ROUTES:
+            errors.append("command has unknown route %r: %s" % (route, value))
+        rule = command.get("rule")
+        if not isinstance(rule, str) or rule not in known_rules:
+            errors.append("command references unknown rule: %s" % value)
+        citation = command.get("citation")
+        if isinstance(citation, str) and SOURCE_PARTS_RE.fullmatch(citation) is None:
+            errors.append("command has an invalid source citation: %s" % value)
+    return errors
+
+
+def _validate_routing_case_records(ledger: Dict[str, Any]) -> List[str]:
+    errors: List[str] = []
+    cases = ledger.get("routing_cases")
+    if not isinstance(cases, list):
+        return errors
+
+    known_rules = set(EXPECTED_RULE_REPOSITORIES)
+    seen_names = set()
+    for index, case in enumerate(cases):
+        context = "routing case %d" % (index + 1)
+        errors.extend(
+            _record_key_errors(
+                context,
+                case,
+                ROUTING_CASE_REQUIRED_KEYS,
+                ROUTING_CASE_OPTIONAL_KEYS,
+            )
+        )
+        if not isinstance(case, dict):
+            continue
+        name = case.get("name")
+        for field in ("name", "safety", "input", "expected"):
+            error = _required_string_error(context, field, case.get(field))
+            if error:
+                errors.append(error)
+        if isinstance(name, str):
+            if name in seen_names:
+                errors.append("source ledger contains duplicate routing case: %s" % name)
+            seen_names.add(name)
+        safety = case.get("safety")
+        if safety not in ("safe", "unsafe"):
+            errors.append("%s.safety has an unknown value: %r" % (context, safety))
+        expected = case.get("expected")
+        if not isinstance(expected, str) or expected not in ROUTING_CASE_ROUTES:
+            errors.append("%s.expected has an unknown route: %r" % (context, expected))
+        elif safety == "unsafe" and expected != "unsafe":
+            errors.append("%s unsafe cases must expect unsafe" % context)
+        elif safety == "safe" and expected == "unsafe":
+            errors.append("%s safe cases cannot expect unsafe" % context)
+
+        if "rule" in case:
+            rule = case.get("rule")
+            if not isinstance(rule, str) or not rule.strip():
+                errors.append("%s.rule must be a non-empty source rule id" % context)
+            elif rule not in known_rules:
+                errors.append("%s references unknown rule: %s" % (context, rule))
+        elif safety == "unsafe":
+            errors.append("%s unsafe cases must include a source rule" % context)
+        if "repositories" in case:
+            repositories = case.get("repositories")
+            if not isinstance(repositories, list):
+                errors.append("%s.repositories must be a list" % context)
+            else:
+                seen_repositories = set()
+                for repository in repositories:
+                    if not isinstance(repository, str) or repository not in EXPECTED_REPOSITORIES:
+                        errors.append(
+                            "%s.repositories contains an unknown repository: %r"
+                            % (context, repository)
+                        )
+                    elif repository in seen_repositories:
+                        errors.append(
+                            "%s.repositories contains a duplicate repository: %s"
+                            % (context, repository)
+                        )
+                    if isinstance(repository, str) and repository in EXPECTED_REPOSITORIES:
+                        seen_repositories.add(repository)
+    return errors
+
+
+def _validate_ledger_schema(ledger: Any) -> List[str]:
+    """Validate the complete JSON ledger before any consumer indexes it."""
+
+    if not isinstance(ledger, dict):
+        return ["source ledger must be an object"]
+
+    errors = _record_key_errors("source ledger", ledger, LEDGER_REQUIRED_KEYS)
+    upstream_sha = ledger.get("upstream_sha_checked")
+    upstream_error = _required_string_error(
+        "source ledger", "upstream_sha_checked", upstream_sha
+    )
+    if upstream_error:
+        errors.append(upstream_error)
+    elif upstream_sha != EXPECTED_UPSTREAM_SHA:
+        errors.append("source ledger has an unexpected upstream SHA")
+
+    repositories = ledger.get("repositories")
+    if not isinstance(repositories, dict):
+        errors.append("source ledger repositories must be an object")
+    else:
+        errors.extend(_validate_repository_records(ledger))
+
+    for field, label in (
+        ("rules", "rules"),
+        ("commands", "commands"),
+        ("routing_cases", "routing cases"),
+    ):
+        value = ledger.get(field)
+        if not isinstance(value, list):
+            errors.append("source ledger %s must be a list" % label)
+        elif not value:
+            errors.append("source ledger %s must be non-empty" % label)
+
+    if isinstance(ledger.get("rules"), list):
+        errors.extend(_validate_rule_records(ledger))
+    if isinstance(ledger.get("commands"), list):
+        errors.extend(_validate_command_records(ledger))
+    if isinstance(ledger.get("routing_cases"), list):
+        errors.extend(_validate_routing_case_records(ledger))
+    return errors
+
+
+def _validate_ledger_metadata(ledger: Any) -> List[str]:
+    """Compatibility wrapper for callers that used the old metadata validator."""
+
+    return _validate_ledger_schema(ledger)
 
 
 def _validate_local_references(skill_text: str) -> List[str]:
@@ -631,6 +925,8 @@ def _validate_local_references(skill_text: str) -> List[str]:
 
 
 def _citation_entries(rule: Dict[str, Any]) -> List[Dict[str, str]]:
+    if not isinstance(rule, dict):
+        return []
     entries = rule.get("citations")
     if entries is None:
         return [{
@@ -657,14 +953,17 @@ def _validate_citation(
         errors.append("%s has an invalid source citation: %s" % (rule_id, citation))
         return errors
 
-    source = repositories.get(repo, {})
-    if repo not in repositories:
+    source = repositories.get(repo, {}) if isinstance(repo, str) else {}
+    if not isinstance(repositories, dict) or not isinstance(repo, str) or repo not in repositories:
         errors.append("%s references unknown repository %r" % (rule_id, repo))
     if match.group("repo") != repo:
         errors.append("%s citation repository does not match its rule: %s" % (rule_id, citation))
-    if not re.fullmatch(r"[0-9a-f]{40}", source.get("sha", "")):
+    if not isinstance(source, dict):
+        source = {}
+    source_sha = source.get("sha", "")
+    if not isinstance(source_sha, str) or not re.fullmatch(r"[0-9a-f]{40}", source_sha):
         errors.append("%s has an invalid repository SHA" % rule_id)
-    if source.get("sha") != match.group("sha"):
+    if source_sha != match.group("sha"):
         errors.append("%s citation does not carry the repository SHA: %s" % (rule_id, citation))
 
     path = entry.get("path", "")
@@ -685,18 +984,28 @@ def _validate_citation(
 
 
 def _registered_citations(
-    ledger: Dict[str, Any],
+    ledger: Any,
     skill_text: str,
     errors: List[str],
 ) -> Dict[str, str]:
+    if not isinstance(ledger, dict):
+        return {}
     repositories = ledger.get("repositories", {})
+    if not isinstance(repositories, dict):
+        repositories = {}
     registered: Dict[str, str] = {}
     rule_ids = set()
-    for rule in ledger.get("rules", []):
+    rules = ledger.get("rules", [])
+    if not isinstance(rules, list):
+        return registered
+    for rule in rules:
         if not isinstance(rule, dict):
             errors.append("source ledger contains a malformed source rule")
             continue
         rule_id = rule.get("id")
+        if not isinstance(rule_id, str):
+            errors.append("source rule is missing a string id")
+            continue
         if rule_id in rule_ids:
             errors.append("duplicate source rule: %s" % rule_id)
         rule_ids.add(rule_id)
@@ -725,7 +1034,7 @@ def _registered_citations(
 
         legacy_fields = (rule.get("citation"), rule.get("path"), rule.get("lines"))
         if any(field is not None for field in legacy_fields):
-            first = entries[0] if entries else {}
+            first = entries[0] if entries and isinstance(entries[0], dict) else {}
             if any(first.get(key) != value for key, value in zip(("citation", "path", "lines"), legacy_fields)):
                 errors.append("%s legacy citation fields do not match its citation register" % rule_id)
 
@@ -747,7 +1056,7 @@ def _validate_command_status(command: Dict[str, Any]) -> Optional[str]:
         not isinstance(status, str) or UNSAFE_COMMAND_STATUS_RE.fullmatch(status) is None
     ):
         return "unsafe command must use 'UNSAFE: <reason> / NOT RUN': %s" % value
-    if safety not in {"safe", "unsafe"}:
+    if safety not in ("safe", "unsafe"):
         return "command has unknown safety classification: %s" % value
     return None
 
@@ -808,12 +1117,17 @@ def _command_table_rows(skill_text: str) -> Tuple[List[Dict[str, str]], List[str
 
 def _validate_command_table(
     skill_text: str,
-    ledger: Dict[str, Any],
+    ledger: Any,
     rule_ids: set,
     registered_citations: Dict[str, str],
 ) -> List[str]:
     errors: List[str] = []
-    rules_by_id = {rule.get("id"): rule for rule in ledger.get("rules", [])}
+    rules = ledger.get("rules", []) if isinstance(ledger, dict) else []
+    rules_by_id = {
+        rule.get("id"): rule
+        for rule in rules
+        if isinstance(rule, dict) and isinstance(rule.get("id"), str)
+    } if isinstance(rules, list) else {}
     rows, parse_errors = _command_table_rows(skill_text)
     errors.extend(parse_errors)
 
@@ -824,26 +1138,37 @@ def _validate_command_table(
             errors.append("command table contains duplicate command: %s" % command)
         rows_by_command[command] = row
 
-    ledger_commands = ledger.get("commands", [])
+    ledger_commands = ledger.get("commands", []) if isinstance(ledger, dict) else []
+    if not isinstance(ledger_commands, list):
+        return errors
     ledger_command_names = set()
-    for command in ledger_commands:
+    for index, command in enumerate(ledger_commands):
+        if not isinstance(command, dict):
+            errors.append("command %d must be an object" % (index + 1))
+            continue
         value = command.get("command", "")
-        if value in ledger_command_names:
+        if isinstance(value, str) and value in ledger_command_names:
             errors.append("source ledger contains duplicate command: %s" % value)
-        ledger_command_names.add(value)
+        if isinstance(value, str):
+            ledger_command_names.add(value)
 
         status_error = _validate_command_status(command)
         if status_error:
             errors.append(status_error)
         rule = command.get("rule")
-        if rule not in rule_ids:
+        if not isinstance(rule, str) or rule not in rule_ids:
             errors.append("command references unknown rule: %s" % value)
 
         route = command.get("route")
-        if route not in COMMAND_ROUTES:
+        if not isinstance(route, str) or route not in COMMAND_ROUTES:
             errors.append("command has unknown route %r: %s" % (route, value))
-        source_route = rules_by_id.get(rule, {}).get("route")
-        if source_route in COMMAND_ROUTES and route != source_route:
+        source_rule = rules_by_id.get(rule, {}) if isinstance(rule, str) else {}
+        source_route = source_rule.get("route") if isinstance(source_rule, dict) else None
+        if (
+            isinstance(source_route, str)
+            and source_route in COMMAND_ROUTES
+            and route != source_route
+        ):
             errors.append("command route does not match its source rule: %s" % value)
         citation = command.get("citation")
         if not isinstance(citation, str) or not citation:
@@ -851,7 +1176,7 @@ def _validate_command_table(
         elif registered_citations.get(citation) != rule:
             errors.append("command citation is not registered for its rule: %s" % value)
 
-        row = rows_by_command.get(value)
+        row = rows_by_command.get(value) if isinstance(value, str) else None
         if row is None:
             errors.append("command is missing from SKILL.md command table: %s" % value)
             continue
@@ -900,9 +1225,10 @@ def check_documents(skill_text: str, ledger: Dict[str, Any]) -> List[str]:
         errors.append("SKILL.md has invalid frontmatter delimiters")
     else:
         frontmatter = skill_text[4 : skill_text.index("\n---\n", 4)]
-        for field in ("name", "description"):
-            if not re.search(r"^%s:[ \t]*\S" % field, frontmatter, re.MULTILINE):
-                errors.append("SKILL.md frontmatter is missing %s" % field)
+        errors.extend(
+            "SKILL.md frontmatter %s" % error
+            for error in required_frontmatter_errors(frontmatter)
+        )
 
     for line_number, line in enumerate(skill_text.splitlines(), start=1):
         if line.endswith((" ", "\t")):
@@ -910,21 +1236,25 @@ def check_documents(skill_text: str, ledger: Dict[str, Any]) -> List[str]:
     if "\r" in skill_text:
         errors.append("SKILL.md contains carriage returns")
 
+    rules = ledger.get("rules", []) if isinstance(ledger, dict) else []
     rule_ids = {
         rule.get("id")
-        for rule in ledger.get("rules", [])
-        if isinstance(rule, dict)
-    }
-    errors.extend(_validate_ledger_metadata(ledger))
+        for rule in rules
+        if isinstance(rule, dict) and isinstance(rule.get("id"), str)
+    } if isinstance(rules, list) else set()
+    errors.extend(_validate_ledger_schema(ledger))
     errors.extend(_validate_local_references(skill_text))
     registered_citations = _registered_citations(ledger, skill_text, errors)
     errors.extend(_validate_frontend_boundary(skill_text))
 
-    for case in ledger.get("routing_cases", []):
+    cases = ledger.get("routing_cases", []) if isinstance(ledger, dict) else []
+    for case in cases if isinstance(cases, list) else []:
+        if not isinstance(case, dict):
+            continue
         rule = case.get("rule")
         if case.get("expected") == "unsafe" and not rule:
             errors.append("unsafe routing case is missing a source rule: %s" % case.get("name"))
-        elif rule is not None and rule not in rule_ids:
+        elif rule is not None and (not isinstance(rule, str) or rule not in rule_ids):
             errors.append("routing case references unknown rule: %s" % case.get("name"))
 
     for marker in set(MARKER_RE.findall(skill_text)):
@@ -942,9 +1272,18 @@ def check_documents(skill_text: str, ledger: Dict[str, Any]) -> List[str]:
     return errors
 
 
-def check_scenarios(ledger: Dict[str, Any], safety: Optional[str]) -> List[str]:
+def check_scenarios(ledger: Any, safety: Optional[str]) -> List[str]:
+    if not isinstance(ledger, dict):
+        return ["source ledger must be an object"]
+    schema_errors = _validate_ledger_schema(ledger)
+    if schema_errors:
+        return schema_errors
+    cases_value = ledger.get("routing_cases", [])
+    if not isinstance(cases_value, list):
+        return ["source ledger routing cases must be a list"]
+
     errors: List[str] = []
-    cases: Iterable[Dict[str, str]] = ledger.get("routing_cases", [])
+    cases: Iterable[Dict[str, str]] = cases_value
     if safety is not None:
         cases = [case for case in cases if case.get("safety") == safety]
     for case in cases:
@@ -964,6 +1303,10 @@ def check_scenarios(ledger: Dict[str, Any], safety: Optional[str]) -> List[str]:
 
 def check_negative_cases(skill_text: str, ledger: Dict[str, Any]) -> List[str]:
     """Prove that stale document claims and source-register drift fail closed."""
+
+    schema_errors = _validate_ledger_schema(ledger)
+    if schema_errors:
+        return ["cannot run negative cases against an invalid source ledger"] + schema_errors
 
     errors: List[str] = []
     for name, task, expected in ROUTING_GUARD_CASES:
@@ -1114,7 +1457,11 @@ def main() -> int:
     parser.add_argument("--scenario", choices=("safe", "unsafe", "negative", "all"), default="all")
     args = parser.parse_args()
 
-    ledger = load_ledger()
+    try:
+        ledger = load_ledger()
+    except (OSError, json.JSONDecodeError) as exc:
+        print("Python skill check failed: could not load source ledger: %s" % exc, file=sys.stderr)
+        return 1
     skill_text = SKILL_PATH.read_text(encoding="utf-8")
     errors = check_documents(skill_text, ledger)
     scenario = None if args.scenario in {"negative", "all"} else args.scenario

@@ -14,6 +14,15 @@ if SPEC is None or SPEC.loader is None:
 CHECKER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CHECKER)
 
+PORT_SPEC = importlib.util.spec_from_file_location(
+    "python_skill_port_checker",
+    Path(__file__).resolve().parents[3] / "scripts" / "verify_port.py",
+)
+if PORT_SPEC is None or PORT_SPEC.loader is None:
+    raise RuntimeError("could not load the shared port checker")
+PORT_CHECKER = importlib.util.module_from_spec(PORT_SPEC)
+PORT_SPEC.loader.exec_module(PORT_CHECKER)
+
 
 class RoutingRegressionTests(unittest.TestCase):
     def test_fabric3_forms_are_manual_review(self) -> None:
@@ -67,6 +76,10 @@ class RoutingRegressionTests(unittest.TestCase):
             "gcloud compute instances create vm",
             "gcloud compute instances update vm",
             "gcloud compute instances delete vm",
+            "gcloud storage rm gs://bucket/object",
+            "gcloud projects remove-iam-policy-binding project",
+            "gcloud auth revoke user@example.com",
+            "gcloud compute instances stop vm",
         ):
             with self.subTest(request=request):
                 self.assertEqual(CHECKER.route_for_task(request), "unsafe")
@@ -284,11 +297,22 @@ class RoutingRegressionTests(unittest.TestCase):
         for request in (
             "Fix web-app Next.js bridge",
             "Fix Django Next.js bridge",
-            "Fix showpass-frontend Next.js bridge",
         ):
             with self.subTest(request=request):
                 self.assertEqual(CHECKER.route_for_task(request), "web-app")
                 self.assertEqual(CHECKER.repositories_for_task(request), ("web-app",))
+
+    def test_explicit_frontend_bridge_cues_keep_both_owners(self) -> None:
+        for request in (
+            "Fix showpass-frontend Next.js bridge",
+            "Fix packages/core Next.js bridge",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "ambiguous")
+                self.assertEqual(
+                    CHECKER.repositories_for_task(request),
+                    ("web-app", "showpass-frontend"),
+                )
 
 
 class LedgerRegistrationTests(unittest.TestCase):
@@ -310,6 +334,12 @@ class LedgerRegistrationTests(unittest.TestCase):
             "web-app-nextjs-bridge-only",
             "django-nextjs-bridge-only",
             "frontend-repository-nextjs-bridge-only",
+            "frontend-package-nextjs-bridge-only",
+            "gcloud-auth-list",
+            "gcloud-storage-rm",
+            "gcloud-projects-remove-iam-binding",
+            "gcloud-auth-revoke",
+            "gcloud-instances-stop",
             "legacy-ui-bridge",
             "angularjs-bridge",
             "nextjs-bridge-only",
@@ -390,10 +420,170 @@ class DocumentIntegrityTests(unittest.TestCase):
         self.skill_text = CHECKER.SKILL_PATH.read_text(encoding="utf-8")
         self.ledger = CHECKER.load_ledger()
 
-    def test_blank_frontmatter_name_is_rejected(self) -> None:
-        candidate = self.skill_text.replace("name: python-best-practices", "name:\n", 1)
+    def test_required_frontmatter_values_must_be_non_empty_scalar_strings(self) -> None:
+        replacements = {
+            "name": "name: python-best-practices",
+            "description": next(
+                line
+                for line in self.skill_text.splitlines()
+                if line.startswith("description:")
+            ),
+        }
+        for field, original in replacements.items():
+            for value in ("", "null", "~", "[]", "{}"):
+                with self.subTest(field=field, value=value):
+                    candidate = self.skill_text.replace(
+                        original,
+                        f"{field}: {value}",
+                        1,
+                    )
+                    errors = CHECKER.check_documents(candidate, self.ledger)
+                    self.assertTrue(errors)
+                    self.assertTrue(any(field in error for error in errors))
 
-        self.assertTrue(CHECKER.check_documents(candidate, self.ledger))
+    def test_shared_port_boundary_rejects_non_scalar_required_frontmatter(self) -> None:
+        for field in ("name", "description"):
+            for value in ("", "null", "~", "[]", "{}"):
+                with self.subTest(field=field, value=value):
+                    metadata = f"{field}: {value}\n"
+                    errors = PORT_CHECKER.required_frontmatter_errors(metadata)
+                    self.assertTrue(errors)
+                    self.assertTrue(any(field in error for error in errors))
+
+    def test_malformed_ledger_records_are_rejected_with_readable_errors(self) -> None:
+        mutations = (
+            ("top-level extra key", lambda candidate: candidate.__setitem__("unexpected", True), "unknown field"),
+            (
+                "repository missing field",
+                lambda candidate: candidate["repositories"]["web-app"].pop("root"),
+                "missing required field",
+            ),
+            (
+                "repository extra key",
+                lambda candidate: candidate["repositories"]["web-app"].__setitem__(
+                    "unexpected", True
+                ),
+                "unknown field",
+            ),
+            (
+                "rule missing field",
+                lambda candidate: candidate["rules"][0].pop("repo"),
+                "missing required field",
+            ),
+            (
+                "rule extra key",
+                lambda candidate: candidate["rules"][0].__setitem__("unexpected", True),
+                "unknown field",
+            ),
+            (
+                "command missing field",
+                lambda candidate: candidate["commands"][0].pop("rule"),
+                "missing required field",
+            ),
+            (
+                "command extra key",
+                lambda candidate: candidate["commands"][0].__setitem__("unexpected", True),
+                "unknown field",
+            ),
+            (
+                "routing case missing field",
+                lambda candidate: candidate["routing_cases"][0].pop("expected"),
+                "missing required field",
+            ),
+            (
+                "routing case extra key",
+                lambda candidate: candidate["routing_cases"][0].__setitem__(
+                    "unexpected", True
+                ),
+                "unknown field",
+            ),
+            (
+                "routing case invalid safety",
+                lambda candidate: candidate["routing_cases"][0].__setitem__(
+                    "safety", "maybe"
+                ),
+                "unknown value",
+            ),
+        )
+        for name, mutate, expected_fragment in mutations:
+            with self.subTest(name=name):
+                candidate = copy.deepcopy(self.ledger)
+                mutate(candidate)
+                errors = CHECKER.check_documents(self.skill_text, candidate)
+                self.assertTrue(errors)
+                self.assertTrue(
+                    any(expected_fragment in error for error in errors),
+                    errors,
+                )
+
+    def test_ledger_record_allowed_values_are_rejected(self) -> None:
+        mutations = (
+            (
+                "repository root",
+                lambda candidate: candidate["repositories"]["web-app"].__setitem__(
+                    "root", "wrong-root"
+                ),
+                "does not match the pinned evidence",
+            ),
+            (
+                "rule route",
+                lambda candidate: candidate["rules"][0].__setitem__(
+                    "route", "not-a-route"
+                ),
+                "route has an unknown route",
+            ),
+            (
+                "command safety",
+                lambda candidate: candidate["commands"][0].__setitem__(
+                    "safety", "maybe"
+                ),
+                "unknown safety classification",
+            ),
+            (
+                "command route",
+                lambda candidate: candidate["commands"][0].__setitem__(
+                    "route", "not-a-route"
+                ),
+                "unknown route",
+            ),
+            (
+                "routing case expected route",
+                lambda candidate: candidate["routing_cases"][0].__setitem__(
+                    "expected", "not-a-route"
+                ),
+                "expected has an unknown route",
+            ),
+            (
+                "unsafe routing case rule",
+                lambda candidate: candidate["routing_cases"][0].__setitem__(
+                    "safety", "unsafe"
+                ),
+                "unsafe cases must expect unsafe",
+            ),
+        )
+        for name, mutate, expected_fragment in mutations:
+            with self.subTest(name=name):
+                candidate = copy.deepcopy(self.ledger)
+                mutate(candidate)
+                errors = CHECKER.check_documents(self.skill_text, candidate)
+                self.assertTrue(errors)
+                self.assertTrue(
+                    any(expected_fragment in error for error in errors),
+                    errors,
+                )
+
+    def test_scenario_checker_rejects_malformed_ledger_shapes(self) -> None:
+        for field, value in (
+            ("rules", None),
+            ("commands", []),
+            ("routing_cases", {}),
+        ):
+            with self.subTest(field=field, value=value):
+                candidate = copy.deepcopy(self.ledger)
+                candidate[field] = value
+                errors = CHECKER.check_scenarios(candidate, None)
+                self.assertTrue(errors)
+                self.assertTrue(any(field.replace("_", " ") in error for error in errors))
 
     def test_missing_local_references_are_rejected(self) -> None:
         missing_ledger = self.skill_text.replace(

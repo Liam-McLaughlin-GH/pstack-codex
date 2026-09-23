@@ -3,9 +3,14 @@
 
 from __future__ import annotations
 
-import re
 import sys
 from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from skill_frontmatter import required_frontmatter_errors
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,7 +33,7 @@ FORBIDDEN = (
 def frontmatter(text: str) -> str | None:
     if not text.startswith("---\n"):
         return None
-    end = text.find("\n---", 4)
+    end = text.find("\n---\n", 4)
     if end == -1:
         return None
     return text[4:end]
@@ -53,10 +58,8 @@ def main() -> int:
         if metadata is None:
             errors.append(f"{relative} has no valid YAML frontmatter")
         else:
-            if not re.search(r"^name:\s*\S+", metadata, re.MULTILINE):
-                errors.append(f"{relative} is missing name")
-            if not re.search(r"^description:\s*\S+", metadata, re.MULTILINE):
-                errors.append(f"{relative} is missing description")
+            for error in required_frontmatter_errors(metadata):
+                errors.append(f"{relative} frontmatter {error}")
 
         for marker in FORBIDDEN:
             if marker in text:
