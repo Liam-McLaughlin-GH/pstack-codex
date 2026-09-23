@@ -25,7 +25,7 @@ The following 30 upstream skills are active in this repo without changing their 
 
 These skills carry over the parts of pstack that do not depend on Cursor APIs. They cover design principles, root-cause debugging, behavior-focused verification, plain explanations, TypeScript modeling, and clean writing.
 
-The following 10 skills are present as Codex-native rewrites.
+The following 9 skills are present as Codex-native rewrites.
 
 | Skill | Codex port |
 | --- | --- |
@@ -38,13 +38,12 @@ The following 10 skills are present as Codex-native rewrites.
 | `interrogate` | Runs an adversarial review of a design or diff. |
 | `show-me-your-work` | Keeps an optional append-only decision trail. |
 | `no-comments` | Provides a Codex-compatible review pass for stale or misleading comments. |
-| `setup-pstack` | Installs the skill and agent bundle with guarded, reversible configuration. |
 
 The port preserves the names of these workflows where possible. In Codex, invoke them as skills such as `$poteto-mode`, `$how`, `$architect`, or `$tdd`.
 
 ## What is missing
 
-The following 7 upstream skills are not active in the port.
+The following 8 upstream skills are not active in the port.
 
 - `automate-me`. It depends on Cursor's built-in skill-authoring flow and transcript paths.
 - `create-verification-skill`. Its feature-map workflow assumes Cursor control skills and `.cursor/skills`.
@@ -53,6 +52,7 @@ The following 7 upstream skills are not active in the port.
 - `make-bot-ui`. It depends on Cursor UI and control tooling.
 - `recall`. It reads Cursor agent transcripts.
 - `reflect`. Its multi-model transcript review needs a Codex transcript and delegation adapter.
+- `setup-pstack`. It writes Cursor model configuration to `~/.cursor/rules/pstack-models.mdc`.
 
 The upstream `poteto-mode` playbooks are not copied into the active port. The missing playbook files are:
 
@@ -85,8 +85,6 @@ The port keeps user-facing workflow names stable where that helps muscle memory.
 
 This repo is the source tree. It is not linked into Codex automatically.
 
-Codex discovers project skills from `.agents/skills`. It discovers user skills from `${CODEX_HOME:-$HOME/.codex}/skills`; user custom agents use the matching `${CODEX_HOME:-$HOME/.codex}/agents` directory. Set `CODEX_HOME` before activation when you need an isolated user discovery root. Project custom agents remain in `.codex/agents`.
-
 Review the port first.
 
 ```sh
@@ -97,20 +95,18 @@ git status --short
 
 When you are ready to activate it, link the skill folders into your local Codex skill directory after checking for name collisions.
 
-The repository remains the source of truth. The entries under `${CODEX_HOME:-$HOME/.codex}/skills` are only discoverability links for the local Codex runtime.
+The repository remains the source of truth. The entries under `~/.codex/skills` are only discoverability links for the local Codex runtime.
 
 ```sh
 REPO=/Users/liammclaughlin/PycharmProjects/pstack-codex
-CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
-CODEX_SKILLS="$CODEX_HOME/skills"
-mkdir -p "$CODEX_SKILLS"
+mkdir -p "$HOME/.codex/skills"
 for skill_dir in "$REPO"/skills/*; do
   skill_name=$(basename "$skill_dir")
-  [ -e "$CODEX_SKILLS/$skill_name" ] || [ -L "$CODEX_SKILLS/$skill_name" ] && {
+  [ -e "$HOME/.codex/skills/$skill_name" ] && {
     printf 'Skipping existing skill %s\n' "$skill_name"
     continue
   }
-  ln -s "$skill_dir" "$CODEX_SKILLS/$skill_name"
+  ln -s "$skill_dir" "$HOME/.codex/skills/$skill_name"
 done
 ```
 

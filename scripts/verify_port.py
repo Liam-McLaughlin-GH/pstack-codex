@@ -25,9 +25,7 @@ ACTIVE_SEAMS = (
         re.compile(
             r"(?:\b(?:call|use|invoke)\s+(?:the\s+)?Cursor\s+Task\b"
             r"|\bCursor\s+Task\s+(?:tool|call)\b"
-            r"|\bTask\s*\("
-            r"|\bfrom\s+cursor_tools\s+import[^\n]*\bTask\b"
-            r"|\bimport\s+cursor_tools[^\n]*\bTask\b)",
+            r"|\bTask\s*\()",
             re.IGNORECASE,
         ),
     ),
@@ -43,16 +41,6 @@ ACTIVE_SEAMS = (
 )
 EXPLICIT_CONTINUATION = r"\\[ \t]*\r?\n[ \t]*"
 IMPORT_SEPARATOR = rf"[ \t]+(?:{EXPLICIT_CONTINUATION})?"
-MULTILINE_CURSOR_TASK_IMPORT = re.compile(
-    rf"\bfrom{IMPORT_SEPARATOR}cursor_tools{IMPORT_SEPARATOR}import"
-    rf"(?:{IMPORT_SEPARATOR})*\((?P<body>(?=[^)]*\n)[^)]*\bTask\b[^)]*)\)",
-    re.IGNORECASE | re.DOTALL,
-)
-BACKSLASH_CURSOR_TASK_IMPORT = re.compile(
-    rf"\bfrom\s+cursor_tools(?:(?:[ \t]+{EXPLICIT_CONTINUATION})+|[ \t]+)import"
-    rf"(?P<body>(?:[^\n]|{EXPLICIT_CONTINUATION}|\([^)]*\))*\bTask\b[^\n]*)",
-    re.IGNORECASE,
-)
 BOUNDARY_ANNOTATION = re.compile(r"\bUNSUPPORTED[-_ ]SEAM\s*:\s*(?P<detail>[^\n]+)", re.IGNORECASE)
 SEAM_ANNOTATION_ALIASES = {
     "Cursor path": ("cursor path", "cursor rules", "cursor target"),
@@ -124,6 +112,74 @@ def _mask_comments(text: str) -> str:
                     characters[index] = " "
                 break
     return "".join(characters)
+
+
+def _skip_import_whitespace(text: str, position: int) -> int:
+    while position < len(text):
+        if text[position] in " \t\r\n":
+            position += 1
+            continue
+        continuation = re.match(EXPLICIT_CONTINUATION, text[position:])
+        if continuation is not None:
+            position += continuation.end()
+            continue
+        break
+    return position
+
+
+def _cursor_task_import_spans(text: str) -> list[tuple[int, int]]:
+    """Find imports whose imported symbol is actually named ``Task``."""
+
+    comment_free_text = _mask_comments(text)
+    import_head = re.compile(
+        rf"\bfrom{IMPORT_SEPARATOR}cursor_tools{IMPORT_SEPARATOR}import\b",
+        re.IGNORECASE,
+    )
+    spans: list[tuple[int, int]] = []
+    for match in import_head.finditer(comment_free_text):
+        position = _skip_import_whitespace(comment_free_text, match.end())
+        if position >= len(comment_free_text):
+            continue
+
+        if comment_free_text[position] == "(":
+            depth = 0
+            end = position
+            while end < len(comment_free_text):
+                character = comment_free_text[end]
+                if character == "(":
+                    depth += 1
+                elif character == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                end += 1
+            body = comment_free_text[position + 1 : end]
+            statement_end = min(end + 1, len(comment_free_text))
+        else:
+            end = position
+            while end < len(comment_free_text):
+                newline = comment_free_text.find("\n", end)
+                if newline == -1:
+                    end = len(comment_free_text)
+                    break
+                line = comment_free_text[end:newline]
+                if line.rstrip().endswith("\\"):
+                    end = newline + 1
+                    continue
+                end = newline
+                break
+            body = comment_free_text[position:end]
+            statement_end = end
+
+        imported_task = False
+        for item in body.replace("\\\n", " ").split(","):
+            symbol = re.match(r"\s*([A-Za-z_]\w*)", item)
+            if symbol is not None and symbol.group(1) == "Task":
+                imported_task = True
+                break
+        if imported_task:
+            spans.append((match.start(), statement_end))
+    return spans
 
 
 class ValidationError(ValueError):
@@ -349,26 +405,22 @@ def _check_boundary_mentions(root: Path, path: Path, text: str, errors: list[str
                     "add an explicit same-line UNSUPPORTED-SEAM annotation or use a Codex surface"
                 )
 
-    comment_free_text = _mask_comments(text)
-    for import_pattern in (
-        MULTILINE_CURSOR_TASK_IMPORT,
-        BACKSLASH_CURSOR_TASK_IMPORT,
-    ):
-        for match in import_pattern.finditer(comment_free_text):
-            if import_pattern is BACKSLASH_CURSOR_TASK_IMPORT and "\\" not in match.group(0):
-                continue
-            original_match = text[match.start() : match.end()]
-            annotations = [
-                annotation.group("detail").casefold()
-                for annotation in BOUNDARY_ANNOTATION.finditer(original_match)
-            ]
-            if any(alias in detail for detail in annotations for alias in SEAM_ANNOTATION_ALIASES["Cursor Task call"]):
-                continue
-            line_number = text.count("\n", 0, match.start()) + 1
-            errors.append(
-                f"{path.relative_to(root)}:{line_number} contains an active unsupported seam 'Cursor Task call'; "
-                "add an explicit same-line UNSUPPORTED-SEAM annotation or use a Codex surface"
-            )
+    for start, end in _cursor_task_import_spans(text):
+        closing_line_end = text.find("\n", end)
+        if closing_line_end == -1:
+            closing_line_end = len(text)
+        original_match = text[start:closing_line_end]
+        annotations = [
+            annotation.group("detail").casefold()
+            for annotation in BOUNDARY_ANNOTATION.finditer(original_match)
+        ]
+        if any(alias in detail for detail in annotations for alias in SEAM_ANNOTATION_ALIASES["Cursor Task call"]):
+            continue
+        line_number = text.count("\n", 0, start) + 1
+        errors.append(
+            f"{path.relative_to(root)}:{line_number} contains an active unsupported seam 'Cursor Task call'; "
+            "add an explicit same-line UNSUPPORTED-SEAM annotation or use a Codex surface"
+        )
 
 
 def _load_skill_helper(path: Path):

@@ -33,6 +33,7 @@ from safe_fs import (  # noqa: E402
     create_unique_directory,
     directory_lock,
     lstat_at,
+    merge_cleanup_receipts,
     open_child_directory,
     open_directory,
     remove_tree_at,
@@ -64,6 +65,15 @@ def _cleanup_retry_hint(residue: Path, expected_metadata: os.stat_result | None 
 
 def _recovery_hint(root: Path, residue: Path) -> str:
     return f"inspect {root} and {residue}, then rerun preview before cleanup"
+
+
+def _parent_cleanup_retry_hint(receipt: CleanupReceipt | None) -> str | None:
+    if receipt is None:
+        return None
+    paths = ", ".join(str(entry.path) for entry in receipt.entries)
+    if receipt.truncated:
+        paths += ", ..."
+    return f"inspect created-parent identities ({paths}) before retrying the original configuration command"
 
 
 class ConfigurationError(RuntimeError):
@@ -144,6 +154,7 @@ class TransactionOutcome:
     residue: Path | None = None
     retry: str | None = None
     recovery_receipt: CleanupReceipt | None = None
+    recovery_state: str | None = None
 
     def as_dict(self) -> dict[str, object]:
         result: dict[str, object] = {"status": self.status}
@@ -153,6 +164,8 @@ class TransactionOutcome:
             result["retry"] = self.retry
         if self.recovery_receipt is not None:
             result["recovery_receipt"] = self.recovery_receipt.as_dict()
+        if self.recovery_state is not None:
+            result["recovery_state"] = self.recovery_state
         return result
 
 
@@ -628,6 +641,7 @@ def _publication_state(
     expected_residue: os.stat_result | None,
     expected_snapshot: TreeSnapshot | None = None,
     recovery_receipt: CleanupReceipt | None = None,
+    recovery_state: str | None = None,
 ) -> TransactionOutcome:
     residue = parent_path / residue_name
     try:
@@ -660,6 +674,7 @@ def _publication_state(
                 residue,
                 _recovery_hint(parent_path / root_name, residue),
                 recovery_receipt,
+                recovery_state,
             )
         if expected_residue is not None and _same_entry(current_residue, expected_residue):
             if live_root is not None and _same_entry(live_root, expected_root):
@@ -668,36 +683,49 @@ def _publication_state(
                     residue,
                     _recovery_hint(parent_path / root_name, residue),
                     recovery_receipt,
+                    recovery_state,
                 )
             return TransactionOutcome(
                 "root_replacement_cleanup_pending",
                 residue,
                 _cleanup_retry_hint(residue, current_residue),
                 recovery_receipt,
+                recovery_state,
             )
         return TransactionOutcome(
             "publication_recovery_pending",
             residue,
             _recovery_hint(parent_path / root_name, residue),
             recovery_receipt,
+            recovery_state,
         )
 
     try:
         current_residue = lstat_at(parent_fd, residue_name)
     except FileNotFoundError:
-        return TransactionOutcome("published", recovery_receipt=recovery_receipt)
+        if recovery_receipt is not None or recovery_state is not None:
+            return TransactionOutcome(
+                "publication_recovery_pending",
+                residue,
+                _recovery_hint(parent_path / root_name, residue),
+                recovery_receipt,
+                recovery_state,
+            )
+        return TransactionOutcome("published")
     if expected_residue is not None and _same_entry(current_residue, expected_residue):
         return TransactionOutcome(
             "published_cleanup_pending",
             residue,
             _cleanup_retry_hint(residue, current_residue),
             recovery_receipt,
+            recovery_state,
         )
     return TransactionOutcome(
         "publication_recovery_pending",
         residue,
         _recovery_hint(parent_path / root_name, residue),
         recovery_receipt,
+        recovery_state,
     )
 
 
@@ -753,6 +781,7 @@ def _cleanup_published_generation(
             )
         except (OSError, SafeFilesystemError) as exc:
             recovery_receipt = exc.cleanup_receipt if isinstance(exc, SafeFilesystemError) else None
+            recovery_state = "publication_cleanup_recovery_pending"
             state = _publication_state(
                 parent_fd,
                 parent_path,
@@ -762,6 +791,7 @@ def _cleanup_published_generation(
                 expected_residue,
                 expected_snapshot,
                 recovery_receipt,
+                recovery_state,
             )
             if state.status == "published":
                 return TransactionOutcome(
@@ -769,6 +799,7 @@ def _cleanup_published_generation(
                     residue,
                     _recovery_hint(parent_path / root_name, residue),
                     recovery_receipt,
+                    recovery_state,
                 )
             return state
         if not _root_descriptor_matches(
@@ -1137,7 +1168,7 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
                         )
                     except (OSError, SafeFilesystemError) as exc:
                         if isinstance(exc, SafeFilesystemError) and exc.cleanup_receipt is not None:
-                            recovery_receipt = exc.cleanup_receipt
+                            recovery_receipt = merge_cleanup_receipts(recovery_receipt, exc.cleanup_receipt)
                             recovery_state = "rollback_cleanup_pending"
                         cleanup_errors.append(f"staging residue {parent_handle.path / staging_name}: {exc}")
                 if not completed:
@@ -1145,9 +1176,10 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
                         cleanup_created_directories(parent_handle.created)
                     except (OSError, SafeFilesystemError) as exc:
                         if isinstance(exc, SafeFilesystemError) and exc.cleanup_receipt is not None:
-                            recovery_receipt = exc.cleanup_receipt
-                        elif recovery_receipt is None:
-                            recovery_receipt = recovery_receipt_for_created_directories(parent_handle.created)
+                            parent_receipt = exc.cleanup_receipt
+                        else:
+                            parent_receipt = recovery_receipt_for_created_directories(parent_handle.created)
+                        recovery_receipt = merge_cleanup_receipts(recovery_receipt, parent_receipt)
                         recovery_state = "rollback_parent_cleanup_pending"
                         cleanup_errors.append(f"created parent cleanup: {exc}")
                         close_created_directories(parent_handle.created)
@@ -1165,7 +1197,12 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
                     )
                     message = f"configuration cleanup is incomplete (status=cleanup_pending): {detail}"
                     residue = Path(retry) if retry else None
-                    retry_command = _cleanup_retry_hint(residue, staging_metadata) if residue is not None else None
+                    if recovery_state == "rollback_parent_cleanup_pending":
+                        retry_command = _parent_cleanup_retry_hint(recovery_receipt)
+                    else:
+                        retry_command = _cleanup_retry_hint(residue, staging_metadata) if residue is not None else None
+                        if retry_command is None:
+                            retry_command = _parent_cleanup_retry_hint(recovery_receipt)
                     if retry_command:
                         message += f". Retry with {retry_command}"
                     if recovery_receipt is not None:

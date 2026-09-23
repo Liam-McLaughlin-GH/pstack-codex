@@ -33,6 +33,7 @@ from safe_fs import (  # noqa: E402
     create_unique_directory,
     directory_lock,
     lstat_at,
+    merge_cleanup_receipts,
     open_child_directory,
     open_directory,
     remove_tree_at,
@@ -131,6 +132,15 @@ def _cleanup_retry_hint(residue: Path, expected_metadata: os.stat_result | None 
     if expected_metadata is not None:
         command.extend(("--expected-dev", str(expected_metadata.st_dev), "--expected-ino", str(expected_metadata.st_ino)))
     return shlex.join(command)
+
+
+def _parent_cleanup_retry_hint(receipt: CleanupReceipt | None) -> str | None:
+    if receipt is None:
+        return None
+    paths = ", ".join(str(entry.path) for entry in receipt.entries)
+    if receipt.truncated:
+        paths += ", ..."
+    return f"inspect created-parent identities ({paths}) before retrying the original install command"
 
 
 def _source_snapshot(source: Path) -> TreeSnapshot:
@@ -403,7 +413,7 @@ def apply_install(source: Path, destination: Path) -> InstallPlan:
                         )
                     except (OSError, SafeFilesystemError) as exc:
                         if isinstance(exc, SafeFilesystemError) and exc.cleanup_receipt is not None:
-                            recovery_receipt = exc.cleanup_receipt
+                            recovery_receipt = merge_cleanup_receipts(recovery_receipt, exc.cleanup_receipt)
                             recovery_state = "rollback_cleanup_pending"
                         cleanup_errors.append(f"staging residue {destination_handle.path / staging_name}: {exc}")
                 if not completed:
@@ -411,9 +421,10 @@ def apply_install(source: Path, destination: Path) -> InstallPlan:
                         cleanup_created_directories(destination_handle.created)
                     except (OSError, SafeFilesystemError) as exc:
                         if isinstance(exc, SafeFilesystemError) and exc.cleanup_receipt is not None:
-                            recovery_receipt = exc.cleanup_receipt
-                        elif recovery_receipt is None:
-                            recovery_receipt = recovery_receipt_for_created_directories(destination_handle.created)
+                            parent_receipt = exc.cleanup_receipt
+                        else:
+                            parent_receipt = recovery_receipt_for_created_directories(destination_handle.created)
+                        recovery_receipt = merge_cleanup_receipts(recovery_receipt, parent_receipt)
                         recovery_state = "rollback_parent_cleanup_pending"
                         cleanup_errors.append(f"created parent cleanup: {exc}")
                 else:
@@ -429,7 +440,12 @@ def apply_install(source: Path, destination: Path) -> InstallPlan:
                         None,
                     )
                     residue = Path(residue_text) if residue_text else None
-                    retry = _cleanup_retry_hint(residue, staging_metadata) if residue is not None else None
+                    if recovery_state == "rollback_parent_cleanup_pending":
+                        retry = _parent_cleanup_retry_hint(recovery_receipt)
+                    else:
+                        retry = _cleanup_retry_hint(residue, staging_metadata) if residue is not None else None
+                        if retry is None:
+                            retry = _parent_cleanup_retry_hint(recovery_receipt)
                     message = f"install rollback cleanup is incomplete (status=cleanup_pending): {detail}"
                     if residue is not None and retry is not None:
                         message += f". Retry with {retry}"

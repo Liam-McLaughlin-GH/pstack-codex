@@ -252,6 +252,17 @@ def recovery_receipt_for_created_directories(
     )
 
 
+def merge_cleanup_receipts(*receipts: CleanupReceipt | None) -> CleanupReceipt | None:
+    """Combine bounded recovery receipts without losing earlier failures."""
+
+    present = [receipt for receipt in receipts if receipt is not None]
+    if not present:
+        return None
+    entries = [entry for receipt in present for entry in receipt.entries]
+    merged = CleanupReceipt.from_entries(entries)
+    return CleanupReceipt(merged.entries, merged.truncated or any(receipt.truncated for receipt in present))
+
+
 @contextmanager
 def directory_lock(fd: int):
     """Serialize writers that publish through the same stable directory."""
@@ -361,11 +372,11 @@ def write_regular_file_at(directory_fd: int, name: str, content: bytes, *, repla
         os.close(file_fd)
 
 
-def create_unique_directory(parent_fd: int, prefix: str) -> tuple[str, int]:
+def create_unique_directory(parent_fd: int, prefix: str, *, mode: int = 0o755) -> tuple[str, int]:
     for _attempt in range(100):
         name = f"{prefix}{secrets.token_hex(12)}"
         try:
-            os.mkdir(name, 0o755, dir_fd=parent_fd)
+            os.mkdir(name, mode, dir_fd=parent_fd)
         except FileExistsError:
             continue
         try:
@@ -387,6 +398,33 @@ def unique_entry_name(parent_fd: int, prefix: str) -> str:
         except FileNotFoundError:
             return name
     raise SafeFilesystemError(f"could not allocate a temporary name in {parent_fd}")
+
+
+def _native_unlink_at(parent_fd: int, name: str, *, is_directory: bool) -> None:
+    """Remove a quarantined entry through the platform unlinkat primitive.
+
+    The final destructive operation is deliberately kept out of the public
+    ``os.unlink``/``os.rmdir`` attributes.  That prevents a caller from
+    interposing a second public-name replacement between the quarantine claim
+    and the removal.  The directory descriptor is held open for the complete
+    quarantine lifetime, so the final lookup is relative to the directory we
+    bound rather than to a path assembled later.
+    """
+
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        function = getattr(libc, "unlinkat")
+    except AttributeError as exc:
+        raise SafeFilesystemError("the platform has no descriptor-relative unlink primitive") from exc
+
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    function.restype = ctypes.c_int
+    # Darwin's AT_REMOVEDIR is 0x80; Linux uses 0x200.
+    flags = (0x00000080 if sys.platform == "darwin" else 0x00000200) if is_directory else 0
+    result = function(parent_fd, os.fsencode(name), flags)
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), name)
 
 
 def _native_rename(old_dir_fd: int, old_name: str, new_dir_fd: int, new_name: str, flags: int) -> bool:
@@ -436,10 +474,21 @@ def atomic_exchange_at(directory_fd: int, first_name: str, second_name: str) -> 
 def atomic_rename_noreplace_at(directory_fd: int, source_name: str, target_name: str) -> None:
     """Rename a sibling without replacing a target that appeared meanwhile."""
 
+    atomic_rename_noreplace_between(directory_fd, source_name, directory_fd, target_name)
+
+
+def atomic_rename_noreplace_between(
+    source_dir_fd: int,
+    source_name: str,
+    target_dir_fd: int,
+    target_name: str,
+) -> None:
+    """Rename between opened directories without replacing the target."""
+
     # macOS renameatx_np uses RENAME_EXCL; Linux renameat2 uses
     # RENAME_NOREPLACE.
     flags = 0x00000004 if sys.platform == "darwin" else 0x00000001
-    if not _native_rename(directory_fd, source_name, directory_fd, target_name, flags):
+    if not _native_rename(source_dir_fd, source_name, target_dir_fd, target_name, flags):
         raise SafeFilesystemError("the platform has no atomic no-replace rename primitive")
 
 
@@ -631,14 +680,21 @@ def _delete_private_entry(
     is_directory: bool,
     receipt_path: Path,
 ) -> None:
-    """Claim a private entry again before deleting it.
+    """Claim an entry, move it into a held quarantine, and remove that claim.
 
-    The second no-replace rename makes the entry being deleted a fresh private
-    claim. If the original private name was replaced, the replacement is
-    moved to that claim and is then preserved instead of being deleted.
+    The second no-replace rename protects the first private name.  The third
+    move puts the expected identity below a separately opened, mode-700
+    quarantine directory.  The final unlinkat is relative to that held
+    directory descriptor, never to the public or first private name.  If any
+    claim fails, the expected entry is restored without replacing a competitor
+    and the caller receives a bounded recovery receipt.
     """
 
     delete_name: str | None = None
+    quarantine_name: str | None = None
+    quarantine_fd: int | None = None
+    quarantine_entry_name = "entry"
+    quarantine_metadata: os.stat_result | None = None
     try:
         current_metadata = lstat_at(parent_fd, private_name)
         if not _same_entry(current_metadata, expected_metadata):
@@ -648,21 +704,71 @@ def _delete_private_entry(
         claimed_metadata = lstat_at(parent_fd, delete_name)
         if not _same_entry(claimed_metadata, expected_metadata):
             raise SafeFilesystemError(f"private cleanup identity changed: {private_name}")
-        if is_directory:
-            os.rmdir(delete_name, dir_fd=parent_fd)
-        else:
-            os.unlink(delete_name, dir_fd=parent_fd)
+
+        quarantine_name, quarantine_fd = create_unique_directory(
+            parent_fd,
+            ".pstack-dispose-",
+            mode=0o700,
+        )
+        atomic_rename_noreplace_between(
+            parent_fd,
+            delete_name,
+            quarantine_fd,
+            quarantine_entry_name,
+        )
+        quarantine_metadata = lstat_at(quarantine_fd, quarantine_entry_name)
+        if not _same_entry(quarantine_metadata, expected_metadata):
+            raise SafeFilesystemError(f"private cleanup identity changed in quarantine: {private_name}")
+        _native_unlink_at(
+            quarantine_fd,
+            quarantine_entry_name,
+            is_directory=is_directory,
+        )
+        quarantine_entry_name = None
+        os.close(quarantine_fd)
+        quarantine_fd = None
+        _native_unlink_at(parent_fd, quarantine_name, is_directory=True)
+        quarantine_name = None
         try:
             lstat_at(parent_fd, public_name)
         except FileNotFoundError:
             return
         raise SafeFilesystemError(f"replacement appeared during removal: {public_name}")
     except BaseException as exc:
+        if quarantine_fd is not None and quarantine_entry_name is not None:
+            try:
+                lstat_at(quarantine_fd, quarantine_entry_name)
+            except FileNotFoundError:
+                pass
+            else:
+                if delete_name is None:
+                    delete_name = unique_entry_name(parent_fd, ".pstack-cleanup-")
+                try:
+                    atomic_rename_noreplace_between(
+                        quarantine_fd,
+                        quarantine_entry_name,
+                        parent_fd,
+                        delete_name,
+                    )
+                except (OSError, SafeFilesystemError) as restore_error:
+                    exc = SafeFilesystemError(f"{exc}; {restore_error}")
         if delete_name is not None:
             try:
                 _restore_bound_entry(parent_fd, public_name, delete_name)
             except SafeFilesystemError as restore_error:
                 exc = SafeFilesystemError(f"{exc}; {restore_error}")
+        if quarantine_name is not None:
+            try:
+                quarantine_metadata = lstat_at(parent_fd, quarantine_name)
+                if stat.S_ISDIR(quarantine_metadata.st_mode):
+                    _native_unlink_at(parent_fd, quarantine_name, is_directory=True)
+            except (OSError, SafeFilesystemError) as cleanup_error:
+                exc = SafeFilesystemError(f"{exc}; {cleanup_error}")
+        if quarantine_fd is not None:
+            try:
+                os.close(quarantine_fd)
+            except OSError:
+                pass
         if isinstance(exc, SafeFilesystemError) and exc.cleanup_receipt is not None:
             raise exc
         reason = "replaced" if "identity" in str(exc) or "replacement" in str(exc) else "cleanup-error"
@@ -672,6 +778,12 @@ def _delete_private_entry(
             expected_metadata=expected_metadata,
             reason=reason,
         ) from exc
+    finally:
+        if quarantine_fd is not None:
+            try:
+                os.close(quarantine_fd)
+            except OSError:
+                pass
 
 
 def _remove_owned_empty_directory(
@@ -779,8 +891,19 @@ def remove_tree_at(
         receipt_path = _cleanup_receipt_path(receipt_root, relative, entry_name)
         try:
             if top_level and stat.S_ISDIR(entry_metadata.st_mode):
-                validate_entry(directory_parent_fd, entry_name, entry_metadata)
-                directory_fd = _open_child_directory(directory_parent_fd, entry_name)
+                # Bind the public root before opening or mutating any child.
+                # A replacement at the public name must never turn recursive
+                # cleanup into mutation of the old root after the names swap.
+                private_name = _move_bound_entry(
+                    directory_parent_fd,
+                    entry_name,
+                    entry_metadata,
+                    receipt_path=receipt_path,
+                )
+                moved_metadata = validate_entry(directory_parent_fd, private_name, entry_metadata)
+                if not stat.S_ISDIR(moved_metadata.st_mode):
+                    raise SafeFilesystemError(f"entry is no longer a directory during removal: {entry_name}")
+                directory_fd = _open_child_directory(directory_parent_fd, private_name)
                 try:
                     opened_metadata = os.fstat(directory_fd)
                     if not _same_entry(opened_metadata, entry_metadata):
@@ -789,12 +912,6 @@ def remove_tree_at(
                 finally:
                     os.close(directory_fd)
                 validate_guard()
-                private_name = _move_bound_entry(
-                    directory_parent_fd,
-                    entry_name,
-                    entry_metadata,
-                    receipt_path=receipt_path,
-                )
                 _delete_private_entry(
                     directory_parent_fd,
                     entry_name,
