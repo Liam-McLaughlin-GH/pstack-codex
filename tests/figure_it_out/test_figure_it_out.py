@@ -382,6 +382,17 @@ class WorkflowBehaviorTests(unittest.TestCase):
             self.assertEqual([event["target"] for event in refusal_events], ["<invalid-target>"] * len(unsafe_targets))
             self.assertTrue(all("@" not in json.dumps(event) for event in refusal_events))
 
+    def test_invalid_action_refusal_does_not_persist_the_raw_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            with self.assertRaises(figure_it_out.ScopeRefusal) as refusal:
+                workflow.guard_action("deploy token@host", "token@host")
+            self.assertNotIn("token@host", json.dumps(refusal.exception.refusal))
+            self.assertNotIn("deploy token@host", json.dumps(workflow.state))
+            event = next(event for event in workflow.state["events"] if event["event"] == "action_refused")
+            self.assertEqual(event["action"], "invalid-action")
+
     def test_completed_run_cannot_mutate_terminal_results(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1285,9 +1296,9 @@ class WorkflowBehaviorTests(unittest.TestCase):
 
             mislabeled_legacy = legacy_state(json.loads(refusal_state_path.read_text(encoding="utf-8")))
             mislabeled_legacy["events"] = [{
-                "at": orphan_decision["at"],
+                "at": "token@host",
                 "event": "decision_recorded",
-                "phase": "phase-1",
+                "phase": "token@host",
                 "target": "token@host",
                 "reason": "target token@host was out of scope",
                 "next_action": "next target token@host",
@@ -1307,6 +1318,22 @@ class WorkflowBehaviorTests(unittest.TestCase):
             self.assertNotIn("token@host", json.dumps(migrated_mislabeled.state))
             self.assertNotIn("token@host", mislabeled_audit)
             self.assertNotIn("next_action", migrated_mislabeled.state["events"][0])
+
+            explicit_legacy = legacy_state(json.loads(refusal_state_path.read_text(encoding="utf-8")))
+            explicit_event = explicit_legacy["events"][0]
+            explicit_event.update(
+                {
+                    "event": "action_refused",
+                    "phase": "phase-1",
+                    "action": "deploy token@host",
+                    "target": "token@host",
+                }
+            )
+            explicit_path = root / "explicit-raw-action.json"
+            explicit_path.write_text(json.dumps(explicit_legacy), encoding="utf-8")
+            migrated_explicit = figure_it_out.Workflow.load(explicit_path, workspace_root=root)
+            self.assertNotIn("token@host", json.dumps(migrated_explicit.state))
+            self.assertEqual(migrated_explicit.state["events"][0]["action"], "deploy")
 
             malformed_cases = {
                 "predicate-results": lambda state: state.update(predicate_results=[]),

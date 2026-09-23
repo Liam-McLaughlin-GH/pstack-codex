@@ -1766,8 +1766,8 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                 for item in evidence
             )
         return {
-            "at": record.get("at", _now()),
-            "phase": record.get("phase", "run"),
+            "at": _now(),
+            "phase": record.get("phase") if record.get("phase") in phase_by_id else "run",
             "decision": f"refused action {action_reference}",
             "why": "legacy refusal",
             "evidence": [
@@ -1779,6 +1779,16 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             "reason": "legacy refusal",
             "next_action": "choose a declared local action or replan with owner approval",
         }
+
+    def refusal_action_reference(event: Mapping[str, Any]) -> str:
+        action = event.get("action")
+        if isinstance(action, str) and SAFE_ACTION.fullmatch(action):
+            return action
+        if isinstance(action, str):
+            parts = action.split()
+            if parts and SAFE_ACTION.fullmatch(parts[0]):
+                return parts[0]
+        return "invalid-action"
 
     def matching_decision(event: Mapping[str, Any], used: set[int]) -> tuple[dict[str, Any] | None, int | None]:
         event_name = event.get("event")
@@ -1803,8 +1813,7 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             if event_name == "blocked" and decision.get("status") == "blocked" and decision.get("phase") == phase:
                 return decision, index
             if event_name == "action_refused":
-                action = event.get("action", "invalid-action")
-                action_reference = action if isinstance(action, str) and SAFE_ACTION.fullmatch(action) else "invalid-action"
+                action_reference = refusal_action_reference(event)
                 if decision.get("decision") == f"refused action {action_reference}" and decision.get("result") == "blocked":
                     refusal = deepcopy(decision)
                     refusal["status"] = "refused"
@@ -1816,12 +1825,14 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             if event_name == "action_refused" and decision.get("status") == "refused" and decision.get("phase") == phase:
                 return decision, index
             if event_name == "action_refused" and decision.get("status") == "refused":
-                action = event.get("action", "invalid-action")
-                action_reference = action if isinstance(action, str) and SAFE_ACTION.fullmatch(action) else "invalid-action"
+                action_reference = refusal_action_reference(event)
                 if decision.get("decision") == f"refused action {action_reference}":
                     return decision, index
-            if event_name == "decision_recorded" and decision.get("phase") == event.get("phase", "run"):
-                return decision, index
+            if event_name == "decision_recorded":
+                if decision.get("phase") == event.get("phase", "run"):
+                    return decision, index
+                if isinstance(decision.get("decision"), str) and decision["decision"].startswith("refused action "):
+                    return decision, index
         return None, None
 
     def event_decision(event: dict[str, Any], used: set[int]) -> tuple[dict[str, Any], bool]:
@@ -1831,8 +1842,7 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             if "evidence" in record:
                 record["evidence"] = _migrate_schema_1_evidence(record["evidence"], "event.decision.evidence")
             if event_name == "action_refused":
-                action = event.get("action", "invalid-action")
-                action_reference = action if isinstance(action, str) and SAFE_ACTION.fullmatch(action) else "invalid-action"
+                action_reference = refusal_action_reference(event)
                 record["evidence"] = [
                     {"kind": "reference", "ref": f"scope:{action_reference}"},
                     {"kind": "reference", "ref": "target:provided" if event.get("target") is not None else "target:none"},
@@ -1842,8 +1852,7 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
         if record is not None and index is not None:
             used.add(index)
             if event_name == "action_refused":
-                action = event.get("action", "invalid-action")
-                action_reference = action if isinstance(action, str) and SAFE_ACTION.fullmatch(action) else "invalid-action"
+                action_reference = refusal_action_reference(event)
                 record = deepcopy(record)
                 record["evidence"] = [
                     {"kind": "reference", "ref": f"scope:{action_reference}"},
@@ -1870,8 +1879,7 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             snapshot = event.get("result_snapshot") or migrated.get("predicate_results", {}).get(event.get("check_id")) or {}
             return make_decision("run", f"terminal check {event.get('check_id')}", "the terminal predicate check was recorded", snapshot.get("evidence", ["check:legacy-predicate"]), snapshot.get("status", "failed")), True
         if event_name == "action_refused":
-            action = event.get("action", "invalid-action")
-            action_reference = action if isinstance(action, str) and SAFE_ACTION.fullmatch(action) else "invalid-action"
+            action_reference = refusal_action_reference(event)
             evidence = [
                 {"kind": "reference", "ref": f"scope:{action_reference}"},
                 {"kind": "reference", "ref": "target:provided" if event.get("target") is not None else "target:none"},
@@ -2052,8 +2060,9 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                 # both matched and mislabeled refusal events.
                 event.pop("private", None)
                 if event_name == "action_refused":
-                    action = event.get("action", "invalid-action")
-                    event["action"] = action if isinstance(action, str) and SAFE_ACTION.fullmatch(action) else "invalid-action"
+                    event["at"] = record.get("at", _now())
+                    event["phase"] = record.get("phase", "run")
+                    event["action"] = refusal_action_reference(event)
                     event["target"] = _sanitize_refusal_target(event.get("target"))
                     event["reason"] = "legacy refusal"
                     event["next_action"] = "choose a declared local action or replan with owner approval"
@@ -2062,9 +2071,9 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                     event.pop("result", None)
                 else:
                     safe_fields = {
-                        field: event[field]
-                        for field in ("at", "event", "phase")
-                        if field in event
+                        "at": record.get("at", _now()),
+                        "event": event_name,
+                        "phase": record.get("phase", "run"),
                     }
                     event.clear()
                     event.update(safe_fields)
@@ -2973,16 +2982,17 @@ class Workflow:
 
     def _refuse_action(self, action: str, target: str | None, reason: str) -> None:
         next_action = "choose a declared local action or replan with owner approval"
+        action_reference = action if SAFE_ACTION.fullmatch(action) else "invalid-action"
         target = _sanitize_refusal_target(target)
+        safe_reason = reason if action_reference != "invalid-action" else "action was refused by scope validation"
         refusal = {
             "at": _now(),
             "status": "refused",
-            "action": action,
+            "action": action_reference,
             "target": target,
-            "reason": reason,
+            "reason": safe_reason,
             "next_action": next_action,
         }
-        action_reference = action if SAFE_ACTION.fullmatch(action) else "invalid-action"
         evidence = [
             {"kind": "reference", "ref": f"scope:{action_reference}"},
             {"kind": "reference", "ref": "target:provided" if target is not None else "target:none"},
@@ -2990,11 +3000,11 @@ class Workflow:
         record = self._decision_record(
             self.state.get("current_phase") or "run",
             f"refused action {action_reference}",
-            reason,
+            safe_reason,
             evidence,
             "blocked",
             status="refused",
-            reason=reason,
+            reason=safe_reason,
             next_action=next_action,
         )
 
@@ -3005,13 +3015,13 @@ class Workflow:
             and event.get("event") in {"action_refused", "blocked"}
         )
         if overflow_count >= MAX_DECISION_OVERFLOW_EVENTS and len(self.state["decisions"]) > self.state["plan"]["limits"]["max_decisions"]:
-            raise ScopeRefusal(reason, refusal)
+            raise ScopeRefusal(safe_reason, refusal)
 
         def mutate() -> None:
             self._append_decision_event("action_refused", record, **refusal)
 
         self._transaction(mutate)
-        raise ScopeRefusal(reason, refusal)
+        raise ScopeRefusal(safe_reason, refusal)
 
     def guard_action(self, action: str, target: str | None = None) -> dict[str, Any]:
         _require_state_object(self.state)
@@ -3020,6 +3030,7 @@ class Workflow:
             if isinstance(action, str)
             and len(action) <= 100
             and not any(unicodedata.category(char) in {"Cc", "Cf"} for char in action)
+            and SAFE_ACTION.fullmatch(action) is not None
             else "<invalid-action>"
         )
         target_display = _sanitize_refusal_target(target)
