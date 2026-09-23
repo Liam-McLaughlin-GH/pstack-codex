@@ -50,6 +50,7 @@ The following 8 upstream skills are not active in the port.
 - `figure-it-out`. Its playbook routing and subagent instructions need a Codex-specific rewrite.
 - `maintain-verification-skill`. It assumes the same Cursor verification-skill layout.
 - `make-bot-ui`. It depends on Cursor UI and control tooling.
+- `recall`. It reads Cursor agent transcripts.
 - `reflect`. Its multi-model transcript review needs a Codex transcript and delegation adapter.
 - `setup-pstack`. It writes Cursor model configuration to `~/.cursor/rules/pstack-models.mdc`.
 
