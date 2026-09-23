@@ -871,14 +871,65 @@ def _feature_markdown(feature: dict[str, Any], harness: str) -> str:
     return "\n".join(lines)
 
 
-def _write_tree(spec: dict[str, Any], root: Path) -> None:
+def _write_file_at(parent_fd: int, name: str, text: str) -> None:
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    descriptor = os.open(name, flags, 0o600, dir_fd=parent_fd)
+    try:
+        data = text.encode("utf-8")
+        offset = 0
+        while offset < len(data):
+            written = os.write(descriptor, data[offset:])
+            if written <= 0:
+                raise OSError(errno.EIO, "short write")
+            offset += written
+    finally:
+        os.close(descriptor)
+
+
+def _write_tree(spec: dict[str, Any], root: Path, root_fd: int | None = None) -> None:
     app = spec["app"]
-    (root / "features").mkdir()
-    (root / "SKILL.md").write_text(_skill_markdown(spec), encoding="utf-8")
-    (root / "features" / "README.md").write_text(_index_markdown(spec), encoding="utf-8")
-    for feature in spec["features"]:
-        path = root / "features" / f"{feature['id']}.md"
-        path.write_text(_feature_markdown(feature, app["harness"]), encoding="utf-8")
+    owned_root_fd = root_fd is None
+    if root_fd is None:
+        root_fd = _open_directory_descriptor(root, "staging directory")
+    features_fd: int | None = None
+    features_reservation: PublishedEntry | None = None
+    try:
+        _write_file_at(root_fd, "SKILL.md", _skill_markdown(spec))
+        features_fd, _, features_reservation = _create_new_directory_with_reservation(
+            root_fd,
+            "features",
+            "generated features directory",
+            mode=0o700,
+        )
+        _write_file_at(features_fd, "README.md", _index_markdown(spec))
+        for feature in spec["features"]:
+            _write_file_at(
+                features_fd,
+                f"{feature['id']}.md",
+                _feature_markdown(feature, app["harness"]),
+            )
+    finally:
+        if features_reservation is not None:
+            try:
+                os.close(features_reservation[0])
+            except OSError:
+                pass
+        if features_fd is not None:
+            try:
+                os.close(features_fd)
+            except OSError:
+                pass
+        if owned_root_fd:
+            try:
+                os.close(root_fd)
+            except OSError:
+                pass
 
 
 YAML_NON_STRING_PLAIN_SCALAR = re.compile(
@@ -1680,26 +1731,24 @@ def _open_or_create_directory(
     parent_fd: int,
     name: str,
     label: str,
-) -> tuple[int, bool]:
+) -> tuple[int, bool, PublishedEntry | None]:
     """Open or create one directory entry without resolving through its parent path."""
 
     try:
-        return _open_directory_descriptor(name, label, dir_fd=parent_fd), False
+        return _open_directory_descriptor(name, label, dir_fd=parent_fd), False, None
     except ScaffoldError as exc:
         if not isinstance(exc.__cause__, FileNotFoundError):
             raise
 
     try:
-        os.mkdir(name, mode=0o777, dir_fd=parent_fd)
+        return _create_new_directory_with_reservation(
+            parent_fd,
+            name,
+            label,
+            mode=0o777,
+        )
     except FileExistsError:
-        return _open_directory_descriptor(name, label, dir_fd=parent_fd), False
-
-    try:
-        return _open_directory_descriptor(name, label, dir_fd=parent_fd), True
-    except Exception:
-        # Do not remove the entry here: if a concurrent actor replaced it after
-        # mkdir, a path-based cleanup could delete that actor's directory.
-        raise
+        return _open_directory_descriptor(name, label, dir_fd=parent_fd), False, None
 
 
 def _published_identity(
@@ -1733,73 +1782,143 @@ def _published_identity(
     return os.dup(parent_fd), name, device, inode, is_directory
 
 
+def _remove_identity_bound_empty_directory(
+    parent_fd: int,
+    name: str,
+    identity: tuple[int, int],
+) -> bool:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(current.st_mode) or not _same_identity(current, identity):
+        return False
+    try:
+        _native_unlink_at(
+            parent_fd,
+            name,
+            is_directory=True,
+            expected_identity=identity,
+        )
+    except (OSError, ScaffoldError):
+        return False
+    return True
+
+
+def _remove_unrecorded_directory(parent_fd: int, name: str) -> bool:
+    try:
+        current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(current.st_mode):
+        return False
+    return _remove_identity_bound_empty_directory(
+        parent_fd,
+        name,
+        (current.st_dev, current.st_ino),
+    )
+
+
+def _bind_created_directory(
+    parent_fd: int,
+    name: str,
+    label: str,
+    reservation_parent_fd: int,
+) -> tuple[int, PublishedEntry]:
+    descriptor: int | None = None
+    reservation: PublishedEntry | None = None
+    try:
+        descriptor = _open_directory_descriptor(
+            name,
+            label,
+            dir_fd=parent_fd,
+            collision=True,
+        )
+        identity = _descriptor_identity(descriptor, label, is_directory=True)
+        reservation = (reservation_parent_fd, name, identity[0], identity[1], True)
+        observed = _published_identity(
+            parent_fd,
+            name,
+            is_directory=True,
+            entry_fd=descriptor,
+        )
+        _close_published([observed])
+        return descriptor, reservation
+    except BaseException:
+        if descriptor is not None and reservation is None:
+            try:
+                identity = os.fstat(descriptor)
+            except OSError:
+                identity = None
+            if identity is not None and stat.S_ISDIR(identity.st_mode):
+                reservation = (
+                    reservation_parent_fd,
+                    name,
+                    identity.st_dev,
+                    identity.st_ino,
+                    True,
+                )
+        if descriptor is not None:
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+        if reservation is not None:
+            _remove_identity_bound_empty_directory(
+                parent_fd,
+                name,
+                (reservation[2], reservation[3]),
+            )
+        else:
+            _remove_unrecorded_directory(parent_fd, name)
+        try:
+            os.close(reservation_parent_fd)
+        except OSError:
+            pass
+        raise
+
+
+def _create_new_directory_with_reservation(
+    parent_fd: int,
+    name: str,
+    label: str,
+    *,
+    mode: int,
+) -> tuple[int, bool, PublishedEntry]:
+    reservation_parent_fd = os.dup(parent_fd)
+    try:
+        os.mkdir(name, mode=mode, dir_fd=parent_fd)
+    except BaseException:
+        try:
+            os.close(reservation_parent_fd)
+        except OSError:
+            pass
+        raise
+    descriptor, reservation = _bind_created_directory(
+        parent_fd,
+        name,
+        label,
+        reservation_parent_fd,
+    )
+    return descriptor, True, reservation
+
+
 def _create_staging_directory(parent_fd: int, prefix: str) -> tuple[str, int, PublishedEntry]:
     """Create a private staging directory relative to an already-open parent."""
 
     candidates = tempfile._get_candidate_names()
     for _ in range(100):
         name = f"{prefix}{next(candidates)}"
-        reservation_parent_fd = os.dup(parent_fd)
         try:
-            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
-        except FileExistsError:
-            os.close(reservation_parent_fd)
-            continue
-        except BaseException:
-            os.close(reservation_parent_fd)
-            raise
-
-        descriptor: int | None = None
-        reservation: PublishedEntry = (reservation_parent_fd, name, None, None, True)
-        try:
-            initial = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-            if not stat.S_ISDIR(initial.st_mode):
-                raise CollisionError(f"staging directory is not a directory: {name}")
-            reservation = (
-                reservation_parent_fd,
-                name,
-                initial.st_dev,
-                initial.st_ino,
-                True,
-            )
-            descriptor = _open_directory_descriptor(
-                name,
-                "staging directory",
-                dir_fd=parent_fd,
-                collision=True,
-            )
-            if _descriptor_identity(
-                descriptor,
-                f"staging directory {name}",
-                is_directory=True,
-            ) != (reservation[2], reservation[3]):
-                raise CollisionError(f"staging directory changed during reservation: {name}")
-            observed = _published_identity(
+            descriptor, _, reservation = _create_new_directory_with_reservation(
                 parent_fd,
                 name,
-                is_directory=True,
-                entry_fd=descriptor,
+                "staging directory",
+                mode=0o700,
             )
-            _close_published([observed])
-            return name, descriptor, reservation
-        except Exception:
-            if descriptor is not None:
-                try:
-                    os.close(descriptor)
-                except OSError:
-                    pass
-            if reservation[2] is not None and reservation[3] is not None:
-                _remove_reserved_target(
-                    reservation[0],
-                    reservation[1],
-                    (reservation[2], reservation[3]),
-                )
-            else:
-                try:
-                    os.close(reservation[0])
-                except OSError:
-                    pass
-            raise
+        except FileExistsError:
+            continue
+        return name, descriptor, reservation
     raise ScaffoldError("could not reserve a unique staging directory")
 
 
@@ -1879,8 +1998,26 @@ def _atomic_rename_noreplace(
     raise OSError(error_number, os.strerror(error_number), old_name, new_name)
 
 
-def _native_unlink_at(parent_fd: int, name: str, *, is_directory: bool) -> None:
+def _native_unlink_at(
+    parent_fd: int,
+    name: str,
+    *,
+    is_directory: bool,
+    expected_identity: tuple[int, int] | None = None,
+) -> None:
     """Remove an entry relative to a held directory descriptor."""
+
+    if expected_identity is not None:
+        try:
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError as exc:
+            raise CollisionError(f"entry changed during cleanup: {name}") from exc
+        if (current.st_dev, current.st_ino) != expected_identity:
+            raise CollisionError(f"entry changed during cleanup: {name}")
+        if is_directory and not stat.S_ISDIR(current.st_mode):
+            raise CollisionError(f"entry is not a directory during cleanup: {name}")
+        if not is_directory and not stat.S_ISREG(current.st_mode):
+            raise CollisionError(f"entry is not a regular file during cleanup: {name}")
 
     try:
         libc = ctypes.CDLL(None, use_errno=True)
@@ -1917,15 +2054,19 @@ def _create_private_directory(parent_fd: int) -> tuple[str, int]:
     for _ in range(100):
         name = _unique_private_name(parent_fd, ".verify-dispose-")
         try:
-            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+            descriptor, _, reservation = _create_new_directory_with_reservation(
+                parent_fd,
+                name,
+                "private cleanup directory",
+                mode=0o700,
+            )
         except FileExistsError:
             continue
-        return name, _open_directory_descriptor(
-            name,
-            "private cleanup directory",
-            dir_fd=parent_fd,
-            collision=True,
-        )
+        try:
+            os.close(reservation[0])
+        except OSError:
+            pass
+        return name, descriptor
     raise ScaffoldError("could not reserve a private cleanup directory")
 
 
@@ -1936,13 +2077,17 @@ def _restore_quarantined_entry(parent_fd: int, public_name: str, private_name: s
         os.stat(private_name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
         return
+    except (OSError, ScaffoldError):
+        return
     try:
         os.stat(public_name, dir_fd=parent_fd, follow_symlinks=False)
     except FileNotFoundError:
         try:
             _atomic_rename_noreplace(parent_fd, private_name, parent_fd, public_name)
-        except FileExistsError:
+        except (OSError, ScaffoldError):
             pass
+    except (OSError, ScaffoldError):
+        pass
 
 
 def _move_owned_entry_to_quarantine(
@@ -1991,7 +2136,8 @@ def _delete_quarantined_entry(
     delete_name: str | None = None
     quarantine_name: str | None = None
     quarantine_fd: int | None = None
-    quarantine_entry_name: str | None = "entry"
+    quarantine_entry_name: str | None = None
+    quarantine_identity: tuple[int, int] | None = None
     try:
         current = os.stat(private_name, dir_fd=parent_fd, follow_symlinks=False)
         if not _same_identity(current, (device, inode)):
@@ -2002,6 +2148,14 @@ def _delete_quarantined_entry(
         if not _same_identity(claimed, (device, inode)):
             raise CollisionError(f"private cleanup entry changed: {private_name}")
         quarantine_name, quarantine_fd = _create_private_directory(parent_fd)
+        quarantine_stat = os.fstat(quarantine_fd)
+        if not stat.S_ISDIR(quarantine_stat.st_mode):
+            raise CollisionError(f"private cleanup directory changed: {quarantine_name}")
+        quarantine_identity = (quarantine_stat.st_dev, quarantine_stat.st_ino)
+        quarantine_entry_name = _unique_private_name(
+            quarantine_fd,
+            ".verify-entry-",
+        )
         _atomic_rename_noreplace(
             parent_fd,
             delete_name,
@@ -2019,11 +2173,19 @@ def _delete_quarantined_entry(
             quarantine_fd,
             quarantine_entry_name,
             is_directory=is_directory,
+            expected_identity=(device, inode),
         )
         quarantine_entry_name = None
         os.close(quarantine_fd)
         quarantine_fd = None
-        _native_unlink_at(parent_fd, quarantine_name, is_directory=True)
+        if quarantine_identity is None:
+            raise CollisionError(f"private cleanup directory identity is unavailable: {quarantine_name}")
+        _native_unlink_at(
+            parent_fd,
+            quarantine_name,
+            is_directory=True,
+            expected_identity=quarantine_identity,
+        )
         quarantine_name = None
         try:
             os.stat(public_name, dir_fd=parent_fd, follow_symlinks=False)
@@ -2042,21 +2204,30 @@ def _delete_quarantined_entry(
                 pass
             else:
                 if delete_name is None:
-                    delete_name = _unique_private_name(parent_fd)
-                try:
-                    _atomic_rename_noreplace(
-                        quarantine_fd,
-                        quarantine_entry_name,
-                        parent_fd,
-                        delete_name,
-                    )
-                except (OSError, ScaffoldError):
-                    pass
+                    try:
+                        delete_name = _unique_private_name(parent_fd)
+                    except (OSError, ScaffoldError):
+                        delete_name = None
+                if delete_name is not None:
+                    try:
+                        _atomic_rename_noreplace(
+                            quarantine_fd,
+                            quarantine_entry_name,
+                            parent_fd,
+                            delete_name,
+                        )
+                    except (OSError, ScaffoldError):
+                        pass
         if delete_name is not None:
             _restore_quarantined_entry(parent_fd, public_name, delete_name)
-        if quarantine_name is not None:
+        if quarantine_name is not None and quarantine_identity is not None:
             try:
-                _native_unlink_at(parent_fd, quarantine_name, is_directory=True)
+                _native_unlink_at(
+                    parent_fd,
+                    quarantine_name,
+                    is_directory=True,
+                    expected_identity=quarantine_identity,
+                )
             except (OSError, ScaffoldError):
                 pass
         if quarantine_fd is not None:
@@ -2368,63 +2539,22 @@ def _publish_entry_no_replace(
         child_fd: int | None = None
         child_reservation: PublishedEntry | None = None
         try:
-            reservation_parent_fd = os.dup(destination_dir_fd)
-        except BaseException:
-            os.close(source_descriptor)
-            raise
-        try:
-            os.mkdir(destination_name, dir_fd=destination_dir_fd)
+            child_fd, _, child_reservation = _create_new_directory_with_reservation(
+                destination_dir_fd,
+                destination_name,
+                "published directory",
+                mode=0o777,
+            )
         except FileExistsError as exc:
-            os.close(reservation_parent_fd)
             os.close(source_descriptor)
             raise CollisionError(f"target changed during publication: {destination}") from exc
         except BaseException:
-            os.close(reservation_parent_fd)
             os.close(source_descriptor)
             raise
-        try:
-            initial = os.stat(destination_name, dir_fd=destination_dir_fd, follow_symlinks=False)
-            if not stat.S_ISDIR(initial.st_mode):
-                raise CollisionError(f"published entry is not a directory: {destination}")
-            child_reservation = (
-                reservation_parent_fd,
-                destination_name,
-                initial.st_dev,
-                initial.st_ino,
-                True,
-            )
-            published.append(child_reservation)
-            child_fd = _open_directory_descriptor(
-                destination_name,
-                "published directory",
-                dir_fd=destination_dir_fd,
-                collision=True,
-            )
-            if _descriptor_identity(
-                child_fd,
-                f"published directory {destination_name}",
-                is_directory=True,
-            ) != (child_reservation[2], child_reservation[3]):
-                raise CollisionError(f"target changed during publication: {destination}")
-            observed = _published_identity(
-                destination_dir_fd,
-                destination_name,
-                is_directory=True,
-                entry_fd=child_fd,
-            )
-            _close_published([observed])
-        except Exception:
-            if child_fd is not None:
-                try:
-                    os.close(child_fd)
-                except OSError:
-                    pass
-            _rollback_published(published)
-            try:
-                os.close(source_descriptor)
-            except OSError:
-                pass
-            raise
+        if child_fd is None or child_reservation is None:
+            os.close(source_descriptor)
+            raise ScaffoldError(f"published directory reservation is unavailable: {destination}")
+        published.append(child_reservation)
         try:
             with os.scandir(source_descriptor) as entries:
                 child_names = sorted(entry.name for entry in entries)
@@ -2595,34 +2725,24 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
     target_identity: tuple[int, int] | None = None
     try:
         project_fd = _open_directory_descriptor(project_root, "project root")
-        parent_fd, parent_created = _open_or_create_directory(
+        parent_fd, parent_created, parent_reservation = _open_or_create_directory(
             project_fd,
             ".agents",
             "output parent .agents",
         )
         if parent_created:
-            created_parent_entries.append(
-                _published_identity(
-                    project_fd,
-                    ".agents",
-                    is_directory=True,
-                    entry_fd=parent_fd,
-                )
-            )
-        skills_parent_fd, skills_parent_created = _open_or_create_directory(
+            if parent_reservation is None:
+                raise ScaffoldError("output parent reservation is unavailable")
+            created_parent_entries.append(parent_reservation)
+        skills_parent_fd, skills_parent_created, skills_parent_reservation = _open_or_create_directory(
             parent_fd,
             "skills",
             "output parent .agents/skills",
         )
         if skills_parent_created:
-            created_parent_entries.append(
-                _published_identity(
-                    parent_fd,
-                    "skills",
-                    is_directory=True,
-                    entry_fd=skills_parent_fd,
-                )
-            )
+            if skills_parent_reservation is None:
+                raise ScaffoldError("output parent reservation is unavailable")
+            created_parent_entries.append(skills_parent_reservation)
         _assert_path_matches_descriptor(skills_parent, skills_parent_fd, "output parent")
         staging_name, staging_fd, staging_reservation = _create_staging_directory(
             skills_parent_fd,
@@ -2630,7 +2750,7 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
         )
         staging = skills_parent / staging_name
         _assert_path_matches_descriptor(staging, staging_fd, "staging directory")
-        _write_tree(spec, staging)
+        _write_tree(spec, staging, root_fd=staging_fd)
         _assert_path_matches_descriptor(skills_parent, skills_parent_fd, "output parent")
         _assert_path_matches_descriptor(staging, staging_fd, "staging directory")
         errors = validate_generated_skill(
@@ -2643,56 +2763,21 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
 
         # Reserve the final directory with an exclusive mkdir. Unlike rename,
         # this cannot replace a target that appeared after the initial check.
-        reservation_parent_fd: int | None = None
         try:
             if skills_parent_fd is None:
                 raise ScaffoldError("output parent descriptor is unavailable")
-            reservation_parent_fd = os.dup(skills_parent_fd)
-            os.mkdir(target.name, dir_fd=skills_parent_fd)
+            target_fd, _, target_reservation = _create_new_directory_with_reservation(
+                skills_parent_fd,
+                target.name,
+                "reserved target",
+                mode=0o777,
+            )
         except FileExistsError as exc:
-            if reservation_parent_fd is not None:
-                os.close(reservation_parent_fd)
             raise CollisionError(f"output appeared during generation: {target}") from exc
-        except BaseException:
-            if reservation_parent_fd is not None:
-                os.close(reservation_parent_fd)
-            raise
+        if target_reservation is None or target_fd is None:
+            raise ScaffoldError("reserved target reservation is unavailable")
         target_reserved = True
-        target_reservation = (reservation_parent_fd, target.name, None, None, True)
-        initial_target = os.stat(
-            target.name,
-            dir_fd=skills_parent_fd,
-            follow_symlinks=False,
-        )
-        if not stat.S_ISDIR(initial_target.st_mode):
-            raise CollisionError(f"reserved target is not a directory: {target}")
-        target_reservation = (
-            reservation_parent_fd,
-            target.name,
-            initial_target.st_dev,
-            initial_target.st_ino,
-            True,
-        )
-        target_identity = (initial_target.st_dev, initial_target.st_ino)
-        target_fd = _open_directory_descriptor(
-            target.name,
-            "reserved target",
-            dir_fd=skills_parent_fd,
-            collision=True,
-        )
-        if _descriptor_identity(
-            target_fd,
-            "reserved target",
-            is_directory=True,
-        ) != target_identity:
-            raise CollisionError(f"target changed during reservation: {target}")
-        observed_target = _published_identity(
-            skills_parent_fd,
-            target.name,
-            is_directory=True,
-            entry_fd=target_fd,
-        )
-        _close_published([observed_target])
+        target_identity = (target_reservation[2], target_reservation[3])
         _assert_reserved_target_identity(
             skills_parent_fd,
             target.name,

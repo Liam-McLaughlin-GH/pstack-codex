@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import errno
 import os
 import re
 import shutil
@@ -791,6 +792,49 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
             self.assertFalse((detached / "README.md").exists())
             self.assertFalse((target / "SKILL.md").exists())
 
+    def test_published_child_identity_failure_removes_empty_child(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-child-identity-") as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            copy_fixture(project)
+            target = project / ".agents" / "skills" / "verify-tiny-fixture"
+            original_identity = scaffold_module._published_identity
+            feature_calls = 0
+            injected = False
+
+            def fail_child_identity(
+                parent_fd: int,
+                name: str,
+                *,
+                is_directory: bool,
+                entry_fd: int | None = None,
+            ) -> scaffold_module.PublishedEntry:
+                nonlocal feature_calls, injected
+                if name == "features" and is_directory:
+                    feature_calls += 1
+                    if feature_calls == 2:
+                        injected = True
+                        raise ScaffoldError("forced child identity failure")
+                return original_identity(
+                    parent_fd,
+                    name,
+                    is_directory=is_directory,
+                    entry_fd=entry_fd,
+                )
+
+            with mock.patch.object(
+                scaffold_module,
+                "_published_identity",
+                side_effect=fail_child_identity,
+            ):
+                with self.assertRaises(ScaffoldError):
+                    scaffold_module.scaffold(spec_for(), project)
+
+            self.assertTrue(injected)
+            self.assertFalse(target.exists())
+            self.assertFalse((project / ".agents").exists())
+
     def test_rollback_refuses_a_replaced_staging_directory(self) -> None:
         with tempfile.TemporaryDirectory(prefix="create-verification-staging-rollback-") as temporary:
             root = Path(temporary)
@@ -801,9 +845,14 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
             replacement: Path | None = None
             original_write = scaffold_module._write_tree
 
-            def race_write(current_spec: dict[str, object], staging: Path) -> None:
+            def race_write(
+                current_spec: dict[str, object],
+                staging: Path,
+                *,
+                root_fd: int,
+            ) -> None:
                 nonlocal replacement
-                original_write(current_spec, staging)
+                original_write(current_spec, staging, root_fd=root_fd)
                 staging.rename(detached)
                 staging.mkdir()
                 (staging / "sentinel.txt").write_text("preserve\n", encoding="utf-8")
@@ -821,6 +870,45 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
             )
             self.assertTrue((detached / "SKILL.md").is_file())
             self.assertFalse((project / ".agents" / "skills" / "verify-tiny-fixture").exists())
+
+    def test_staging_writes_stay_on_bound_descriptor_after_path_swap(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-staging-write-race-") as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            copy_fixture(project)
+            outside = root / "outside"
+            outside.mkdir()
+            detached = root / "detached-staging"
+            original_write = scaffold_module._write_tree
+            swapped = False
+
+            def race_write(
+                current_spec: dict[str, object],
+                staging: Path,
+                *,
+                root_fd: int,
+            ) -> None:
+                nonlocal swapped
+                staging.rename(detached)
+                os.symlink(outside, staging, target_is_directory=True)
+                swapped = True
+                original_write(current_spec, staging, root_fd=root_fd)
+
+            with mock.patch.object(scaffold_module, "_write_tree", side_effect=race_write):
+                with self.assertRaises(ScaffoldError):
+                    scaffold_module.scaffold(spec_for(), project)
+
+            self.assertTrue(swapped)
+            self.assertTrue((detached / "SKILL.md").is_file())
+            self.assertTrue((detached / "features" / "README.md").is_file())
+            self.assertTrue((project / ".agents" / "skills").is_dir())
+            staging_link = next(
+                (project / ".agents" / "skills").glob(".verify-tiny-fixture.staging-*")
+            )
+            self.assertTrue(staging_link.is_symlink())
+            self.assertFalse((outside / "SKILL.md").exists())
+            self.assertFalse((outside / "features").exists())
 
     def test_staging_creation_stays_on_open_parent_when_parent_is_replaced_or_symlinked(self) -> None:
         for kind in ("replacement", "symlink"):
@@ -928,6 +1016,139 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
                     self.assertTrue(staging_detached.is_dir())
                 else:
                     self.assertFalse((project / ".agents").exists())
+
+    def test_new_parent_descriptor_failure_preserves_competitor(self) -> None:
+        for component in ("agents", "skills"):
+            with self.subTest(component=component), tempfile.TemporaryDirectory(
+                prefix=f"create-verification-parent-descriptor-{component}-"
+            ) as temporary:
+                root = Path(temporary)
+                project = root / "project"
+                project.mkdir()
+                copy_fixture(project)
+                detached = root / f"detached-{component}"
+                injected = False
+                attempts = 0
+                original_open = scaffold_module._open_directory_descriptor
+                failing_label = (
+                    "output parent .agents"
+                    if component == "agents"
+                    else "output parent .agents/skills"
+                )
+
+                def fail_parent_descriptor(
+                    name: Path | str,
+                    label: str,
+                    *,
+                    dir_fd: int | None = None,
+                    collision: bool = False,
+                ) -> int:
+                    nonlocal attempts, injected
+                    if label == failing_label:
+                        attempts += 1
+                    if label == failing_label and attempts == 2:
+                        injected = True
+                        entry = project / ".agents"
+                        if component == "skills":
+                            entry = entry / "skills"
+                        entry.rename(detached)
+                        entry.mkdir()
+                        (entry / "sentinel.txt").write_text("preserve\n", encoding="utf-8")
+                        raise ScaffoldError("forced parent descriptor failure")
+                    return original_open(name, label, dir_fd=dir_fd, collision=collision)
+
+                with mock.patch.object(
+                    scaffold_module,
+                    "_open_directory_descriptor",
+                    side_effect=fail_parent_descriptor,
+                ):
+                    with self.assertRaises(ScaffoldError):
+                        scaffold_module.scaffold(spec_for(), project)
+
+                self.assertTrue(injected)
+                entry = project / ".agents"
+                if component == "skills":
+                    entry = entry / "skills"
+                self.assertEqual((entry / "sentinel.txt").read_text(encoding="utf-8"), "preserve\n")
+                self.assertTrue(detached.is_dir())
+                self.assertFalse((entry / "verify-tiny-fixture").exists())
+
+    def test_new_parent_identity_failure_removes_owned_parents(self) -> None:
+        for component in ("agents", "skills"):
+            with self.subTest(component=component), tempfile.TemporaryDirectory(
+                prefix=f"create-verification-parent-identity-{component}-"
+            ) as temporary:
+                root = Path(temporary)
+                project = root / "project"
+                project.mkdir()
+                copy_fixture(project)
+                injected = False
+                original_identity = scaffold_module._published_identity
+
+                def fail_parent_identity(
+                    parent_fd: int,
+                    name: str,
+                    *,
+                    is_directory: bool,
+                    entry_fd: int | None = None,
+                ) -> scaffold_module.PublishedEntry:
+                    nonlocal injected
+                    if name == (".agents" if component == "agents" else "skills") and not injected:
+                        injected = True
+                        raise ScaffoldError("forced parent identity failure")
+                    return original_identity(
+                        parent_fd,
+                        name,
+                        is_directory=is_directory,
+                        entry_fd=entry_fd,
+                    )
+
+                with mock.patch.object(
+                    scaffold_module,
+                    "_published_identity",
+                    side_effect=fail_parent_identity,
+                ):
+                    with self.assertRaises(ScaffoldError):
+                        scaffold_module.scaffold(spec_for(), project)
+
+                self.assertTrue(injected)
+                self.assertFalse((project / ".agents").exists())
+
+    def test_initial_directory_identity_failure_removes_owned_entry(self) -> None:
+        for phase in ("staging", "target"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory(
+                prefix=f"create-verification-initial-identity-{phase}-"
+            ) as temporary:
+                root = Path(temporary)
+                project = root / "project"
+                project.mkdir()
+                copy_fixture(project)
+                injected = False
+                original_stat = os.stat
+
+                def fail_initial_stat(
+                    path: str | os.PathLike[str],
+                    *args: object,
+                    **kwargs: object,
+                ) -> os.stat_result:
+                    nonlocal injected
+                    value = os.fspath(path)
+                    matches = (
+                        phase == "target" and value == "verify-tiny-fixture"
+                    ) or (
+                        phase == "staging" and value.startswith(".verify-tiny-fixture.staging-")
+                    )
+                    if kwargs.get("dir_fd") is not None and matches and not injected:
+                        injected = True
+                        raise OSError(errno.EIO, "forced identity capture failure")
+                    return original_stat(path, *args, **kwargs)
+
+                with mock.patch.object(scaffold_module.os, "stat", side_effect=fail_initial_stat):
+                    with self.assertRaises(ScaffoldError):
+                        scaffold_module.scaffold(spec_for(), project)
+
+                self.assertTrue(injected)
+                self.assertFalse((project / ".agents").exists())
 
     def test_reserved_target_descriptor_failure_cleans_own_reservation_and_preserves_competitor(self) -> None:
         for preserve_competing in (False, True):
@@ -1161,6 +1382,187 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
                     self.assertEqual(detached.read_text(encoding="utf-8"), "owned\n")
                 else:
                     self.assertTrue(detached.is_dir())
+
+    def test_quarantine_identity_recheck_preserves_replacement(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-quarantine-race-") as temporary:
+            root = Path(temporary)
+            parent = root / "parent"
+            parent.mkdir()
+            victim = parent / "victim"
+            detached = root / "detached-owned"
+            victim.write_text("owned\n", encoding="utf-8")
+            expected = os.lstat(victim)
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            original_unlink = scaffold_module._native_unlink_at
+            original_create = scaffold_module._create_private_directory
+            quarantine_directory: Path | None = None
+            injected = False
+
+            def capture_quarantine(directory_fd: int) -> tuple[str, int]:
+                nonlocal quarantine_directory
+                name, quarantine_fd = original_create(directory_fd)
+                quarantine_directory = parent / name
+                return name, quarantine_fd
+
+            def replace_quarantine_entry(
+                directory_fd: int,
+                name: str,
+                *,
+                is_directory: bool,
+                expected_identity: tuple[int, int] | None = None,
+            ) -> None:
+                nonlocal injected
+                if expected_identity is not None and not is_directory and not injected:
+                    if quarantine_directory is None:
+                        raise AssertionError("quarantine directory was not captured")
+                    entry = quarantine_directory / name
+                    entry.rename(detached)
+                    entry.write_text("competitor\n", encoding="utf-8")
+                    injected = True
+                original_unlink(
+                    directory_fd,
+                    name,
+                    is_directory=is_directory,
+                    expected_identity=expected_identity,
+                )
+
+            try:
+                with mock.patch.object(
+                    scaffold_module,
+                    "_create_private_directory",
+                    side_effect=capture_quarantine,
+                ):
+                    with mock.patch.object(
+                        scaffold_module,
+                        "_native_unlink_at",
+                        side_effect=replace_quarantine_entry,
+                    ):
+                        with self.assertRaises((ScaffoldError, OSError)):
+                            scaffold_module._remove_owned_entry(
+                                parent_fd,
+                                "victim",
+                                expected.st_dev,
+                                expected.st_ino,
+                                is_directory=False,
+                            )
+            finally:
+                os.close(parent_fd)
+
+            self.assertTrue(injected)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "competitor\n")
+            self.assertEqual(detached.read_text(encoding="utf-8"), "owned\n")
+
+    def test_private_quarantine_descriptor_failure_removes_private_directory(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-quarantine-descriptor-") as temporary:
+            root = Path(temporary)
+            parent = root / "parent"
+            parent.mkdir()
+            victim = parent / "victim"
+            victim.write_text("owned\n", encoding="utf-8")
+            expected = os.lstat(victim)
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            original_open = scaffold_module._open_directory_descriptor
+            injected = False
+
+            def fail_private_descriptor(
+                name: Path | str,
+                label: str,
+                *,
+                dir_fd: int | None = None,
+                collision: bool = False,
+            ) -> int:
+                nonlocal injected
+                if label == "private cleanup directory" and not injected:
+                    injected = True
+                    raise ScaffoldError("forced private descriptor failure")
+                return original_open(name, label, dir_fd=dir_fd, collision=collision)
+
+            try:
+                with mock.patch.object(
+                    scaffold_module,
+                    "_open_directory_descriptor",
+                    side_effect=fail_private_descriptor,
+                ):
+                    with self.assertRaises(ScaffoldError):
+                        scaffold_module._remove_owned_entry(
+                            parent_fd,
+                            "victim",
+                            expected.st_dev,
+                            expected.st_ino,
+                            is_directory=False,
+                        )
+            finally:
+                os.close(parent_fd)
+
+            self.assertTrue(injected)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "owned\n")
+            self.assertEqual(list(parent.glob(".verify-dispose-*")), [])
+
+    def test_cleanup_failure_restores_owned_entry_without_unbounded_residue(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-quarantine-failure-") as temporary:
+            root = Path(temporary)
+            parent = root / "parent"
+            parent.mkdir()
+            victim = parent / "victim"
+            victim.write_text("owned\n", encoding="utf-8")
+            expected = os.lstat(victim)
+            parent_fd = os.open(
+                parent,
+                os.O_RDONLY
+                | getattr(os, "O_DIRECTORY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            original_unlink = scaffold_module._native_unlink_at
+            injected = False
+
+            def fail_owned_unlink(
+                directory_fd: int,
+                name: str,
+                *,
+                is_directory: bool,
+                expected_identity: tuple[int, int] | None = None,
+            ) -> None:
+                nonlocal injected
+                if expected_identity == (expected.st_dev, expected.st_ino) and not is_directory:
+                    injected = True
+                    raise ScaffoldError("forced cleanup failure")
+                original_unlink(
+                    directory_fd,
+                    name,
+                    is_directory=is_directory,
+                    expected_identity=expected_identity,
+                )
+
+            try:
+                with mock.patch.object(
+                    scaffold_module,
+                    "_native_unlink_at",
+                    side_effect=fail_owned_unlink,
+                ):
+                    with self.assertRaises(ScaffoldError):
+                        scaffold_module._remove_owned_entry(
+                            parent_fd,
+                            "victim",
+                            expected.st_dev,
+                            expected.st_ino,
+                            is_directory=False,
+                        )
+            finally:
+                os.close(parent_fd)
+
+            self.assertTrue(injected)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "owned\n")
+            self.assertEqual(list(parent.glob(".verify-dispose-*")), [])
 
     def test_reservation_identity_capture_failure_cleans_only_owned_entry(self) -> None:
         for phase in ("staging", "target"):
@@ -1547,8 +1949,13 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
             target = project / ".agents" / "skills" / "verify-tiny-fixture"
             original_write = scaffold_module._write_tree
 
-            def race_write(current_spec: dict[str, object], staging: Path) -> None:
-                original_write(current_spec, staging)
+            def race_write(
+                current_spec: dict[str, object],
+                staging: Path,
+                *,
+                root_fd: int,
+            ) -> None:
+                original_write(current_spec, staging, root_fd=root_fd)
                 target.mkdir(parents=True)
                 (target / "sentinel").write_text("preserve\n", encoding="utf-8")
 
