@@ -244,7 +244,7 @@ GCLOUD_MUTATION_RE = re.compile(
     + r"[^\n]*?"
     + (
         r"(?<![a-z0-9])(?:add|apply|attach|change|connect|create|cp|delete|destroy|"
-        r"detach|disable|enable|export|import|login|move|modify|mv|patch|remove|"
+        r"detach|disable|enable|export|import|login|move|modify|mv|patch|remove|rsync|"
         r"replace|reset|resize|restore|restart|revoke|rm|rollback|set|start|stop|"
         r"suspend|resume|undelete|unset|update|upgrade)(?:-[a-z0-9-]+)?"
         r"(?![a-z0-9_-])"
@@ -513,7 +513,7 @@ def repositories_for_task(task: str) -> Tuple[str, ...]:
     repositories: List[str] = []
     if legacy_ui_cue:
         repositories.append("web-app")
-        if modern_ui_work or explicit_repository_cue:
+        if modern_ui_work or explicit_repository_cue or showpass_ui_cue:
             repositories.append("showpass-frontend")
     elif backend_cue:
         repositories.append("web-app")
@@ -863,6 +863,13 @@ def _validate_routing_case_records(ledger: Dict[str, Any]) -> List[str]:
                         )
                     if isinstance(repository, str) and repository in EXPECTED_REPOSITORIES:
                         seen_repositories.add(repository)
+                if isinstance(case.get("input"), str):
+                    expected_repositories = repositories_for_task(case["input"])
+                    if tuple(repositories) != expected_repositories:
+                        errors.append(
+                            "%s.repositories does not match the task owners: expected %r, got %r"
+                            % (context, expected_repositories, tuple(repositories))
+                        )
     return errors
 
 

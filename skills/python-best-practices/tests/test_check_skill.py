@@ -215,6 +215,22 @@ class RoutingRegressionTests(unittest.TestCase):
                     ("web-app", "showpass-frontend"),
                 )
 
+    def test_showpass_modern_cues_keep_both_owners_with_nextjs_bridge(self) -> None:
+        for request in (
+            "Fix the Next.js bridge and update the Showpass frontend",
+            "Fix the Next.js bridge and update the Showpass web",
+            "Fix the Next.js bridge and update the Showpass mobile",
+            "Fix the Next.js bridge and update the Showpass desktop",
+            "Fix the Next.js bridge and update the Showpass UI",
+            "Fix the Next.js bridge and update the Showpass client",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "ambiguous")
+                self.assertEqual(
+                    CHECKER.repositories_for_task(request),
+                    ("web-app", "showpass-frontend"),
+                )
+
     def test_showpass_nextjs_bridge_with_modern_ui_work_keeps_both_owners(self) -> None:
         for request in (
             "Fix the Showpass Next.js bridge and update the React component",
@@ -430,7 +446,7 @@ class DocumentIntegrityTests(unittest.TestCase):
             ),
         }
         for field, original in replacements.items():
-            for value in ("", "null", "~", "[]", "{}"):
+            for value in ("", "null", "~", "[]", "{}", "0x10", ".inf", "!!int 1"):
                 with self.subTest(field=field, value=value):
                     candidate = self.skill_text.replace(
                         original,
@@ -443,7 +459,7 @@ class DocumentIntegrityTests(unittest.TestCase):
 
     def test_shared_port_boundary_rejects_non_scalar_required_frontmatter(self) -> None:
         for field in ("name", "description"):
-            for value in ("", "null", "~", "[]", "{}"):
+            for value in ("", "null", "~", "[]", "{}", "0x10", ".inf", "!!int 1"):
                 with self.subTest(field=field, value=value):
                     metadata = f"{field}: {value}\n"
                     errors = PORT_CHECKER.required_frontmatter_errors(metadata)
@@ -569,6 +585,18 @@ class DocumentIntegrityTests(unittest.TestCase):
                 self.assertTrue(errors)
                 self.assertTrue(
                     any(expected_fragment in error for error in errors),
+                    errors,
+                )
+
+    def test_routing_repository_expectations_match_task_owners(self) -> None:
+        for value in ([], ["web-k8s"]):
+            with self.subTest(value=value):
+                candidate = copy.deepcopy(self.ledger)
+                candidate["routing_cases"][7]["repositories"] = value
+                errors = CHECKER.check_documents(self.skill_text, candidate)
+                self.assertTrue(errors)
+                self.assertTrue(
+                    any("does not match the task owners" in error for error in errors),
                     errors,
                 )
 

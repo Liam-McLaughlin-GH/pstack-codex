@@ -10,6 +10,13 @@ NULL_VALUES = {"", "~", "null", "true", "false", "yes", "no", "on", "off"}
 NUMBER_RE = re.compile(
     r"[-+]?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][-+]?[0-9]+)?"
 )
+YAML_BASE_PREFIX_RE = re.compile(
+    r"[-+]?0[xX][0-9a-fA-F]+|[-+]?0[oO][0-7]+|[-+]?0[bB][01]+"
+)
+YAML_SPECIAL_FLOAT_RE = re.compile(r"[-+]?\.(?:inf|nan)", re.IGNORECASE)
+YAML_NON_STRING_TAG_RE = re.compile(
+    r"!!(?:int|float|timestamp|bool)\b", re.IGNORECASE
+)
 
 
 def _without_inline_comment(value: str) -> str:
@@ -65,6 +72,12 @@ def _scalar_value_error(field: str, raw_value: str) -> str | None:
             return f"{field} must be a scalar string, not a boolean"
         return f"{field} must be a non-null scalar string"
     if NUMBER_RE.fullmatch(value):
+        return f"{field} must be a scalar string, not a number"
+    if (
+        YAML_BASE_PREFIX_RE.fullmatch(value)
+        or YAML_SPECIAL_FLOAT_RE.fullmatch(value)
+        or YAML_NON_STRING_TAG_RE.match(value)
+    ):
         return f"{field} must be a scalar string, not a number"
     if value.startswith(("|", ">", "&", "*")):
         return f"{field} must be a non-empty scalar string"
