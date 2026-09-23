@@ -98,6 +98,20 @@ class CodexAgentRoleTests(unittest.TestCase):
             after = sorted(path.relative_to(project).as_posix() for path in project.rglob("*"))
             self.assertEqual(before, after)
 
+    def test_comment_sicko_tampering_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="codex-role-tampered-") as temporary:
+            project = Path(temporary)
+            shutil.copytree(ROLE_ROOT, project / ".codex")
+            role_path = project / ".codex" / "agents" / "comment-sicko.toml"
+            role_path.write_text(
+                role_path.read_text(encoding="utf-8")
+                .replace('sandbox_mode = "read-only"', 'sandbox_mode = "workspace-write"')
+                .replace("Do not write application code.", "Write application code."),
+                encoding="utf-8",
+            )
+            with self.assertRaises(adapter.AdapterError):
+                adapter.load_explicit_roles(project)
+
     def test_unknown_role_is_explicit_and_does_not_select_generic_worker(self) -> None:
         with tempfile.TemporaryDirectory(prefix="codex-role-unknown-") as temporary:
             project = Path(temporary)
@@ -115,11 +129,13 @@ class CodexAgentRoleTests(unittest.TestCase):
                 "Touched files: fixture.py",
                 "Deletion count: 2",
                 "MUST KILL: fixture.py:4 unnecessary narration",
+                "MUST KILL: fixture.py:9 commented-out branch",
                 "Skips: fixture.py:1 license header",
             ]
         )
         sections = adapter.validate_comment_sicko_report(report)
         self.assertEqual(sections["Deletion count:"], "2")
+        self.assertIn("fixture.py:9 commented-out branch", sections["MUST KILL:"])
         self.assertEqual(sections["Skips:"], "fixture.py:1 license header")
 
         with self.assertRaises(adapter.ReportContractError):

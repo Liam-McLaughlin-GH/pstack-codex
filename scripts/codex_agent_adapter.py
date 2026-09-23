@@ -22,6 +22,12 @@ COMMENT_SICKO_REPORT_FIELDS = (
     "MUST KILL:",
     "Skips:",
 )
+COMMENT_SICKO_REQUIRED_INSTRUCTIONS = (
+    f"Your first output must be exactly this single line:\n{COMMENT_SICKO_FIRST_OUTPUT}",
+    "Do not write application code.",
+    *COMMENT_SICKO_REPORT_FIELDS,
+)
+VALID_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
 DIRECT_SKILL_FALLBACKS = {
     "poteto-agent": "poteto-mode",
     "Comment Sicko": "no-comments",
@@ -97,13 +103,32 @@ def parse_role_file(path: Path) -> RoleDefinition:
         for key, value in raw.items()
         if key not in {"name", "description", "developer_instructions"}
     }
-    return RoleDefinition(
+    role = RoleDefinition(
         path=path.resolve(),
         name=name,
         description=description,
         developer_instructions=developer_instructions,
         settings=settings,
     )
+    sandbox_mode = role.settings.get("sandbox_mode")
+    if sandbox_mode is not None and sandbox_mode not in VALID_SANDBOX_MODES:
+        raise AdapterError(
+            f"{path}: sandbox_mode must be one of {', '.join(sorted(VALID_SANDBOX_MODES))}"
+        )
+    if role.name == "Comment Sicko":
+        if sandbox_mode != "read-only":
+            raise AdapterError(f"{path}: Comment Sicko requires sandbox_mode = 'read-only'")
+        missing = [
+            required
+            for required in COMMENT_SICKO_REQUIRED_INSTRUCTIONS
+            if required not in role.developer_instructions
+        ]
+        if missing:
+            raise AdapterError(
+                f"{path}: Comment Sicko is missing required report-only instructions: "
+                + "; ".join(missing)
+            )
+    return role
 
 
 def _load_toml_table(path: Path) -> dict[str, Any]:
@@ -326,9 +351,13 @@ def validate_comment_sicko_report(output: str) -> dict[str, str]:
     for line in lines[1:]:
         for field in COMMENT_SICKO_REPORT_FIELDS:
             if line.startswith(field):
-                if field in sections:
+                if field in sections and field != "MUST KILL:":
                     raise ReportContractError(f"Comment Sicko report repeats {field!r}")
-                sections[field] = line[len(field) :].strip()
+                value = line[len(field) :].strip()
+                if field == "MUST KILL:" and field in sections:
+                    sections[field] = f"{sections[field]}\n{value}"
+                else:
+                    sections[field] = value
                 break
     missing = [field for field in COMMENT_SICKO_REPORT_FIELDS if field not in sections]
     if missing:
