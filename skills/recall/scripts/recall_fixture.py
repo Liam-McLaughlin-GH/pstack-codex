@@ -727,13 +727,22 @@ def extract_text_field(line: str) -> tuple[str, str] | None:
 
 
 def iter_text_lines(text: str) -> Iterable[str]:
-    in_fence = False
+    fence_character: str | None = None
+    fence_length = 0
     for line in text.splitlines():
         stripped = line.lstrip()
-        if stripped.startswith("```") or stripped.startswith("~~~"):
-            in_fence = not in_fence
-            continue
-        if not in_fence:
+        if stripped and stripped[0] in {"`", "~"}:
+            character = stripped[0]
+            delimiter_length = len(stripped) - len(stripped.lstrip(character))
+            if delimiter_length >= 3:
+                if fence_character is None:
+                    fence_character = character
+                    fence_length = delimiter_length
+                elif character == fence_character and delimiter_length >= fence_length:
+                    fence_character = None
+                    fence_length = 0
+                continue
+        if fence_character is None:
             yield line
 
 

@@ -676,6 +676,50 @@ Status: [open PR #93]
             self.assertIn("ChatGPT/general conversation history is unavailable", result.stdout)
             self.assertNotIn("[open PR #93]", result.stdout)
 
+    def test_fence_closer_must_match_opening_character(self) -> None:
+        cases = (
+            (
+                "backtick opener ignores tilde closer",
+                """```text
+hidden before mismatch
+~~~
+hidden after mismatch
+```
+visible after close
+""",
+            ),
+            (
+                "tilde opener ignores backtick closer",
+                """~~~text
+hidden before mismatch
+```
+hidden after mismatch
+~~~
+visible after close
+""",
+            ),
+        )
+        for name, text in cases:
+            with self.subTest(name=name):
+                self.assertEqual(
+                    list(RECALL_FIXTURE.iter_text_lines(text)),
+                    ["visible after close"],
+                )
+
+    def test_fence_closer_must_be_at_least_as_long_as_opener(self) -> None:
+        text = """````text
+hidden before short closer
+```
+hidden after short closer
+````
+visible after close
+"""
+
+        self.assertEqual(
+            list(RECALL_FIXTURE.iter_text_lines(text)),
+            ["visible after close"],
+        )
+
     def test_rejects_unsafe_topic_and_workspace_identifiers(self) -> None:
         cases = (
             ("--topic", "payments\u2028inject", "payments"),
