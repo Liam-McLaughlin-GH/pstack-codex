@@ -78,8 +78,36 @@ class RoutingRegressionTests(unittest.TestCase):
             "packages/mobile",
             "packages/desktop",
         ):
-            for suffix in ("-extra", "_extra"):
+            for suffix in ("-extra", "_extra", ".extra"):
                 request = f"Change {token}{suffix}"
+                with self.subTest(request=request):
+                    self.assertEqual(CHECKER.route_for_task(request), "general")
+                    self.assertEqual(CHECKER.repositories_for_task(request), ())
+
+    def test_backend_and_infrastructure_word_cues_require_a_real_boundary(self) -> None:
+        for request in (
+            "Change django-extra",
+            "Review the Showpass backend-extra",
+            "Review a fabricated operation in beta",
+            "Review a fabrication operation in beta",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "general")
+                self.assertEqual(CHECKER.repositories_for_task(request), ())
+
+    def test_showpass_framework_file_suffixes_do_not_claim_frontend_ownership(self) -> None:
+        for request in (
+            "Change a Showpass Next.jsx component",
+            "Change a Showpass React.jsx component",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "general")
+                self.assertEqual(CHECKER.repositories_for_task(request), ())
+
+    def test_frontend_package_file_suffixes_do_not_claim_frontend_ownership(self) -> None:
+        for package in ("core", "next-app", "mobile", "desktop"):
+            for suffix in (".ts", ".extra"):
+                request = f"Change packages/{package}{suffix}"
                 with self.subTest(request=request):
                     self.assertEqual(CHECKER.route_for_task(request), "general")
                     self.assertEqual(CHECKER.repositories_for_task(request), ())

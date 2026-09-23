@@ -47,11 +47,24 @@ REGISTERED_REPOSITORY_TOKENS = (
 )
 
 
+REAL_TOKEN_BOUNDARY_CHARS = "a-z0-9_.-"
+
+
+def _real_token_expression(expression: str) -> str:
+    """Require a cue to be separated from letters, digits, dots, or hyphens."""
+
+    return r"(?<![%s])(?:%s)(?![%s])" % (
+        REAL_TOKEN_BOUNDARY_CHARS,
+        expression,
+        REAL_TOKEN_BOUNDARY_CHARS,
+    )
+
+
 def _real_token_pattern(*tokens: str) -> str:
-    """Build alternatives that cannot match a hyphenated or underscored suffix."""
+    """Build exact cue alternatives under the shared real-token policy."""
 
     return "|".join(
-        r"(?<![a-z0-9_-])%s(?![a-z0-9_-])" % re.escape(token)
+        _real_token_expression(re.escape(token))
         for token in tokens
     )
 
@@ -67,19 +80,41 @@ FRONTEND_BOUNDARY_UNSUPPORTED = (
     "owns React, Next.js, and React Native surfaces",
     "Do not apply Django or deployment rules",
 )
-FAB_LIST_RE = re.compile(r"\bfab\s+--list(?:\s|$)")
-FABRIC3_RE = re.compile(r"\bfabric\s*3\b")
+FAB_CUE_RE = re.compile(_real_token_pattern("fab", "fabric"))
+FAB_LIST_RE = re.compile(
+    _real_token_pattern("fab") + r"\s+--list(?:\s|$)"
+)
+FABRIC3_RE = re.compile(
+    _real_token_expression(r"fabric\s*3")
+)
 FAB_ENVIRONMENT_RE = re.compile(
-    r"\bfab\s+(?:demo|beta|live|prod|production)\b"
+    _real_token_expression(r"fab\s+(?:demo|beta|live|prod|production)")
+)
+FABRIC_ENVIRONMENT_CUES = _real_token_pattern(
+    "environment",
+    "cluster",
+    "beta",
+    "demo",
+    "live",
+    "prod",
+    "production",
+    "staging",
 )
 FABRIC_ENVIRONMENT_OPERATION_RE = re.compile(
-    r"(?:\b(?:fabric|fab)(?:\s*3)?\b[^\n]*\b(?:environment|cluster|"
-    r"beta|demo|live|prod|production|staging)\b|"
-    r"\b(?:environment|cluster|beta|demo|live|prod|production|staging)\b"
-    r"[^\n]*\b(?:fabric|fab)(?:\s*3)?\b)"
+    r"(?:"
+    + _real_token_expression(r"(?:fabric|fab)(?:\s*3)?")
+    + r"[^\n]*"
+    + r"(?:" + FABRIC_ENVIRONMENT_CUES + r")"
+    + r"|"
+    + r"(?:" + FABRIC_ENVIRONMENT_CUES + r")"
+    + r"[^\n]*"
+    + _real_token_expression(r"(?:fabric|fab)(?:\s*3)?")
+    + r")"
 )
 KUBECTL_MUTATION_RE = re.compile(
-    r"\bkubectl\s+(?:apply|create|delete|patch|replace|rollout|scale|set)\b"
+    _real_token_expression(
+        r"kubectl\s+(?:apply|create|delete|patch|replace|rollout|scale|set)"
+    )
 )
 MUTATION_TOKEN = (
     r"(?<![a-z0-9])(?:apply|change|create|delete|deploy(?:ed|ing|ment)?|"
@@ -88,7 +123,7 @@ MUTATION_TOKEN = (
     r"rolling|scale|seed|set|truncate|update|upgrade)(?![a-z0-9])"
 )
 FAB_MUTATION_RE = re.compile(
-    r"\bfab(?:ric)?\b[^\n]*" + MUTATION_TOKEN
+    _real_token_expression(r"fab(?:ric)?") + r"[^\n]*" + MUTATION_TOKEN
 )
 ENVIRONMENT_RE = re.compile(
     r"(?<![a-z0-9])(?:beta|demo|live|prod|production|staging|"
@@ -102,18 +137,47 @@ DEPLOYMENT_OPERATION_RE = re.compile(
 )
 PRODUCTION_LIVE_RE = re.compile(r"\b(?:production|prod|live)\b")
 BACKEND_CUE_RE = re.compile(
-    r"(?:%s|\b(?:showpass\s+backend|django|drf|orm|manage\.py|celery)\b)"
-    % REPOSITORY_TOKEN_PATTERNS["web-app"]
+    r"(?:%s|%s)"
+    % (
+        REPOSITORY_TOKEN_PATTERNS["web-app"],
+        _real_token_pattern(
+            "showpass backend",
+            "django-backed",
+            "django",
+            "drf",
+            "orm",
+            "manage.py",
+            "celery",
+        ),
+    )
 )
 FRONTEND_CUE_RE = re.compile(
-    r"(?:%s|(?<![a-z0-9_-])(?:next(?:\.js|js)?|"
-    r"react(?:\s+native)?|frontend|client)(?![a-z0-9_-]))"
-    % REPOSITORY_TOKEN_PATTERNS["showpass-frontend"]
+    r"(?:%s|%s)"
+    % (
+        REPOSITORY_TOKEN_PATTERNS["showpass-frontend"],
+        _real_token_pattern(
+            "next.js",
+            "nextjs",
+            "next",
+            "react native",
+            "react",
+            "frontend",
+            "client",
+        ),
+    )
 )
 FRONTEND_OWNER_CUE_RE = re.compile(
-    r"(?:%s|(?<![a-z0-9_-])(?:next(?:\.js|js)?|"
-    r"react(?:\s+native)?)(?![a-z0-9_-]))"
-    % REPOSITORY_TOKEN_PATTERNS["showpass-frontend"]
+    r"(?:%s|%s)"
+    % (
+        REPOSITORY_TOKEN_PATTERNS["showpass-frontend"],
+        _real_token_pattern(
+            "next.js",
+            "nextjs",
+            "next",
+            "react native",
+            "react",
+        ),
+    )
 )
 FRONTEND_REPOSITORY_CUE_RE = re.compile(
     "|".join(
@@ -125,21 +189,56 @@ FRONTEND_REPOSITORY_CUE_RE = re.compile(
 INFRASTRUCTURE_REPOSITORY_CUE_RE = re.compile(REPOSITORY_TOKEN_PATTERNS["web-k8s"])
 SHOWPASS_PRODUCT_CUE_RE = re.compile(_real_token_pattern("showpass"))
 SHOWPASS_UI_CUE_RE = re.compile(
-    r"\bshowpass\s+(?:web|mobile|desktop|frontend|ui|client)\b"
+    _real_token_pattern(
+        "showpass web",
+        "showpass mobile",
+        "showpass desktop",
+        "showpass frontend",
+        "showpass ui",
+        "showpass client",
+    )
 )
 MODERN_UI_WORK_RE = re.compile(
     r"\b(?:component|page|screen|hook|widget|modal|form|button|layout|"
     r"style|styles|styling|css|tsx|user\s+interface|render(?:er|ing)?)\b|"
-    r"\b(?:modern\s+(?:ui|frontend|client)|(?:react|next(?:\.js|js)?)\s+"
-    r"(?:ui|frontend|client))\b"
+    + _real_token_expression(
+        r"(?:modern\s+(?:ui|frontend|client)|"
+        r"(?:react|next(?:\.js|js)?)\s+(?:ui|frontend|client))"
+    )
 )
 LEGACY_UI_CUE_RE = re.compile(
-    r"\b(?:next(?:\.js|js)?\s+(?:bridge|redirect|bridge[-\s]?route)|"
-    r"(?:bridge[-\s]?route|bridge|redirect)\s+(?:for|in|from|to)\s+"
-    r"next(?:\.js|js)?|bridge[-\s]?route|angularjs|angular\s+js|"
-    r"legacy\s+(?:ui|frontend|template|bridge|redirect)|(?:ui|frontend)\s+bridge|"
-    r"bridge\s+template|django\s+(?:template|redirect)|"
-    r"apps/main/(?:static|templates)|gulp|embedded\s+page)\b"
+    r"(?:"
+    + _real_token_expression(
+        r"next(?:\.js|js)?\s+(?:bridge|redirect|bridge[-\s]?route)"
+    )
+    + r"|"
+    + _real_token_expression(
+        r"(?:bridge[-\s]?route|bridge|redirect)\s+(?:for|in|from|to)\s+"
+        r"next(?:\.js|js)?"
+    )
+    + r"|"
+    + _real_token_pattern(
+        "bridge-route",
+        "bridge",
+        "redirect",
+        "angularjs",
+        "angular js",
+        "legacy ui",
+        "legacy frontend",
+        "legacy template",
+        "legacy bridge",
+        "legacy redirect",
+        "ui bridge",
+        "frontend bridge",
+        "bridge template",
+        "django template",
+        "django redirect",
+        "apps/main/static",
+        "apps/main/templates",
+        "gulp",
+        "embedded page",
+    )
+    + r")"
 )
 
 
@@ -193,15 +292,39 @@ ROUTING_GUARD_CASES = (
     ("backend-repository-underscore-suffix", "Change web-app_extra", "general"),
     ("infrastructure-repository-suffix", "Change web-k8s-extra", "general"),
     ("infrastructure-repository-underscore-suffix", "Change web-k8s_extra", "general"),
+    ("backend-framework-suffix", "Change django-extra", "general"),
+    ("backend-phrase-suffix", "Review the Showpass backend-extra", "general"),
+    (
+        "infrastructure-fabricated-word",
+        "Review a fabricated operation in beta",
+        "general",
+    ),
+    (
+        "infrastructure-fabrication-word",
+        "Review a fabrication operation in beta",
+        "general",
+    ),
+    (
+        "showpass-nextjs-dotted-suffix",
+        "Change a Showpass Next.jsx component",
+        "general",
+    ),
+    (
+        "showpass-react-dotted-suffix",
+        "Change a Showpass React.jsx component",
+        "general",
+    ),
+    ("frontend-package-file-suffix", "Change packages/core.ts", "general"),
+    ("frontend-package-dotted-suffix", "Change packages/core.extra", "general"),
 )
 
 
 def _has_infrastructure_cue(text: str) -> bool:
     return (
         bool(INFRASTRUCTURE_REPOSITORY_CUE_RE.search(text))
-        or any(marker in text for marker in ("kubectl", "gcloud"))
-        or bool(re.search(r"\bfab(?:\s|$)", text))
-        or "fabric" in text
+        or bool(re.search(_real_token_pattern("kubectl", "gcloud"), text))
+        or bool(FAB_CUE_RE.search(text))
+        or bool(FABRIC3_RE.search(text))
     )
 
 
