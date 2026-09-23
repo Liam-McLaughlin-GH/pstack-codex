@@ -1067,6 +1067,251 @@ class MaintainVerificationSkillBehaviorTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, label + ": " + result.stderr)
                 self.assertEqual(json_output(result)["outcome"], "clean", label)
 
+    def test_dependency_free_frontmatter_rejects_malformed_scalars(self) -> None:
+        variants = {
+            "comment-null": "description: # comment",
+            "question-indicator": "description: ? bad",
+            "comma-indicator": "description: ,bad",
+            "closing-flow-indicator": "description: ]bad",
+            "closing-mapping-indicator": "description: }bad",
+            "sequence-indicator": "description: - bad",
+            "invalid-block-header": "description: |oops\n  body",
+            "duplicate-block-modifier": "description: |++\n  body",
+        }
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-frontmatter-invalid-") as temporary:
+            root = Path(temporary)
+            for label, description in variants.items():
+                fixture_root = root / label
+                fixture_root.mkdir()
+                fixture = create_project(fixture_root, stale=False)
+                skill_file = fixture["skill_root"] / "SKILL.md"
+                body = skill_file.read_text(encoding="utf-8").split("---\n", 2)[2]
+                skill_file.write_text(
+                    "---\n"
+                    "name: verify-tiny\n"
+                    + description
+                    + "\n---\n"
+                    + body,
+                    encoding="utf-8",
+                )
+                result = run_helper_without_yaml(
+                    "audit",
+                    "--skill-root",
+                    str(fixture["skill_root"]),
+                    "--project-root",
+                    str(fixture["project"]),
+                    "--reader-report",
+                    str(fixture["reader_path"]),
+                    "--live-report",
+                    str(fixture["live_path"]),
+                    "--json",
+                )
+                self.assertEqual(result.returncode, 1, label + ": " + result.stderr)
+                payload = json_output(result)
+                self.assertEqual(payload["outcome"], "blocked", label)
+                self.assertTrue(
+                    any(
+                        item["kind"] == "doc-drift" and item.get("path") == "SKILL.md"
+                        for item in payload["findings"]
+                    ),
+                    label,
+                )
+
+    def test_dependency_free_frontmatter_accepts_quoted_scalars_with_comments(self) -> None:
+        variants = {
+            "double-quoted": 'description: "Verify the tiny CLI #1" # inline comment',
+            "single-quoted": "description: 'Verify the tiny ''CLI''.' # inline comment",
+        }
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-frontmatter-quoted-") as temporary:
+            root = Path(temporary)
+            for label, description in variants.items():
+                fixture_root = root / label
+                fixture_root.mkdir()
+                fixture = create_project(fixture_root, stale=False)
+                skill_file = fixture["skill_root"] / "SKILL.md"
+                body = skill_file.read_text(encoding="utf-8").split("---\n", 2)[2]
+                skill_file.write_text(
+                    "---\n"
+                    "name: verify-tiny\n"
+                    + description
+                    + "\n---\n"
+                    + body,
+                    encoding="utf-8",
+                )
+                result = run_helper_without_yaml(
+                    "audit",
+                    "--skill-root",
+                    str(fixture["skill_root"]),
+                    "--project-root",
+                    str(fixture["project"]),
+                    "--reader-report",
+                    str(fixture["reader_path"]),
+                    "--live-report",
+                    str(fixture["live_path"]),
+                    "--json",
+                )
+                self.assertEqual(result.returncode, 0, label + ": " + result.stderr)
+                self.assertEqual(json_output(result)["outcome"], "clean", label)
+
+    def test_source_and_skill_paths_reject_internal_symlink_hops(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-symlink-hops-") as temporary:
+            root = Path(temporary)
+            fixture = create_project(root, stale=False)
+            project = fixture["project"]
+            skill_root = fixture["skill_root"]
+
+            source_link = project / "source-link"
+            source_link.symlink_to(project, target_is_directory=True)
+            readers = json.loads(fixture["reader_path"].read_text(encoding="utf-8"))
+            readers["readers"][0]["source_entries"] = [{"path": "source-link/app.py", "lines": "1-40"}]
+            linked_reader = root / "linked-reader.json"
+            linked_reader.write_text(json.dumps(readers), encoding="utf-8")
+            source_result = run_helper(
+                "audit",
+                "--skill-root",
+                str(skill_root),
+                "--project-root",
+                str(project),
+                "--reader-report",
+                str(linked_reader),
+                "--live-report",
+                str(fixture["live_path"]),
+                "--json",
+            )
+            self.assertEqual(source_result.returncode, 1, source_result.stderr)
+            source_payload = json_output(source_result)
+            self.assertTrue(
+                any(
+                    item["kind"] == "blocked" and "crosses a symlink" in item["message"]
+                    for item in source_payload["findings"]
+                )
+            )
+
+            skill_link = skill_root / "skill-link"
+            skill_link.symlink_to(skill_root, target_is_directory=True)
+            target = skill_root / "features" / "check-state.md"
+            original = target.read_text(encoding="utf-8")
+            patch_plan = root / "linked-patches.json"
+            patch_plan.write_text(
+                json.dumps(
+                    {
+                        "changes": [
+                            {
+                                "path": "skill-link/features/check-state.md",
+                                "kind": "doc-drift",
+                                "old": "stdout contains check passed",
+                                "new": "stdout contains changed",
+                                "reason": "invalid symlink path",
+                                "source": "app.py:1-40",
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            skill_result = run_helper(
+                "apply",
+                "--skill-root",
+                str(skill_root),
+                "--patch-plan",
+                str(patch_plan),
+                "--json",
+            )
+            self.assertEqual(skill_result.returncode, 2, skill_result.stderr)
+            self.assertIn("crosses a symlink", skill_result.stderr)
+            self.assertEqual(target.read_text(encoding="utf-8"), original)
+
+    def test_malformed_change_receipt_kinds_are_bounded_audit_errors(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-receipt-shapes-") as temporary:
+            root = Path(temporary)
+            fixture = create_project(root, stale=False)
+            changed_file = "features/check-state.md"
+            changed_path = fixture["skill_root"] / changed_file
+            for shape in ([], {}, None, 7):
+                receipt_path = root / "change-receipt.json"
+                receipt_path.write_text(
+                    json.dumps(
+                        {
+                            "receipt_version": 2,
+                            "outcome": "changed",
+                            "apply_id": "apply-" + ("a" * 32),
+                            "run_id": "receipt-run",
+                            "session_id": "receipt-session",
+                            "skill_root": str(fixture["skill_root"]),
+                            "plan_sha256": "0" * 64,
+                            "affected_features": ["check-state"],
+                            "changed_files": [changed_file],
+                            "before_file_digests": {changed_file: "1" * 64},
+                            "file_digests": {
+                                changed_file: hashlib.sha256(changed_path.read_bytes()).hexdigest()
+                            },
+                            "changes": [
+                                {
+                                    "path": changed_file,
+                                    "kind": shape,
+                                    "feature_ids": ["check-state"],
+                                }
+                            ],
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                result = run_helper(
+                    "audit",
+                    "--skill-root",
+                    str(fixture["skill_root"]),
+                    "--project-root",
+                    str(fixture["project"]),
+                    "--reader-report",
+                    str(fixture["reader_path"]),
+                    "--live-report",
+                    str(fixture["live_path"]),
+                    "--change-log",
+                    str(receipt_path),
+                    "--json",
+                )
+                self.assertEqual(result.returncode, 1, repr(shape))
+                self.assertNotIn("Traceback", result.stderr)
+                payload = json_output(result)
+                self.assertEqual(payload["outcome"], "blocked", repr(shape))
+                self.assertTrue(
+                    any("changes[0].kind" in item["message"] for item in payload["findings"]),
+                    repr(shape),
+                )
+
+    def test_undecodable_reports_and_receipts_use_cli_error_boundary(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-undecodable-") as temporary:
+            root = Path(temporary)
+            fixture = create_project(root, stale=False)
+            bad_input = root / "undecodable.json"
+            bad_input.write_bytes(b"{\xff\xfe\x00")
+            scenarios = {
+                "reader": ["--reader-report", str(bad_input), "--live-report", str(fixture["live_path"])],
+                "live": ["--reader-report", str(fixture["reader_path"]), "--live-report", str(bad_input)],
+                "receipt": [
+                    "--reader-report",
+                    str(fixture["reader_path"]),
+                    "--live-report",
+                    str(fixture["live_path"]),
+                    "--change-log",
+                    str(bad_input),
+                ],
+            }
+            for label, report_args in scenarios.items():
+                result = run_helper(
+                    "audit",
+                    "--skill-root",
+                    str(fixture["skill_root"]),
+                    "--project-root",
+                    str(fixture["project"]),
+                    *report_args,
+                    "--json",
+                )
+                self.assertEqual(result.returncode, 2, label)
+                self.assertEqual(result.stdout, "", label)
+                self.assertNotIn("Traceback", result.stderr, label)
+                self.assertIn("could not read JSON", result.stderr, label)
+
     def test_source_entries_need_citations_and_regular_files(self) -> None:
         with tempfile.TemporaryDirectory(prefix="maintain-verification-sources-") as temporary:
             root = Path(temporary)

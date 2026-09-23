@@ -64,6 +64,9 @@ TOP_LEVEL_FRONTMATTER_FIELD = re.compile(
 BLOCK_SCALAR_HEADER = re.compile(
     r"^(?P<style>[|>])(?P<modifiers>[1-9+-]{0,2})(?:[ \t]+(?:#.*)?)?$"
 )
+PLAIN_SCALAR_ALWAYS_INVALID_START = frozenset(",[]{}#&*!|>'\"%@`")
+PLAIN_SCALAR_CONDITIONAL_START = frozenset("-?:")
+PLAIN_SCALAR_FLOW_INDICATORS = frozenset(",[]{}")
 YAML_NON_STRING_PLAIN_SCALAR = re.compile(
     r"^[+-]?(?:"
     r"0[bB][01_]+|0[oO][0-7_]+|0[xX][0-9a-fA-F_]+|"
@@ -106,7 +109,7 @@ def _text_list(value: Any, label: str, *, allow_empty: bool = True) -> list[str]
 def _load_json(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise MaintainError(f"could not read JSON {path}: {exc}") from exc
     return _mapping(value, str(path))
 
@@ -133,19 +136,24 @@ def _real_directory(path: Path, label: str) -> Path:
 def _safe_path(root: Path, raw: str, label: str, *, require_exists: bool = False) -> Path:
     """Resolve a path and require it to stay below root without symlink hops."""
 
+    if not isinstance(raw, str):
+        raise MaintainError(f"{label} must be a relative path")
     if Path(raw).is_absolute():
         raise MaintainError(f"{label} must be relative: {raw}")
     root = _resolved(root)
-    candidate = _resolved(root / raw)
-    if not _is_relative_to(candidate, root) or candidate == root:
-        raise MaintainError(f"{label} escapes its allowed root: {raw}")
-
-    relative = candidate.relative_to(root)
+    raw_path = Path(raw)
     current = root
-    for part in relative.parts:
+    for part in raw_path.parts:
+        if part in {"", "."}:
+            continue
         current /= part
         if current.is_symlink():
             raise MaintainError(f"{label} crosses a symlink: {raw}")
+
+    candidate = _resolved(root / raw_path)
+    if not _is_relative_to(candidate, root) or candidate == root:
+        raise MaintainError(f"{label} escapes its allowed root: {raw}")
+
     if require_exists and not candidate.exists():
         raise MaintainError(f"{label} does not exist: {raw}")
     return candidate
@@ -266,6 +274,55 @@ def _is_non_string_yaml_scalar(value: str) -> bool:
     )
 
 
+def _quoted_scalar(value: str, key: str) -> str:
+    quote = value[0]
+    if quote == '"':
+        try:
+            parsed, end = json.JSONDecoder().raw_decode(value)
+        except json.JSONDecodeError as exc:
+            raise MaintainError(f"frontmatter field {key!r} has invalid YAML quoting") from exc
+        if not isinstance(parsed, str):
+            raise MaintainError(f"frontmatter field {key!r} must be a string")
+    else:
+        end = None
+        index = 1
+        while index < len(value):
+            if value[index] != "'":
+                index += 1
+                continue
+            if index + 1 < len(value) and value[index + 1] == "'":
+                index += 2
+                continue
+            end = index
+            break
+        if end is None:
+            raise MaintainError(f"frontmatter field {key!r} has an unterminated quote")
+        parsed = value[1:end].replace("''", "'")
+
+    tail = value[end:] if quote == '"' else value[end + 1 :]
+    if tail and not re.fullmatch(r"[ \t]+#.*", tail):
+        raise MaintainError(f"frontmatter field {key!r} has invalid trailing content after its quote")
+    return parsed
+
+
+def _plain_scalar(value: str, key: str) -> str:
+    first = value[0]
+    if first in PLAIN_SCALAR_ALWAYS_INVALID_START:
+        raise MaintainError(f"frontmatter field {key!r} starts with an invalid plain scalar indicator")
+    if first in PLAIN_SCALAR_CONDITIONAL_START:
+        if len(value) == 1 or value[1].isspace() or value[1] in PLAIN_SCALAR_FLOW_INDICATORS:
+            raise MaintainError(f"frontmatter field {key!r} starts with an invalid plain scalar indicator")
+
+    plain_value = re.split(r"[ \t]+#", value, maxsplit=1)[0].rstrip()
+    if not plain_value:
+        raise MaintainError(f"frontmatter field {key!r} is empty")
+    if re.search(r":(?:[ \t]|$|[,\[\]{}])", plain_value):
+        raise MaintainError(f"frontmatter field {key!r} has an invalid plain scalar mapping value")
+    if _is_non_string_yaml_scalar(plain_value):
+        raise MaintainError(f"frontmatter field {key!r} must be a string")
+    return plain_value
+
+
 def _block_scalar_header(value: str, key: str) -> tuple[str, str, int | None] | None:
     if not value.startswith(("|", ">")):
         return None
@@ -365,30 +422,11 @@ def _strict_frontmatter_subset(text: str) -> dict[str, str]:
         if block_header is not None:
             fields[key], index = _block_scalar_value(lines, index + 1, key, *block_header)
             continue
-        if value.startswith('"'):
-            try:
-                parsed = json.loads(value)
-            except json.JSONDecodeError as exc:
-                raise MaintainError(f"frontmatter field {key!r} has invalid YAML quoting") from exc
-            if not isinstance(parsed, str):
-                raise MaintainError(f"frontmatter field {key!r} must be a string")
-            fields[key] = parsed
+        if value.startswith(('"', "'")):
+            fields[key] = _quoted_scalar(value, key)
             index += 1
             continue
-        if value.startswith("'"):
-            if len(value) < 2 or not value.endswith("'"):
-                raise MaintainError(f"frontmatter field {key!r} has an unterminated quote")
-            fields[key] = value[1:-1].replace("''", "'")
-            index += 1
-            continue
-        if value.startswith(("[", "{", "&", "*", "!", "%", "@", "`")):
-            raise MaintainError(f"frontmatter field {key!r} is not a supported scalar")
-        plain_value = re.split(r"[ \t]+#", value, maxsplit=1)[0].rstrip()
-        if re.search(r":(?:[ \t]|$)", plain_value):
-            raise MaintainError(f"frontmatter field {key!r} has an invalid plain scalar mapping value")
-        if _is_non_string_yaml_scalar(plain_value):
-            raise MaintainError(f"frontmatter field {key!r} must be a string")
-        fields[key] = plain_value
+        fields[key] = _plain_scalar(value, key)
         index += 1
     return fields
 
@@ -396,7 +434,7 @@ def _strict_frontmatter_subset(text: str) -> dict[str, str]:
 def _parse_frontmatter(path: Path) -> dict[str, str]:
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise MaintainError(f"could not read frontmatter {path}: {exc}") from exc
     lines = text.splitlines()
     if not lines or lines[0] != "---":
@@ -888,7 +926,8 @@ def _evidence_for_result(
 def _post_apply_feature_findings(
     result: dict[str, Any], feature_id: str, change_receipt: dict[str, Any] | None
 ) -> list[dict[str, Any]]:
-    if change_receipt is None or feature_id not in change_receipt.get("affected_features", []):
+    affected_features = change_receipt.get("affected_features") if change_receipt is not None else None
+    if not isinstance(affected_features, list) or feature_id not in affected_features:
         return []
     findings: list[dict[str, Any]] = []
     binding = result.get("post_apply")
@@ -1238,7 +1277,8 @@ def _validate_change_receipt(
             except MaintainError as exc:
                 findings.append(_finding("evidence-failure", str(exc)))
                 continue
-            if raw_change.get("kind") not in PATCH_KINDS:
+            raw_kind = raw_change.get("kind")
+            if not isinstance(raw_kind, str) or raw_kind not in PATCH_KINDS:
                 findings.append(_finding("evidence-failure", f"{label}.kind is not an applicable correction kind"))
             if change_path not in changed_files:
                 findings.append(_finding("evidence-failure", f"{label}.path is not in changed_files"))
@@ -1254,7 +1294,7 @@ def _validate_change_receipt(
                 findings.append(_finding("evidence-failure", f"{label} does not identify an affected feature"))
             change_feature_ids.update(change_features)
             normalized_changes.append(
-                {"path": change_path, "kind": raw_change.get("kind"), "feature_ids": change_features}
+                {"path": change_path, "kind": raw_kind if isinstance(raw_kind, str) else None, "feature_ids": change_features}
             )
         if set(change_paths) != set(changed_files):
             findings.append(_finding("evidence-failure", "change receipt changes do not cover changed_files"))
