@@ -728,6 +728,8 @@ def _validate_lifecycle_graph_v2(
         if not isinstance(in_list, bool) or not isinstance(overflow, bool):
             fail(f"events[{index}] decision accounting flags must be booleans")
         if overflow:
+            if event_name not in {"action_refused", "blocked"}:
+                fail(f"events[{index}] records overflow on a non-refusal decision event")
             overflow_count = sum(
                 1
                 for prior in state["events"][: index + 1]

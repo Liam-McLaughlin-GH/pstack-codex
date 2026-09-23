@@ -1174,6 +1174,40 @@ class WorkflowBehaviorTests(unittest.TestCase):
             with self.assertRaises(figure_it_out.StateError):
                 figure_it_out.Workflow.load(state_path, workspace_root=root)
 
+    def test_decision_overflow_cannot_be_attached_to_a_generic_decision_event(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1, max_decisions=1)
+            workflow.record_decision("phase-1", "first", "fills budget", ["tests/first.txt"], "open")
+            state_path = root / "run.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            forged = deepcopy(state["decisions"][0])
+            forged["event_sequence"] = len(state["events"]) + 1
+            forged.update(
+                decision="forged overflow decision",
+                why="forged overflow",
+                result="blocked",
+                status="refused",
+                reason="forged overflow",
+                next_action="stop",
+            )
+            state["decisions"].append(forged)
+            state["events"].append(
+                {
+                    "sequence": len(state["events"]) + 1,
+                    "at": forged["at"],
+                    "event": "decision_recorded",
+                    "phase": "phase-1",
+                    "decision": deepcopy(forged),
+                    "decision_in_list": True,
+                    "decision_overflow": True,
+                }
+            )
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(state_path, workspace_root=root)
+
     def test_schema_one_state_is_explicitly_migrated_to_schema_two(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
