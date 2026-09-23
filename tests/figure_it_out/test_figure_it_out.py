@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -765,6 +766,155 @@ class WorkflowBehaviorTests(unittest.TestCase):
             (root / "forged-terminal" / "run.json").write_text(json.dumps(forged_state), encoding="utf-8")
             with self.assertRaises(figure_it_out.StateError):
                 figure_it_out.Workflow.load(root / "forged-terminal" / "run.json", workspace_root=root / "forged-terminal")
+
+    def test_persisted_lifecycle_rejects_deleted_event_snapshots(self):
+        def phase_passed(workflow):
+            workflow.start_phase()
+            workflow.complete_phase(
+                "phase output",
+                {"check_id": "check-1", "passed": True, "evidence": ["tests/phase-pass.txt"]},
+            )
+
+        def checkpointed(workflow):
+            workflow.start_phase()
+            workflow.checkpoint("safe point", ["artifacts/checkpoint.txt"], "resume phase-1")
+
+        def failed(workflow):
+            workflow.start_phase()
+            workflow.fail_phase("check disagreed", ["tests/failure.txt"], "replan the phase")
+
+        def replanned(workflow):
+            failed(workflow)
+            workflow.replan("change the approach", ["tests/replan.txt"], "start phase-1 again")
+
+        def interrupted(workflow):
+            checkpointed(workflow)
+            workflow.interrupt("session stopped")
+
+        def blocked(workflow):
+            workflow.block("fixture unavailable", ["fixtures/missing.json"], "obtain the fixture")
+
+        def predicate_recorded(workflow):
+            phase_passed(workflow)
+            workflow.record_predicate("focused-tests", True, ["tests/focused.txt"])
+
+        def completed(workflow):
+            phase_passed(workflow)
+            workflow.record_predicate("focused-tests", True, ["tests/focused.txt"])
+            workflow.record_predicate("artifact-inspection", True, ["artifacts/inspection.txt"])
+            workflow.finish()
+
+        cases = [
+            ("phase-output", phase_passed, "phase_passed", "output_snapshot"),
+            ("phase-verification", phase_passed, "phase_passed", "verification_snapshot"),
+            ("checkpoint", checkpointed, "checkpoint", "checkpoint_snapshot"),
+            ("failure", failed, "phase_failed", "failure_snapshot"),
+            ("replan", replanned, "replanned", "replan_snapshot"),
+            ("interruption", interrupted, "interrupted", "interruption_snapshot"),
+            ("blocker", blocked, "blocked", "blocker_snapshot"),
+            ("predicate", predicate_recorded, "predicate_recorded", "result_snapshot"),
+            ("terminal", completed, "completed", "terminal_snapshot"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name, setup, event_name, snapshot_field in cases:
+                with self.subTest(snapshot=snapshot_field):
+                    run_root = root / name
+                    workflow = self.workflow(run_root, phase_count=1)
+                    setup(workflow)
+                    state_path = run_root / "run.json"
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    event = next(item for item in state["events"] if item["event"] == event_name)
+                    del event[snapshot_field]
+                    state_path.write_text(json.dumps(state), encoding="utf-8")
+                    with self.assertRaises(figure_it_out.StateError):
+                        figure_it_out.Workflow.load(state_path, workspace_root=run_root)
+
+    def test_persisted_lifecycle_rejects_forged_phase_output_checkpoint_and_replan(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            output_workflow = self.workflow(root / "output", phase_count=1)
+            output_workflow.start_phase()
+            output_workflow.complete_phase(
+                "real output",
+                {"check_id": "check-1", "passed": True, "evidence": ["tests/phase-pass.txt"]},
+            )
+            output_state_path = root / "output" / "run.json"
+            output_state = json.loads(output_state_path.read_text(encoding="utf-8"))
+            output_state["phases"][0]["output_value"] = "forged output"
+            output_state_path.write_text(json.dumps(output_state), encoding="utf-8")
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(output_state_path, workspace_root=root / "output")
+
+            checkpoint_workflow = self.workflow(root / "checkpoint", phase_count=1)
+            checkpoint_workflow.start_phase()
+            checkpoint_workflow.checkpoint("real checkpoint", ["artifacts/checkpoint.txt"], "continue phase-1")
+            checkpoint_state_path = root / "checkpoint" / "run.json"
+            checkpoint_state = json.loads(checkpoint_state_path.read_text(encoding="utf-8"))
+            checkpoint_state["checkpoints"][0]["label"] = "forged checkpoint"
+            checkpoint_state_path.write_text(json.dumps(checkpoint_state), encoding="utf-8")
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(checkpoint_state_path, workspace_root=root / "checkpoint")
+
+            replan_workflow = self.workflow(root / "replan", phase_count=1)
+            replan_workflow.start_phase()
+            replan_workflow.fail_phase("check disagreed", ["tests/failure.txt"], "replan the phase")
+            replan_workflow.replan("real replan", ["tests/replan.txt"], "start phase-1 again")
+            replan_state_path = root / "replan" / "run.json"
+            replan_state = json.loads(replan_state_path.read_text(encoding="utf-8"))
+            replan_state["replans"][0]["reason"] = "forged replan"
+            replan_state_path.write_text(json.dumps(replan_state), encoding="utf-8")
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(replan_state_path, workspace_root=root / "replan")
+
+    def test_refusal_persistence_restores_live_state_when_replace_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            before_state = deepcopy(workflow.state)
+            before_bytes = (root / "run.json").read_bytes()
+
+            with patch.object(figure_it_out.os, "replace", side_effect=OSError("simulated replace failure")):
+                with self.assertRaises(OSError):
+                    workflow.guard_action("deploy", "production")
+
+            self.assertEqual(workflow.state, before_state)
+            self.assertEqual((root / "run.json").read_bytes(), before_bytes)
+
+    def test_persisted_allowed_actions_must_match_lifecycle_status(self):
+        def failed(workflow):
+            workflow.start_phase()
+            workflow.fail_phase("check disagreed", ["tests/failure.txt"], "replan the phase")
+
+        def interrupted(workflow):
+            workflow.start_phase()
+            workflow.checkpoint("safe stop", ["artifacts/checkpoint.txt"], "resume phase-1")
+            workflow.interrupt("session stopped")
+
+        def blocked(workflow):
+            workflow.block("fixture unavailable", ["fixtures/missing.json"], "obtain the fixture")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for status, setup in (("failed", failed), ("interrupted", interrupted), ("blocked", blocked)):
+                with self.subTest(status=status):
+                    run_root = root / status
+                    workflow = self.workflow(run_root, phase_count=1)
+                    setup(workflow)
+                    state_path = run_root / "run.json"
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    state["events"].append(
+                        {
+                            "at": "2026-09-23T00:00:00+00:00",
+                            "event": "action_allowed",
+                            "action": "write",
+                            "target": "src/after-stop.py",
+                        }
+                    )
+                    state_path.write_text(json.dumps(state), encoding="utf-8")
+                    with self.assertRaises(figure_it_out.StateError):
+                        figure_it_out.Workflow.load(state_path, workspace_root=run_root)
 
     def test_cli_rejects_non_regular_inputs_and_invalid_utf8_plan_without_traceback(self):
         with tempfile.TemporaryDirectory() as directory:

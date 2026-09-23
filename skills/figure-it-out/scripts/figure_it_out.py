@@ -262,6 +262,58 @@ def _relative_path(value: Any, field: str, *, max_length: int = 500) -> str:
     return str(PurePosixPath(path))
 
 
+def _scope_action_reason(scope: Mapping[str, Any], action: Any, target: Any) -> str | None:
+    if not isinstance(action, str):
+        return "action name is not a string"
+    if not action:
+        return "action name is empty"
+    if len(action) > 100:
+        return "action name exceeds 100 characters"
+    if any(unicodedata.category(char) in {"Cc", "Cf"} for char in action):
+        return "action name contains a control or format character"
+    if action != action.strip():
+        return "action name contains surrounding whitespace"
+    if not SAFE_ACTION.fullmatch(action):
+        return "action name is not a declared safe action"
+
+    target_provided = target is not None
+    if target_provided and not isinstance(target, str):
+        return "target is not a string"
+    if target_provided and isinstance(target, str):
+        if not target:
+            return "target is empty; omit it only for a logical action"
+        if len(target) > 500:
+            return "target exceeds 500 characters"
+        if any(unicodedata.category(char) in {"Cc", "Cf"} for char in target):
+            return "target contains a control or format character"
+        if target != target.strip():
+            return "target contains surrounding whitespace"
+        if "\\" in target:
+            return "target contains a backslash escape"
+        if target.startswith(("/", "~", "//")) or re.match(r"^[A-Za-z]:", target):
+            return "target is absolute, a drive path, or a UNC path"
+        if URI_SCHEME.match(target):
+            return "target contains a URL or URI scheme"
+        if "@" in target:
+            return "target looks like a credential or external host"
+        if ".." in PurePosixPath(target).parts:
+            return "target escapes the declared scope"
+
+    if action in scope["out_of_scope_actions"]:
+        return f"action {action!r} is explicitly out of scope"
+    if action not in scope["allowed_actions"]:
+        return f"action {action!r} is not declared in allowed_actions"
+    if target_provided and isinstance(target, str):
+        normalized = str(PurePosixPath(target))
+        if scope["allowed_paths"] and not any(
+            normalized == prefix[:-1] or normalized.startswith(prefix) for prefix in scope["allowed_paths"]
+        ):
+            return "target is outside scope.allowed_paths"
+    elif scope["allowed_paths"] and action not in scope.get("logical_actions", []):
+        return "a target is required for this action in a path-constrained scope"
+    return None
+
+
 def _phase_spec(value: Any, index: int) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise PlanError(f"phases[{index}] must be an object")
@@ -469,6 +521,7 @@ def _validate_lifecycle_graph(
     """Replay persisted transition events and compare them with the snapshot."""
 
     phase_ids = [phase["id"] for phase in validated_plan["phases"]]
+    phase_by_id = {phase["id"]: phase for phase in phases}
     check_ids = set(validated_plan["terminal_predicate"]["checks"])
     phase_states = {phase_id: "pending" for phase_id in phase_ids}
     phase_attempts = {phase_id: 0 for phase_id in phase_ids}
@@ -534,9 +587,13 @@ def _validate_lifecycle_graph(
             fail("lifecycle events cannot be appended after completion")
 
         if event_name == "action_allowed":
-            event_text(event, index, "action", max_length=100)
-            if event.get("target") is not None:
-                _state_text(event["target"], f"events[{index}].target", max_length=500)
+            if run_status not in {"planned", "running"}:
+                fail(f"events[{index}] allows an action from {run_status}")
+            action = event_text(event, index, "action", max_length=100)
+            target = event.get("target")
+            scope_reason = _scope_action_reason(validated_plan["scope"], action, target)
+            if scope_reason is not None:
+                fail(f"events[{index}] records an action outside scope: {scope_reason}")
             if completed_event is not None:
                 fail("action_allowed cannot be appended after completion")
             continue
@@ -580,7 +637,9 @@ def _validate_lifecycle_graph(
                 fail(f"events[{index}] repeats checkpoint {checkpoint_id}")
             seen_checkpoints.add(checkpoint_id)
             latest_checkpoint[phase_id] = checkpoint_id
-            if "checkpoint_snapshot" in event and event["checkpoint_snapshot"] != checkpoint:
+            if "checkpoint_snapshot" not in event:
+                fail(f"events[{index}] is missing checkpoint_snapshot")
+            if event["checkpoint_snapshot"] != checkpoint:
                 fail(f"events[{index}].checkpoint_snapshot does not match the checkpoint")
             expected_next_action = checkpoint["next_action"]
             continue
@@ -593,12 +652,20 @@ def _validate_lifecycle_graph(
                 fail(f"events[{index}] passes a phase outside the current phase")
             phase_states[phase_id] = "passed"
             last_phase_passed[phase_id] = event
-            if "verification_snapshot" in event:
-                _state_phase_verification(
-                    event["verification_snapshot"],
-                    f"events[{index}].verification_snapshot",
-                    check_id,
-                )
+            if "output_snapshot" not in event:
+                fail(f"events[{index}] is missing output_snapshot")
+            _state_output(event["output_snapshot"], f"events[{index}].output_snapshot")
+            if event["output_snapshot"] != phase_by_id[phase_id]["output_value"]:
+                fail(f"events[{index}].output_snapshot does not match the phase output")
+            if "verification_snapshot" not in event:
+                fail(f"events[{index}] is missing verification_snapshot")
+            _state_phase_verification(
+                event["verification_snapshot"],
+                f"events[{index}].verification_snapshot",
+                check_id,
+            )
+            if event["verification_snapshot"] != phase_by_id[phase_id]["verification_result"]:
+                fail(f"events[{index}].verification_snapshot does not match the phase verification")
             next_phase = current_phase()
             expected_next_action = (
                 f"inspect output, then start phase {next_phase}" if next_phase is not None else "record terminal predicate checks"
@@ -614,10 +681,11 @@ def _validate_lifecycle_graph(
             phase_states[phase_id] = "failed"
             last_phase_failed[phase_id] = event
             run_status = "failed"
-            if "failure_snapshot" in event:
-                _state_failure(event["failure_snapshot"], f"events[{index}].failure_snapshot")
-                if event["failure_snapshot"]["reason"] != reason:
-                    fail(f"events[{index}].failure_snapshot does not match the failure")
+            if "failure_snapshot" not in event:
+                fail(f"events[{index}] is missing failure_snapshot")
+            _state_failure(event["failure_snapshot"], f"events[{index}].failure_snapshot")
+            if event["failure_snapshot"]["reason"] != reason:
+                fail(f"events[{index}].failure_snapshot does not match the failure")
             expected_next_action = ""
             continue
 
@@ -632,8 +700,14 @@ def _validate_lifecycle_graph(
             replan = replans_by_number.get(number)
             if replan is None or replan["phase"] != phase_id:
                 fail(f"events[{index}] has no matching replan record")
-            if "replacement" in event and event["replacement"] != replan["replacement"]:
+            if "replacement" not in event:
+                fail(f"events[{index}] is missing replacement")
+            if event["replacement"] != replan["replacement"]:
                 fail(f"events[{index}].replacement does not match the replan record")
+            if "replan_snapshot" not in event:
+                fail(f"events[{index}] is missing replan_snapshot")
+            if event["replan_snapshot"] != replan:
+                fail(f"events[{index}].replan_snapshot does not match the replan record")
             phase_states[phase_id] = "pending"
             run_status = "planned"
             last_replacement[phase_id] = replan["replacement"]
@@ -656,20 +730,21 @@ def _validate_lifecycle_graph(
                 interruption["reason"] = event["reason"]
                 _state_text(event["reason"], f"events[{index}].reason", max_length=1000)
             latest_interruption_snapshot = None
-            if "interruption_snapshot" in event:
-                snapshot = event["interruption_snapshot"]
-                if not isinstance(snapshot, Mapping):
-                    fail(f"events[{index}].interruption_snapshot must be an object")
-                _require_state_fields(
-                    snapshot,
-                    {"at", "phase", "checkpoint", "reason"},
-                    f"events[{index}].interruption_snapshot",
-                )
-                for field in ("at", "phase", "checkpoint", "reason"):
-                    _state_text(snapshot[field], f"events[{index}].interruption_snapshot.{field}")
-                if snapshot["phase"] != phase_id or snapshot["checkpoint"] != checkpoint_id or snapshot["reason"] != interruption.get("reason"):
-                    fail(f"events[{index}].interruption_snapshot does not match the interruption")
-                latest_interruption_snapshot = snapshot
+            if "interruption_snapshot" not in event:
+                fail(f"events[{index}] is missing interruption_snapshot")
+            snapshot = event["interruption_snapshot"]
+            if not isinstance(snapshot, Mapping):
+                fail(f"events[{index}].interruption_snapshot must be an object")
+            _require_state_fields(
+                snapshot,
+                {"at", "phase", "checkpoint", "reason"},
+                f"events[{index}].interruption_snapshot",
+            )
+            for field in ("at", "phase", "checkpoint", "reason"):
+                _state_text(snapshot[field], f"events[{index}].interruption_snapshot.{field}")
+            if snapshot["phase"] != phase_id or snapshot["checkpoint"] != checkpoint_id or snapshot["reason"] != interruption.get("reason"):
+                fail(f"events[{index}].interruption_snapshot does not match the interruption")
+            latest_interruption_snapshot = snapshot
             latest_interruption = interruption
             expected_next_action = f"resume from checkpoint {checkpoint_id}"
             continue
@@ -699,10 +774,11 @@ def _validate_lifecycle_graph(
             run_status = "blocked"
             reason = event_text(event, index, "reason", max_length=1000)
             latest_blocker = event
-            if "blocker_snapshot" in event:
-                _state_failure(event["blocker_snapshot"], f"events[{index}].blocker_snapshot")
-                if event["blocker_snapshot"]["reason"] != reason:
-                    fail(f"events[{index}].blocker_snapshot does not match the blocker")
+            if "blocker_snapshot" not in event:
+                fail(f"events[{index}] is missing blocker_snapshot")
+            _state_failure(event["blocker_snapshot"], f"events[{index}].blocker_snapshot")
+            if event["blocker_snapshot"] != state["blocker"]:
+                fail(f"events[{index}].blocker_snapshot does not match the blocker")
             expected_next_action = ""
             continue
 
@@ -713,22 +789,23 @@ def _validate_lifecycle_graph(
                 fail(f"events[{index}] records a predicate before all phases pass")
             if check_id not in check_ids:
                 fail(f"events[{index}] records an undeclared predicate")
-            if "result_snapshot" in event:
-                snapshot = event["result_snapshot"]
-                if not isinstance(snapshot, Mapping):
-                    fail(f"events[{index}].result_snapshot must be an object")
-                _require_state_fields(
-                    snapshot,
-                    {"check_id", "passed", "status", "evidence", "observed", "at"},
-                    f"events[{index}].result_snapshot",
-                )
-                if snapshot["check_id"] != check_id or snapshot["passed"] is not passed:
-                    fail(f"events[{index}].result_snapshot does not match the predicate")
-                if snapshot["status"] not in CHECK_STATUSES or (snapshot["status"] == "verified") is not passed:
-                    fail(f"events[{index}].result_snapshot has an invalid status")
-                _state_evidence(snapshot["evidence"], f"events[{index}].result_snapshot.evidence")
-                _state_text(snapshot["observed"], f"events[{index}].result_snapshot.observed", max_length=1000)
-                _state_text(snapshot["at"], f"events[{index}].result_snapshot.at")
+            if "result_snapshot" not in event:
+                fail(f"events[{index}] is missing result_snapshot")
+            snapshot = event["result_snapshot"]
+            if not isinstance(snapshot, Mapping):
+                fail(f"events[{index}].result_snapshot must be an object")
+            _require_state_fields(
+                snapshot,
+                {"check_id", "passed", "status", "evidence", "observed", "at"},
+                f"events[{index}].result_snapshot",
+            )
+            if snapshot["check_id"] != check_id or snapshot["passed"] is not passed:
+                fail(f"events[{index}].result_snapshot does not match the predicate")
+            if snapshot["status"] not in CHECK_STATUSES or (snapshot["status"] == "verified") is not passed:
+                fail(f"events[{index}].result_snapshot has an invalid status")
+            _state_evidence(snapshot["evidence"], f"events[{index}].result_snapshot.evidence")
+            _state_text(snapshot["observed"], f"events[{index}].result_snapshot.observed", max_length=1000)
+            _state_text(snapshot["at"], f"events[{index}].result_snapshot.at")
             last_predicate_event[check_id] = event
             expected_next_action = (
                 "finish when all terminal checks pass" if passed else f"address failed terminal check {check_id}"
@@ -740,6 +817,8 @@ def _validate_lifecycle_graph(
                 fail(f"events[{index}] completes a run before the predicate is ready")
             if any(check_id not in last_predicate_event or not last_predicate_event[check_id]["passed"] for check_id in check_ids):
                 fail(f"events[{index}] completes a run without all verified predicate events")
+            if "terminal_snapshot" not in event:
+                fail(f"events[{index}] is missing terminal_snapshot")
             completed_event = event
             run_status = "completed"
             expected_next_action = ""
@@ -762,9 +841,8 @@ def _validate_lifecycle_graph(
         fail("completed runs require a completed lifecycle event")
     if state["status"] != "completed" and completed_event is not None:
         fail("non-completed runs cannot retain a completed lifecycle event")
-    if completed_event is not None and "terminal_snapshot" in completed_event:
-        if completed_event["terminal_snapshot"] != state["terminal"]:
-            fail("terminal snapshot does not match the completed lifecycle event")
+    if completed_event is not None and completed_event["terminal_snapshot"] != state["terminal"]:
+        fail("terminal snapshot does not match the completed lifecycle event")
 
     for phase in phases:
         phase_id = phase["id"]
@@ -776,13 +854,13 @@ def _validate_lifecycle_graph(
             pass_event = last_phase_passed.get(phase_id)
             if pass_event is None or pass_event["check_id"] != phase["verification"]["id"]:
                 fail(f"phase {phase_id} has no final matching phase_passed event")
-            if "verification_snapshot" in pass_event and pass_event["verification_snapshot"] != phase["verification_result"]:
+            if pass_event["verification_snapshot"] != phase["verification_result"]:
                 fail(f"phase {phase_id} verification evidence does not match its lifecycle event")
         if phase["status"] == "failed":
             failure_event = last_phase_failed.get(phase_id)
             if failure_event is None or failure_event["reason"] != phase["failure"]["reason"]:
                 fail(f"phase {phase_id} failure does not match its lifecycle event")
-            if "failure_snapshot" in failure_event and failure_event["failure_snapshot"] != phase["failure"]:
+            if failure_event["failure_snapshot"] != phase["failure"]:
                 fail(f"phase {phase_id} failure snapshot does not match its lifecycle event")
 
     if latest_interruption is None:
@@ -796,7 +874,7 @@ def _validate_lifecycle_graph(
             fail("interruption details do not match the lifecycle event")
         if "reason" in latest_interruption and interruption["reason"] != latest_interruption["reason"]:
             fail("interruption reason does not match the lifecycle event")
-        if latest_interruption_snapshot is not None and latest_interruption_snapshot != interruption:
+        if latest_interruption_snapshot != interruption:
             fail("interruption snapshot does not match the lifecycle event")
 
     if latest_blocker is None:
@@ -806,7 +884,7 @@ def _validate_lifecycle_graph(
         blocker = state["blocker"]
         if blocker is None or blocker["phase"] != latest_blocker.get("phase") or blocker["reason"] != latest_blocker["reason"]:
             fail("blocker details do not match the lifecycle event")
-        if "blocker_snapshot" in latest_blocker and latest_blocker["blocker_snapshot"] != blocker:
+        if latest_blocker["blocker_snapshot"] != blocker:
             fail("blocker snapshot does not match the lifecycle event")
 
     for check_id in check_ids:
@@ -818,7 +896,7 @@ def _validate_lifecycle_graph(
         else:
             if predicate_event is None or result["passed"] is not predicate_event["passed"]:
                 fail(f"predicate_results[{check_id}] does not match its lifecycle event")
-            if "result_snapshot" in predicate_event and predicate_event["result_snapshot"] != result:
+            if predicate_event["result_snapshot"] != result:
                 fail(f"predicate_results[{check_id}] evidence does not match its lifecycle event")
 
         terminal_decisions = [
@@ -1519,6 +1597,7 @@ class Workflow:
             "phase_passed",
             phase=phase["id"],
             check_id=check_id,
+            output_snapshot=deepcopy(phase["output_value"]),
             verification_snapshot=deepcopy(phase["verification_result"]),
         )
         self.record_decision(
@@ -1637,6 +1716,7 @@ class Workflow:
                 "phase": candidate_phase["id"],
                 "number": replan_record["number"],
                 "replacement": deepcopy(replan_record["replacement"]),
+                "replan_snapshot": deepcopy(replan_record),
             }
         )
         self._persist_candidate(candidate)
@@ -1873,14 +1953,15 @@ class Workflow:
         )
         event = {"event": "action_refused", **refusal}
         decision_limit = self.state["plan"]["limits"]["max_decisions"]
-        try:
-            self._append_decision_record(record, allow_limit_overflow=len(self.state["decisions"]) == decision_limit)
-        except StateError:
+        candidate = deepcopy(self.state)
+        if len(candidate["decisions"]) <= decision_limit:
+            candidate["decisions"].append(record)
+        else:
             # The refusal event remains complete when the bounded decision list
             # has already used its one permitted overflow record.
             event["decision"] = deepcopy(record)
-        self.state["events"].append(event)
-        self._persist()
+        candidate["events"].append(event)
+        self._persist_candidate(candidate)
         raise ScopeRefusal(reason, refusal)
 
     def guard_action(self, action: str, target: str | None = None) -> dict[str, Any]:
@@ -1909,75 +1990,38 @@ class Workflow:
             }
             self._refuse_action(action_value, target_display, lifecycle_reasons[self.state["status"]])
 
-        action_invalid_reason: str | None = None
-        if not isinstance(action, str):
-            action_invalid_reason = "action name is not a string"
-        elif not action:
-            action_invalid_reason = "action name is empty"
-        elif len(action) > 100:
-            action_invalid_reason = "action name exceeds 100 characters"
-        elif any(unicodedata.category(char) in {"Cc", "Cf"} for char in action):
-            action_invalid_reason = "action name contains a control or format character"
-        elif action != action.strip():
-            action_invalid_reason = "action name contains surrounding whitespace"
-        elif not SAFE_ACTION.fullmatch(action):
-            action_invalid_reason = "action name is not a declared safe action"
-        if action_invalid_reason:
-            self._refuse_action(action_value, None, action_invalid_reason)
-        assert isinstance(action, str)
-
-        target_provided = target is not None
-        target_invalid_reason: str | None = None
         target_display = target if isinstance(target, str) else None
-        if target_provided and not isinstance(target, str):
-            target_invalid_reason = "target is not a string"
+        if target is not None and (
+            not isinstance(target, str)
+            or not target
+            or len(target) > 500
+            or any(unicodedata.category(char) in {"Cc", "Cf"} for char in target)
+            or target != target.strip()
+            or "\\" in target
+            or target.startswith(("/", "~", "//"))
+            or re.match(r"^[A-Za-z]:", target)
+            or URI_SCHEME.match(target)
+            or "@" in target
+            or ".." in PurePosixPath(target).parts
+        ):
             target_display = "<invalid-target>"
-        elif target_provided and isinstance(target, str):
-            if not target:
-                target_invalid_reason = "target is empty; omit it only for a logical action"
-                target_display = "<invalid-target>"
-            elif len(target) > 500:
-                target_invalid_reason = "target exceeds 500 characters"
-                target_display = "<invalid-target>"
-            elif any(unicodedata.category(char) in {"Cc", "Cf"} for char in target):
-                target_invalid_reason = "target contains a control or format character"
-                target_display = "<invalid-target>"
-            elif target != target.strip():
-                target_invalid_reason = "target contains surrounding whitespace"
-                target_display = "<invalid-target>"
-            elif "\\" in target:
-                target_invalid_reason = "target contains a backslash escape"
-                target_display = "<invalid-target>"
-            elif target.startswith(("/", "~", "//")) or re.match(r"^[A-Za-z]:", target):
-                target_invalid_reason = "target is absolute, a drive path, or a UNC path"
-                target_display = "<invalid-target>"
-            elif URI_SCHEME.match(target):
-                target_invalid_reason = "target contains a URL or URI scheme"
-                target_display = "<invalid-target>"
-            elif "@" in target:
-                target_invalid_reason = "target looks like a credential or external host"
-                target_display = "<invalid-target>"
-            elif ".." in PurePosixPath(target).parts:
-                target_invalid_reason = "target escapes the declared scope"
-                target_display = "<invalid-target>"
 
         scope = self.state["plan"]["scope"]
-        reason: str | None = target_invalid_reason
-        if reason is None and action in scope["out_of_scope_actions"]:
-            reason = f"action {action!r} is explicitly out of scope"
-        elif reason is None and action not in scope["allowed_actions"]:
-            reason = f"action {action!r} is not declared in allowed_actions"
-        elif reason is None and target_provided and target_display is not None:
-            normalized = str(PurePosixPath(target_display))
-            if scope["allowed_paths"] and not any(
-                normalized == prefix[:-1] or normalized.startswith(prefix) for prefix in scope["allowed_paths"]
-            ):
-                reason = "target is outside scope.allowed_paths"
-        elif reason is None and scope["allowed_paths"] and not target_provided:
-            if action not in scope.get("logical_actions", []):
-                reason = "a target is required for this action in a path-constrained scope"
+        reason = _scope_action_reason(scope, action, target)
         if reason:
-            self._refuse_action(action, target_display, reason)
+            action_is_valid = (
+                isinstance(action, str)
+                and bool(action)
+                and len(action) <= 100
+                and not any(unicodedata.category(char) in {"Cc", "Cf"} for char in action)
+                and action == action.strip()
+                and SAFE_ACTION.fullmatch(action) is not None
+            )
+            self._refuse_action(
+                action if action_is_valid else action_value,
+                target_display if action_is_valid else None,
+                reason,
+            )
 
         allowed = {"at": _now(), "status": "allowed", "action": action, "target": target_display}
         self._event("action_allowed", action=action, target=target_display)
