@@ -1290,6 +1290,7 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 "phase": "phase-1",
                 "target": "token@host",
                 "reason": "target token@host was out of scope",
+                "next_action": "next target token@host",
                 "private": {"target": "token@host"},
             }]
             mislabeled_decision = mislabeled_legacy["decisions"][0]
@@ -1302,6 +1303,7 @@ class WorkflowBehaviorTests(unittest.TestCase):
             mislabeled_audit = migrated_mislabeled.export_audit(root / "mislabeled-refusal.tsv").read_text(encoding="utf-8")
             self.assertNotIn("token@host", json.dumps(migrated_mislabeled.state))
             self.assertNotIn("token@host", mislabeled_audit)
+            self.assertNotIn("next_action", migrated_mislabeled.state["events"][0])
 
             malformed_cases = {
                 "predicate-results": lambda state: state.update(predicate_results=[]),

@@ -2058,6 +2058,7 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                 else:
                     event.pop("target", None)
                     event.pop("reason", None)
+                    event.pop("next_action", None)
                     event.pop("private", None)
             event["__migration_decision"] = record
             event["__migration_listed"] = listed
