@@ -259,7 +259,10 @@ GCLOUD_EFFECTFUL_RE = re.compile(
     + r"components\s+install|"
     + r"config\s+configurations\s+activate|"
     + r"container\s+fleet\s+memberships\s+register|"
+    + r"container\s+operations\s+cancel|"
+    + r"compute\s+disks\s+snapshot|"
     + r"dns\s+record-sets\s+transaction\s+execute|"
+    + r"dns\s+record-sets\s+transaction\s+abort|"
     + r"run\s+jobs\s+execute|scheduler\s+jobs\s+(?:run|pause)|"
     + r"workflows\s+run)(?![a-z0-9_-])"
 )
@@ -868,10 +871,10 @@ def _validate_routing_case_records(ledger: Dict[str, Any]) -> List[str]:
             elif rule not in known_rules:
                 errors.append("%s references unknown rule: %s" % (context, rule))
             elif rule == "SP-K8S-SAFETY":
-                if safety == "safe" and expected_repositories and "web-k8s" not in expected_repositories:
+                if safety != "unsafe" or expected != "unsafe":
                     errors.append(
-                        "%s.rule is incompatible with task owners: expected one of %r, got %r"
-                        % (context, expected_repositories, EXPECTED_RULE_REPOSITORIES[rule])
+                        "%s.rule is incompatible with task owners and safe routing: SP-K8S-SAFETY requires unsafe/manual review"
+                        % context
                     )
             elif not expected_repositories:
                 errors.append("%s.rule requires a task owner" % context)

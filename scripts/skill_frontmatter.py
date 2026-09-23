@@ -22,7 +22,9 @@ YAML_NUMBER_RE = re.compile(
 YAML_BASE_PREFIX_RE = re.compile(
     rf"[-+]?(?:0[xX]{YAML_HEX_DIGITS}|0[bB]{YAML_BINARY_DIGITS})"
 )
+YAML_OCTAL_PREFIX_RE = re.compile(rf"[-+]?0[oO]{YAML_OCTAL_DIGITS}")
 YAML_LEGACY_OCTAL_RE = re.compile(rf"[-+]?0(?:{YAML_OCTAL_DIGITS}|_{YAML_OCTAL_DIGITS})")
+YAML_INVALID_LEGACY_OCTAL_RE = re.compile(r"[-+]?0[0-9_]*[89][0-9_]*(?:\.[0-9_]*)?(?:[eE][-+]?\d+)?")
 YAML_SEXAGESIMAL_RE = re.compile(
     rf"[-+]?{YAML_DECIMAL_DIGITS}(?::[0-5]?[0-9])+(?:\.{YAML_DECIMAL_DIGITS})?"
 )
@@ -128,8 +130,9 @@ def _scalar_value_error(field: str, raw_value: str) -> str | None:
             return f"{field} must be a scalar string, not a boolean"
         return f"{field} must be a non-null scalar string"
     if (
-        YAML_NUMBER_RE.fullmatch(value)
+        (YAML_NUMBER_RE.fullmatch(value) and not YAML_INVALID_LEGACY_OCTAL_RE.fullmatch(value))
         or YAML_BASE_PREFIX_RE.fullmatch(value)
+        or YAML_OCTAL_PREFIX_RE.fullmatch(value)
         or YAML_LEGACY_OCTAL_RE.fullmatch(value)
         or YAML_SEXAGESIMAL_RE.fullmatch(value)
         or YAML_SPECIAL_FLOAT_RE.fullmatch(value)
@@ -165,7 +168,8 @@ def required_frontmatter_errors(metadata: str) -> list[str]:
         raw_value = (match.group("value") or "").strip()
         indicator = _without_inline_comment(raw_value)
         block_match = re.fullmatch(
-            r"(?P<style>[|>])(?P<indent>[1-9]?)(?P<chomp>[+-]?)", indicator
+            r"(?P<style>[|>])(?:(?P<chomp_before>[+-])?(?P<indent>[1-9])(?P<chomp_after>[+-])?|(?P<chomp_only>[+-])?)",
+            indicator,
         )
         if block_match:
             block_fields.add(field)
@@ -180,9 +184,14 @@ def required_frontmatter_errors(metadata: str) -> list[str]:
                     content.append("")
                     index += 1
                     continue
-                leading = len(next_line) - len(next_line.lstrip())
+                whitespace_prefix = next_line[: len(next_line) - len(next_line.lstrip(" \t"))]
+                if "\t" in whitespace_prefix:
+                    invalid_indent = True
+                    index += 1
+                    continue
+                leading = len(next_line) - len(next_line.lstrip(" "))
                 if leading == 0:
-                    if re.match(r"^[A-Za-z_][A-Za-z0-9_-]*:", next_line):
+                    if next_line.startswith("#") or re.match(r"^[A-Za-z_][A-Za-z0-9_-]*:", next_line):
                         break
                     invalid_indent = True
                     index += 1

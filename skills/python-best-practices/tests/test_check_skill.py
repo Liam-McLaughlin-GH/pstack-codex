@@ -96,7 +96,10 @@ class RoutingRegressionTests(unittest.TestCase):
             "gcloud components install kubectl",
             "gcloud config configurations activate production",
             "gcloud container fleet memberships register membership",
+            "gcloud container operations cancel operation",
+            "gcloud compute disks snapshot disk",
             "gcloud dns record-sets transaction execute",
+            "gcloud dns record-sets transaction abort",
             "gcloud run jobs execute job",
             "gcloud scheduler jobs run job",
             "gcloud scheduler jobs pause job",
@@ -510,7 +513,6 @@ class DocumentIntegrityTests(unittest.TestCase):
                 '"1_000"',
                 '"!<tag:yaml.org,2002:int> 1"',
                 "!<tag:yaml.org,2002:str> 1",
-                "0o12",
             ):
                 with self.subTest(field=field, value=value):
                     candidate = self.skill_text.replace(
@@ -523,6 +525,29 @@ class DocumentIntegrityTests(unittest.TestCase):
                         any(field in error for error in errors),
                         errors,
                     )
+
+            for value in ("09", "08"):
+                with self.subTest(field=field, value=value):
+                    candidate = self.skill_text.replace(
+                        original,
+                        f"{field}: {value}",
+                        1,
+                    )
+                    errors = CHECKER.check_documents(candidate, self.ledger)
+                    self.assertFalse(
+                        any(field in error for error in errors),
+                        errors,
+                    )
+
+            for value in ("0o12", "0O12"):
+                with self.subTest(field=field, value=value):
+                    candidate = self.skill_text.replace(
+                        original,
+                        f"{field}: {value}",
+                        1,
+                    )
+                    errors = CHECKER.check_documents(candidate, self.ledger)
+                    self.assertTrue(any(field in error for error in errors), errors)
 
     def test_valid_block_scalars_and_string_aliases_are_accepted(self) -> None:
         name_line = "name: python-best-practices"
@@ -559,6 +584,29 @@ class DocumentIntegrityTests(unittest.TestCase):
             1,
         )
         self.assertTrue(CHECKER.check_documents(malformed_block, self.ledger))
+
+        for indicator in ("|+2", "|2+"):
+            with self.subTest(indicator=indicator):
+                valid_block = self.skill_text.replace(
+                    name_line,
+                    f"name: {indicator}\n  python-best-practices",
+                    1,
+                )
+                self.assertFalse(CHECKER.check_documents(valid_block, self.ledger))
+
+        top_level_comment = self.skill_text.replace(
+            name_line,
+            "name: |\n  python-best-practices\n# comment",
+            1,
+        )
+        self.assertFalse(CHECKER.check_documents(top_level_comment, self.ledger))
+
+        tab_indented = self.skill_text.replace(
+            name_line,
+            "name: |\n\tpython-best-practices",
+            1,
+        )
+        self.assertTrue(CHECKER.check_documents(tab_indented, self.ledger))
 
     def test_shared_port_boundary_rejects_non_scalar_required_frontmatter(self) -> None:
         for field in ("name", "description"):
@@ -756,6 +804,14 @@ class DocumentIntegrityTests(unittest.TestCase):
         django_case["rule"] = "SP-K8S-SAFETY"
         errors = CHECKER.check_documents(self.skill_text, wrong_safety_rule)
         self.assertTrue(any("rule is incompatible with task owners" in error for error in errors), errors)
+
+        safe_k8s_rule = copy.deepcopy(self.ledger)
+        offline_case = next(
+            case for case in safe_k8s_rule["routing_cases"] if case["name"] == "offline-deployment-test"
+        )
+        offline_case["rule"] = "SP-K8S-SAFETY"
+        errors = CHECKER.check_documents(self.skill_text, safe_k8s_rule)
+        self.assertTrue(any("requires unsafe/manual review" in error for error in errors), errors)
 
         ownerless_rule = copy.deepcopy(self.ledger)
         production_case = next(
