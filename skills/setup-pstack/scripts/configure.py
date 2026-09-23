@@ -23,6 +23,7 @@ if str(SCRIPT_DIRECTORY) not in sys.path:
 
 from safe_fs import (  # noqa: E402
     SafeFilesystemError,
+    CleanupReceipt,
     atomic_exchange_at,
     atomic_rename_noreplace_at,
     TreeSnapshot,
@@ -74,11 +75,14 @@ class ConfigurationError(RuntimeError):
         status: str = "failed",
         residue: Path | None = None,
         retry: str | None = None,
+        recovery_receipt: CleanupReceipt | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
         self.residue = residue
         self.retry = retry
+        self.recovery_receipt = recovery_receipt
+        self.receipt = recovery_receipt
 
     def as_dict(self) -> dict[str, object]:
         result: dict[str, object] = {"status": self.status, "error": str(self)}
@@ -86,6 +90,8 @@ class ConfigurationError(RuntimeError):
             result["residue"] = str(self.residue)
         if self.retry is not None:
             result["retry"] = self.retry
+        if self.recovery_receipt is not None:
+            result["recovery_receipt"] = self.recovery_receipt.as_dict()
         return result
 
 
@@ -731,6 +737,20 @@ def _cleanup_published_generation(
                 expected_residue,
                 expected_snapshot,
             )
+        try:
+            current_residue = lstat_at(parent_fd, residue_name)
+        except FileNotFoundError:
+            pass
+        else:
+            return _publication_state(
+                parent_fd,
+                parent_path,
+                root_name,
+                residue_name,
+                expected_root,
+                expected_residue,
+                expected_snapshot,
+            )
         return _publication_state(
             parent_fd,
             parent_path,
@@ -988,6 +1008,7 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
     primary_error: BaseException | None = None
     outcome: TransactionOutcome | None = None
     published_snapshot: TreeSnapshot | None = None
+    recovery_receipt: CleanupReceipt | None = None
     try:
         with directory_lock(parent_handle.fd):
             try:
@@ -1061,6 +1082,8 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
                     try:
                         cleanup_created_directories(parent_handle.created)
                     except (OSError, SafeFilesystemError) as exc:
+                        if isinstance(exc, SafeFilesystemError):
+                            recovery_receipt = exc.cleanup_receipt
                         cleanup_errors.append(f"created parent cleanup: {exc}")
                         close_created_directories(parent_handle.created)
                 else:
@@ -1080,11 +1103,14 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
                     retry_command = _cleanup_retry_hint(residue, staging_metadata) if residue is not None else None
                     if retry_command:
                         message += f". Retry with {retry_command}"
+                    if recovery_receipt is not None:
+                        message += f". Recovery receipt: {recovery_receipt.render()}"
                     raise ConfigurationError(
                         message,
                         status="cleanup_pending",
                         residue=residue,
                         retry=retry_command,
+                        recovery_receipt=recovery_receipt,
                     ) from primary_error
     except BaseException as exc:
         primary_error = exc

@@ -250,6 +250,11 @@ class SetupPstackBehaviorTests(unittest.TestCase):
                 module.cleanup_created_directories = original_cleanup
             self.assertEqual(raised.exception.status, "cleanup_pending")
             self.assertIn("created parent cleanup", str(raised.exception))
+            self.assertIsNotNone(raised.exception.recovery_receipt)
+            self.assertLessEqual(len(raised.exception.recovery_receipt.entries), 8)
+            self.assertIn("skills", {entry.path.name for entry in raised.exception.recovery_receipt.entries})
+            self.assertIn("Recovery receipt:", str(raised.exception))
+            self.assertEqual(raised.exception.as_dict()["recovery_receipt"], raised.exception.recovery_receipt.as_dict())
             self.assertEqual((destination / "operator.txt").read_text(encoding="utf-8"), "keep me\n")
             self.assertTrue((root / "original-skills").is_dir())
 
@@ -795,6 +800,39 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertEqual((outcome.residue / "operator.txt").read_text(encoding="utf-8"), "keep residue\n")
             self.assertTrue((root / "original-residue" / "pstack-feature.toml").is_file())
 
+    def test_publication_cleanup_preserves_replacement_residue_and_never_reports_published(self) -> None:
+        module = load_module(CONFIGURER, "configure_for_publication_cleanup_replacement_test")
+        safe_fs = sys.modules["safe_fs"]
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-publication-cleanup-replacement-test-") as temporary:
+            root = Path(temporary)
+            models = {"codex-test": module.Model("codex-test", ("low", "medium", "high", "xhigh"))}
+            agents = root / ".codex" / "agents"
+            initial = module.build_plan(models, agents, budget="medium", default_model="codex-test")
+            module.apply_plan(initial, agents)
+            replacement = module.build_plan(models, agents, budget="large")
+            replacement_residue = root / "replacement-residue"
+            replacement_residue.mkdir()
+            (replacement_residue / "operator.txt").write_text("keep residue\n", encoding="utf-8")
+            original_rename = safe_fs.atomic_rename_noreplace_at
+            swapped = False
+
+            def replace_after_residue_binding(parent_fd: int, source_name: str, target_name: str) -> None:
+                nonlocal swapped
+                original_rename(parent_fd, source_name, target_name)
+                if not swapped and source_name.startswith(".pstack-agents-") and target_name.startswith(".pstack-cleanup-"):
+                    swapped = True
+                    os.rename(replacement_residue, agents.parent / source_name)
+
+            safe_fs.atomic_rename_noreplace_at = replace_after_residue_binding
+            try:
+                outcome = module.apply_plan(replacement, agents, allow_replace=True)
+            finally:
+                safe_fs.atomic_rename_noreplace_at = original_rename
+            self.assertTrue(swapped)
+            self.assertEqual(outcome.status, "publication_recovery_pending")
+            self.assertNotEqual(outcome.status, "published")
+            self.assertEqual((outcome.residue / "operator.txt").read_text(encoding="utf-8"), "keep residue\n")
+
     def test_configuration_fallback_publishes_and_cleans_by_identity(self) -> None:
         module = load_module(CONFIGURER, "configure_for_fallback_test")
         with tempfile.TemporaryDirectory(prefix="setup-pstack-config-fallback-test-") as temporary:
@@ -897,6 +935,81 @@ class SetupPstackBehaviorTests(unittest.TestCase):
                 else:
                     self.assertEqual((victim / "replacement.txt").read_text(encoding="utf-8"), "replacement\n")
                     self.assertEqual((root / "expected-victim" / "expected.txt").read_text(encoding="utf-8"), "expected\n")
+
+    def test_recursive_cleanup_preserves_replacement_after_binding_an_entry(self) -> None:
+        module = load_module(CONFIGURER, "configure_for_recursive_cleanup_replacement_test")
+        safe_fs = sys.modules["safe_fs"]
+        for kind in ("file", "directory"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(prefix="setup-pstack-bound-cleanup-test-") as temporary:
+                root = Path(temporary)
+                parent = root / "parent"
+                parent.mkdir()
+                residue = parent / ".pstack-agents-old-test"
+                residue.mkdir()
+                victim = residue / "victim"
+                replacement = root / "replacement"
+                if kind == "file":
+                    victim.write_text("expected\n", encoding="utf-8")
+                    replacement.write_text("replacement\n", encoding="utf-8")
+                else:
+                    victim.mkdir()
+                    (victim / "expected.txt").write_text("expected\n", encoding="utf-8")
+                    replacement.mkdir()
+                    (replacement / "replacement.txt").write_text("replacement\n", encoding="utf-8")
+                original_rename = safe_fs.atomic_rename_noreplace_at
+                swapped = False
+
+                def replace_after_binding(parent_fd: int, source_name: str, target_name: str) -> None:
+                    nonlocal swapped
+                    original_rename(parent_fd, source_name, target_name)
+                    if not swapped and source_name == "victim":
+                        swapped = True
+                        os.rename(replacement, victim)
+
+                safe_fs.atomic_rename_noreplace_at = replace_after_binding
+                try:
+                    with self.assertRaises(module.ConfigurationError) as raised:
+                        module._cleanup_residue(residue)
+                finally:
+                    safe_fs.atomic_rename_noreplace_at = original_rename
+                self.assertTrue(swapped)
+                self.assertEqual(raised.exception.status, "cleanup_refused")
+                if kind == "file":
+                    self.assertEqual(victim.read_text(encoding="utf-8"), "replacement\n")
+                else:
+                    self.assertEqual((victim / "replacement.txt").read_text(encoding="utf-8"), "replacement\n")
+
+    def test_created_parent_recovery_receipt_is_bounded_and_deterministic(self) -> None:
+        module = load_module(CONFIGURER, "configure_for_bounded_cleanup_receipt_test")
+        safe_fs = sys.modules["safe_fs"]
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-cleanup-receipt-bound-test-") as temporary:
+            root = Path(temporary)
+            parent = root / "parent"
+            parent.mkdir()
+            parent_fd = os.open(parent, os.O_RDONLY)
+            created: list[object] = []
+            try:
+                for index in range(12):
+                    name = f"created-{index:02d}"
+                    path = parent / name
+                    path.mkdir()
+                    metadata = safe_fs.lstat_at(parent_fd, name)
+                    os.rename(path, root / f"original-{index:02d}")
+                    path.mkdir()
+                    (path / "operator.txt").write_text("keep me\n", encoding="utf-8")
+                    created.append(safe_fs.CreatedDirectory(os.dup(parent_fd), name, path, metadata))
+            finally:
+                os.close(parent_fd)
+            with self.assertRaises(safe_fs.SafeFilesystemError) as raised:
+                safe_fs.cleanup_created_directories(created)
+            receipt = raised.exception.cleanup_receipt
+            self.assertIsNotNone(receipt)
+            self.assertEqual(len(receipt.entries), 8)
+            self.assertTrue(receipt.truncated)
+            self.assertEqual([entry.path.name for entry in receipt.entries], [f"created-{index:02d}" for index in range(8)])
+            self.assertEqual(receipt.render(), receipt.render())
+            for index in range(12):
+                self.assertEqual((parent / f"created-{index:02d}" / "operator.txt").read_text(encoding="utf-8"), "keep me\n")
 
     def test_cleanup_retry_refuses_a_replaced_residue_identity(self) -> None:
         with tempfile.TemporaryDirectory(prefix="setup-pstack-cleanup-retry-identity-test-") as temporary:
@@ -1446,6 +1559,10 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             helper.write_text("from cursor_tools \\\n    import Task,\n", encoding="utf-8")
             continued_module_import_errors = module.verify_port(root, run_helpers=False)
             self.assertTrue(any("Cursor Task call" in error for error in continued_module_import_errors))
+
+            helper.write_text("from cursor_tools \\\n    import (\n        Task,\n    )\n", encoding="utf-8")
+            continued_parenthesized_import_errors = module.verify_port(root, run_helpers=False)
+            self.assertTrue(any("Cursor Task call" in error for error in continued_parenthesized_import_errors))
 
             helper.write_text("result = Task(prompt, model=\"grok\")  # UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")
             mjs_helper.write_text("from cursor_tools import Task  // UNSUPPORTED-SEAM: Cursor Task\nTask(prompt)  // UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")

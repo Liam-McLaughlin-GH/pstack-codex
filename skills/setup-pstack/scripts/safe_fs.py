@@ -5,6 +5,7 @@ from __future__ import annotations
 import errno
 import ctypes
 import fcntl
+import json
 import os
 import secrets
 import stat
@@ -16,6 +17,48 @@ from pathlib import Path
 
 class SafeFilesystemError(RuntimeError):
     """Raised when a requested path cannot be used without following a link."""
+
+    def __init__(self, message: str, *, cleanup_receipt: "CleanupReceipt | None" = None) -> None:
+        super().__init__(message)
+        self.cleanup_receipt = cleanup_receipt
+        self.recovery_receipt = cleanup_receipt
+        self.receipt = cleanup_receipt
+
+
+@dataclass(frozen=True)
+class CleanupReceiptEntry:
+    path: Path
+    expected_dev: int
+    expected_ino: int
+    reason: str
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "path": str(self.path),
+            "expected_dev": self.expected_dev,
+            "expected_ino": self.expected_ino,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class CleanupReceipt:
+    entries: tuple[CleanupReceiptEntry, ...]
+    truncated: bool = False
+
+    @classmethod
+    def from_entries(cls, entries: list[CleanupReceiptEntry]) -> "CleanupReceipt":
+        ordered = sorted(entries, key=lambda entry: (str(entry.path), entry.expected_dev, entry.expected_ino, entry.reason))
+        return cls(tuple(ordered[:8]), len(ordered) > 8)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "entries": [entry.as_dict() for entry in self.entries],
+            "truncated": self.truncated,
+        }
+
+    def render(self) -> str:
+        return json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":"))
 
 
 @dataclass
@@ -138,7 +181,7 @@ def close_created_directories(created: list[CreatedDirectory]) -> None:
 
 
 def cleanup_created_directories(created: list[CreatedDirectory]) -> None:
-    errors: list[str] = []
+    failures: list[CleanupReceiptEntry] = []
     for entry in reversed(created):
         try:
             try:
@@ -146,22 +189,49 @@ def cleanup_created_directories(created: list[CreatedDirectory]) -> None:
             except FileNotFoundError:
                 continue
             if not _same_entry(current, entry.metadata):
-                raise SafeFilesystemError(f"created directory identity changed during cleanup: {entry.path}")
+                raise SafeFilesystemError("created directory identity changed during cleanup")
             if not stat.S_ISDIR(current.st_mode):
-                raise SafeFilesystemError(f"created path is no longer a directory during cleanup: {entry.path}")
-            os.rmdir(entry.name, dir_fd=entry.parent_fd)
+                raise SafeFilesystemError("created path is no longer a directory during cleanup")
+            _remove_owned_empty_directory(entry.parent_fd, entry.name, entry.metadata)
         except OSError as exc:
             if exc.errno != errno.ENOENT:
-                errors.append(f"{entry.path}: {exc}")
+                reason = "not-empty" if exc.errno in {errno.ENOTEMPTY, errno.EEXIST, errno.EBUSY} else "cleanup-error"
+                failures.append(
+                    CleanupReceiptEntry(
+                        entry.path,
+                        entry.metadata.st_dev,
+                        entry.metadata.st_ino,
+                        reason,
+                    )
+                )
         except SafeFilesystemError as exc:
-            errors.append(str(exc))
+            reason = (
+                "replaced"
+                if "identity" in str(exc) or "no longer a directory" in str(exc) or "replacement" in str(exc)
+                else "cleanup-error"
+            )
+            failures.append(
+                CleanupReceiptEntry(
+                    entry.path,
+                    entry.metadata.st_dev,
+                    entry.metadata.st_ino,
+                    reason,
+                )
+            )
         finally:
             try:
                 os.close(entry.parent_fd)
             except OSError:
                 pass
-    if errors:
-        raise SafeFilesystemError("created directory cleanup incomplete: " + "; ".join(errors))
+    if failures:
+        receipt = CleanupReceipt.from_entries(failures)
+        detail = ", ".join(f"{entry.path} ({entry.reason})" for entry in receipt.entries)
+        if receipt.truncated:
+            detail += ", ..."
+        raise SafeFilesystemError(
+            "created directory cleanup incomplete: " + detail,
+            cleanup_receipt=receipt,
+        )
 
 
 @contextmanager
@@ -437,6 +507,78 @@ def _bind_tree_at(
     return identities
 
 
+def _restore_bound_entry(parent_fd: int, public_name: str, private_name: str) -> None:
+    """Put a quarantined entry back without overwriting a replacement."""
+
+    try:
+        lstat_at(parent_fd, private_name)
+    except FileNotFoundError:
+        return
+    try:
+        lstat_at(parent_fd, public_name)
+    except FileNotFoundError:
+        try:
+            atomic_rename_noreplace_at(parent_fd, private_name, public_name)
+        except FileExistsError:
+            return
+        except (OSError, SafeFilesystemError) as exc:
+            raise SafeFilesystemError(
+                f"could not restore cleanup entry {private_name} as {public_name}: {exc}"
+            ) from exc
+
+
+def _move_bound_entry(parent_fd: int, name: str, expected_metadata: os.stat_result) -> str:
+    """Move an identity-checked entry to a private name before removing it."""
+
+    current_metadata = lstat_at(parent_fd, name)
+    if not _same_entry(current_metadata, expected_metadata):
+        raise SafeFilesystemError(f"entry identity changed during removal: {name}")
+    private_name = unique_entry_name(parent_fd, ".pstack-cleanup-")
+    try:
+        atomic_rename_noreplace_at(parent_fd, name, private_name)
+    except FileNotFoundError as exc:
+        raise SafeFilesystemError(f"entry disappeared during removal: {name}") from exc
+    try:
+        moved_metadata = lstat_at(parent_fd, private_name)
+        if not _same_entry(moved_metadata, expected_metadata):
+            raise SafeFilesystemError(f"entry identity changed during removal: {name}")
+    except BaseException as exc:
+        try:
+            _restore_bound_entry(parent_fd, name, private_name)
+        except SafeFilesystemError as restore_error:
+            raise SafeFilesystemError(f"{exc}; {restore_error}") from exc
+        raise
+    return private_name
+
+
+def _remove_owned_empty_directory(parent_fd: int, name: str, expected_metadata: os.stat_result) -> None:
+    """Remove a created directory without ever rmdir-ing a replacement."""
+
+    private_name = _move_bound_entry(parent_fd, name, expected_metadata)
+    moved = True
+    try:
+        try:
+            current_metadata = lstat_at(parent_fd, private_name)
+        except FileNotFoundError as exc:
+            raise SafeFilesystemError(f"created directory disappeared during cleanup: {name}") from exc
+        if not _same_entry(current_metadata, expected_metadata) or not stat.S_ISDIR(current_metadata.st_mode):
+            raise SafeFilesystemError(f"created directory identity changed during cleanup: {name}")
+        os.rmdir(private_name, dir_fd=parent_fd)
+        moved = False
+        try:
+            lstat_at(parent_fd, name)
+        except FileNotFoundError:
+            return
+        raise SafeFilesystemError(f"created directory replacement appeared during cleanup: {name}")
+    except BaseException as exc:
+        if moved:
+            try:
+                _restore_bound_entry(parent_fd, name, private_name)
+            except SafeFilesystemError as restore_error:
+                raise SafeFilesystemError(f"{exc}; {restore_error}") from exc
+        raise
+
+
 def remove_tree_at(
     parent_fd: int,
     name: str,
@@ -445,28 +587,47 @@ def remove_tree_at(
     guard_name: str | None = None,
     guard_metadata: os.stat_result | None = None,
 ) -> None:
-    """Remove an entry without following links, optionally binding identities.
+    """Remove an entry by first binding every owned entry to a private name.
 
     ``guard_name``/``guard_metadata`` protect a sibling publication root while
-    a residue generation is removed. The caller still serializes the parent
-    directory with ``directory_lock``; the repeated checks close the unsafe
-    check-then-remove windows for callers that also need to detect an
-    uncooperative replacement.
+    a residue generation is removed. Each entry is identity-checked, moved
+    with a no-replace rename, and only then deleted from its private name. A
+    replacement at the public name is therefore never the victim of cleanup.
     """
 
     if guard_name is not None and guard_metadata is None:
         raise ValueError("guard_metadata is required when guard_name is set")
 
-    def validate_entry(entry_name: str, expected: os.stat_result | None) -> os.stat_result:
-        entry_metadata = lstat_at(parent_fd, entry_name)
-        if expected is not None and not _same_entry(entry_metadata, expected):
+    def validate_entry(directory_fd: int, entry_name: str, expected: os.stat_result) -> os.stat_result:
+        entry_metadata = lstat_at(directory_fd, entry_name)
+        if not _same_entry(entry_metadata, expected):
             raise SafeFilesystemError(f"entry identity changed during removal: {entry_name}")
         return entry_metadata
 
+    def validate_guard() -> None:
+        if guard_name is not None and guard_metadata is not None:
+            validate_entry(parent_fd, guard_name, guard_metadata)
+
     identities = _bind_tree_at(parent_fd, name, expected_metadata)
-    metadata = validate_entry(name, identities[()])
-    if guard_name is not None:
-        validate_entry(guard_name, guard_metadata)
+    metadata = identities[()]
+
+    def remove_directory_children(directory_fd: int, relative: tuple[str, ...]) -> None:
+        children = sorted(os.listdir(directory_fd))
+        expected_children = {
+            path[0]
+            for path in identities
+            if len(path) == len(relative) + 1 and path[:-1] == relative
+        }
+        if set(children) != expected_children:
+            raise SafeFilesystemError("directory contents changed during removal")
+        for child in children:
+            child_relative = relative + (child,)
+            remove_bound(
+                directory_fd,
+                child,
+                child_relative,
+                identities[child_relative],
+            )
 
     def remove_bound(
         directory_parent_fd: int,
@@ -476,47 +637,56 @@ def remove_tree_at(
         *,
         top_level: bool = False,
     ) -> None:
-        current_metadata = lstat_at(directory_parent_fd, entry_name)
-        if not _same_entry(current_metadata, entry_metadata):
-            raise SafeFilesystemError(f"entry identity changed during removal: {entry_name}")
-        if stat.S_ISDIR(entry_metadata.st_mode):
-            directory_fd = _open_child_directory(directory_parent_fd, entry_name)
+        validate_guard()
+        private_name: str | None = None
+        moved = True
+        try:
+            if top_level and stat.S_ISDIR(entry_metadata.st_mode):
+                validate_entry(directory_parent_fd, entry_name, entry_metadata)
+                directory_fd = _open_child_directory(directory_parent_fd, entry_name)
+                try:
+                    opened_metadata = os.fstat(directory_fd)
+                    if not _same_entry(opened_metadata, entry_metadata):
+                        raise SafeFilesystemError(f"entry identity changed during removal: {entry_name}")
+                    remove_directory_children(directory_fd, relative)
+                finally:
+                    os.close(directory_fd)
+                validate_guard()
+                private_name = _move_bound_entry(directory_parent_fd, entry_name, entry_metadata)
+                validate_entry(directory_parent_fd, private_name, entry_metadata)
+                os.rmdir(private_name, dir_fd=directory_parent_fd)
+            else:
+                private_name = _move_bound_entry(directory_parent_fd, entry_name, entry_metadata)
+                moved_metadata = validate_entry(directory_parent_fd, private_name, entry_metadata)
+                if stat.S_ISDIR(moved_metadata.st_mode):
+                    directory_fd = _open_child_directory(directory_parent_fd, private_name)
+                    try:
+                        opened_metadata = os.fstat(directory_fd)
+                        if not _same_entry(opened_metadata, entry_metadata):
+                            raise SafeFilesystemError(f"entry identity changed during removal: {entry_name}")
+                        remove_directory_children(directory_fd, relative)
+                    finally:
+                        os.close(directory_fd)
+                    validate_guard()
+                    validate_entry(directory_parent_fd, private_name, entry_metadata)
+                    os.rmdir(private_name, dir_fd=directory_parent_fd)
+                else:
+                    validate_guard()
+                    validate_entry(directory_parent_fd, private_name, entry_metadata)
+                    os.unlink(private_name, dir_fd=directory_parent_fd)
+            moved = False
             try:
-                opened_metadata = os.fstat(directory_fd)
-                if not _same_entry(opened_metadata, entry_metadata):
-                    raise SafeFilesystemError(f"entry identity changed during removal: {entry_name}")
-                children = sorted(os.listdir(directory_fd))
-                expected_children = {
-                    path[0]
-                    for path in identities
-                    if len(path) == len(relative) + 1 and path[:-1] == relative
-                }
-                if set(children) != expected_children:
-                    raise SafeFilesystemError(f"directory contents changed during removal: {entry_name}")
-                for child in children:
-                    child_relative = relative + (child,)
-                    remove_bound(
-                        directory_fd,
-                        child,
-                        child_relative,
-                        identities[child_relative],
-                    )
-            finally:
-                os.close(directory_fd)
-            current_metadata = lstat_at(directory_parent_fd, entry_name)
-            if not _same_entry(current_metadata, entry_metadata):
-                raise SafeFilesystemError(f"entry identity changed during removal: {entry_name}")
-            if top_level and guard_name is not None:
-                validate_entry(guard_name, guard_metadata)
-            os.rmdir(entry_name, dir_fd=directory_parent_fd)
-            return
-
-        current_metadata = lstat_at(directory_parent_fd, entry_name)
-        if not _same_entry(current_metadata, entry_metadata):
-            raise SafeFilesystemError(f"entry identity changed during removal: {entry_name}")
-        if top_level and guard_name is not None:
-            validate_entry(guard_name, guard_metadata)
-        os.unlink(entry_name, dir_fd=directory_parent_fd)
+                lstat_at(directory_parent_fd, entry_name)
+            except FileNotFoundError:
+                return
+            raise SafeFilesystemError(f"replacement appeared during removal: {entry_name}")
+        except BaseException as exc:
+            if moved and private_name is not None:
+                try:
+                    _restore_bound_entry(directory_parent_fd, entry_name, private_name)
+                except SafeFilesystemError as restore_error:
+                    raise SafeFilesystemError(f"{exc}; {restore_error}") from exc
+            raise
 
     remove_bound(parent_fd, name, (), metadata, top_level=True)
 

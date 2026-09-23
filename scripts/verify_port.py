@@ -39,11 +39,13 @@ ACTIVE_SEAMS = (
     ),
     ("create-skill call", re.compile(r"(?:/create-skill\b|\bcreate-skill\s+(?:tool|command)\b)", re.IGNORECASE)),
 )
+EXPLICIT_CONTINUATION = r"\\[ \t]*\r?\n[ \t]*"
+IMPORT_SEPARATOR = rf"[ \t]+(?:{EXPLICIT_CONTINUATION})?"
 MULTILINE_CURSOR_TASK_IMPORT = re.compile(
-    r"\bfrom\s+cursor_tools\s+import\s*\((?P<body>(?=[^)]*\n)[^)]*\bTask\b[^)]*)\)",
+    rf"\bfrom{IMPORT_SEPARATOR}cursor_tools{IMPORT_SEPARATOR}import"
+    rf"(?:{IMPORT_SEPARATOR})*\((?P<body>(?=[^)]*\n)[^)]*\bTask\b[^)]*)\)",
     re.IGNORECASE | re.DOTALL,
 )
-EXPLICIT_CONTINUATION = r"\\[ \t]*\r?\n[ \t]*"
 BACKSLASH_CURSOR_TASK_IMPORT = re.compile(
     rf"\bfrom\s+cursor_tools(?:(?:[ \t]+{EXPLICIT_CONTINUATION})+|[ \t]+)import"
     rf"(?P<body>(?:[^\n]|{EXPLICIT_CONTINUATION}|\([^)]*\))*\bTask\b[^\n]*)",
@@ -294,7 +296,10 @@ def _check_boundary_mentions(root: Path, path: Path, text: str, errors: list[str
                     "add an explicit same-line UNSUPPORTED-SEAM annotation or use a Codex surface"
                 )
 
-    for import_pattern in (MULTILINE_CURSOR_TASK_IMPORT, BACKSLASH_CURSOR_TASK_IMPORT):
+    for import_pattern in (
+        MULTILINE_CURSOR_TASK_IMPORT,
+        BACKSLASH_CURSOR_TASK_IMPORT,
+    ):
         for match in import_pattern.finditer(text):
             if import_pattern is BACKSLASH_CURSOR_TASK_IMPORT and "\\" not in match.group(0):
                 continue
