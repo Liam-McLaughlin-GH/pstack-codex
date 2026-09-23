@@ -120,6 +120,8 @@ class WorkflowBehaviorTests(unittest.TestCase):
             self.assertEqual(audit_lines[0], "ts\tphase\tdecision\twhy\tevidence\tresult")
             self.assertGreater(len(audit_lines), 1)
             self.assertTrue(any("phase-1" in line and "verified" in line for line in audit_lines[1:]))
+            self.assertTrue(any("checkpoint: baseline captured" in line for line in audit_lines[1:]))
+            self.assertTrue(any("artifacts/baseline.txt" in line for line in audit_lines[1:]))
 
     def test_failed_phase_requires_replan_before_retry(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -593,6 +595,185 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 len({phase["verification"]["id"] for phase in workflow.state["plan"]["phases"]}),
                 2,
             )
+
+    def test_replan_without_replacement_is_atomic_and_reloadable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root / "reloadable", phase_count=1)
+            workflow.start_phase()
+            workflow.fail_phase("phase check disagreed", ["tests/failure.txt"], "try the bounded approach again")
+
+            replanned = workflow.replan(
+                "the first check used the wrong fixture boundary",
+                ["tests/failure.txt"],
+                "start phase-1 again",
+            )
+            self.assertEqual(
+                replanned["replans"][0]["replacement"],
+                replanned["plan"]["phases"][0],
+            )
+            reloaded = figure_it_out.Workflow.load(root / "reloadable" / "run.json", workspace_root=root / "reloadable")
+            self.assertEqual(reloaded.state["status"], "planned")
+            self.assertEqual(reloaded.state["replans"][0]["replacement"], replanned["replans"][0]["replacement"])
+
+            atomic = self.workflow(root / "atomic", phase_count=1)
+            atomic.start_phase()
+            atomic.fail_phase("phase check disagreed", ["tests/failure.txt"], "try again")
+            before_state = deepcopy(atomic.state)
+            before_bytes = (root / "atomic" / "run.json").read_bytes()
+
+            def fail_persist():
+                raise OSError("simulated persist failure")
+
+            atomic._persist = fail_persist
+            with self.assertRaises(OSError):
+                atomic.replan("change the approach", ["tests/failure.txt"], "start again")
+            self.assertEqual(atomic.state, before_state)
+            self.assertEqual((root / "atomic" / "run.json").read_bytes(), before_bytes)
+
+    def test_evidence_requires_concrete_local_references_for_bare_and_structured_values(self):
+        invalid_references = ["not-run", "not_run", "https://example.test/result", "file:///tmp/result", "foo:bar"]
+        for reference in invalid_references:
+            with self.subTest(kind="bare", reference=reference):
+                with self.assertRaises(figure_it_out.PlanError):
+                    figure_it_out._evidence([reference], "evidence")
+            with self.subTest(kind="structured", reference=reference):
+                with self.assertRaises(figure_it_out.PlanError):
+                    figure_it_out._evidence(
+                        [{"kind": "reference", "ref": reference}],
+                        "evidence",
+                    )
+
+        self.assertEqual(figure_it_out._evidence(["check:terminal-predicate"]), ["check:terminal-predicate"])
+        self.assertEqual(
+            figure_it_out._evidence(
+                [{"kind": "test", "ref": "tests/test_workflow.py:42"}],
+            ),
+            [{"kind": "test", "ref": "tests/test_workflow.py:42"}],
+        )
+
+    def test_persisted_lifecycle_rejects_zero_attempts_and_forged_terminal_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            completed_phase = self.workflow(root / "zero-attempt", phase_count=1)
+            completed_phase.start_phase()
+            completed_phase.complete_phase(
+                "phase output",
+                {"check_id": "check-1", "passed": True, "evidence": ["tests/phase-pass.txt"]},
+            )
+            zero_attempt = json.loads((root / "zero-attempt" / "run.json").read_text(encoding="utf-8"))
+            zero_attempt["phases"][0]["attempt"] = 0
+            (root / "zero-attempt" / "run.json").write_text(json.dumps(zero_attempt), encoding="utf-8")
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(root / "zero-attempt" / "run.json", workspace_root=root / "zero-attempt")
+
+            forged = self.workflow(root / "forged-terminal", phase_count=1)
+            forged.start_phase()
+            forged.complete_phase(
+                "phase output",
+                {"check_id": "check-1", "passed": True, "evidence": ["tests/phase-pass.txt"]},
+            )
+            forged_state = json.loads((root / "forged-terminal" / "run.json").read_text(encoding="utf-8"))
+            for check_id in forged_state["predicate_results"]:
+                forged_state["predicate_results"][check_id] = {
+                    "check_id": check_id,
+                    "passed": True,
+                    "status": "verified",
+                    "evidence": ["tests/forged-terminal.txt"],
+                    "observed": "passed",
+                    "at": "2026-09-23T00:00:00+00:00",
+                }
+            forged_state["next_action"] = "finish when all terminal checks pass"
+            (root / "forged-terminal" / "run.json").write_text(json.dumps(forged_state), encoding="utf-8")
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(root / "forged-terminal" / "run.json", workspace_root=root / "forged-terminal")
+
+    def test_cli_rejects_non_regular_inputs_and_invalid_utf8_plan_without_traceback(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state_destinations = {"directory": root / "state-directory", "fifo": root / "state-fifo"}
+            state_destinations["directory"].mkdir()
+            os.mkfifo(state_destinations["fifo"])
+            for kind, destination in state_destinations.items():
+                with self.subTest(input=f"state-{kind}"):
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(SCRIPT),
+                            "start-phase",
+                            "--state",
+                            str(destination),
+                            "--workspace-root",
+                            str(root),
+                        ],
+                        cwd=ROOT,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        timeout=2,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertTrue(json.loads(result.stderr)["error"])
+
+            plan_destinations = {"directory": root / "plan-directory", "fifo": root / "plan-fifo"}
+            plan_destinations["directory"].mkdir()
+            os.mkfifo(plan_destinations["fifo"])
+            for kind, destination in plan_destinations.items():
+                with self.subTest(input=f"plan-{kind}"):
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(SCRIPT),
+                            "init",
+                            "--plan",
+                            str(destination),
+                            "--state",
+                            str(root / f"{kind}-state.json"),
+                            "--workspace-root",
+                            str(root),
+                        ],
+                        cwd=ROOT,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                        timeout=2,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertTrue(json.loads(result.stderr)["error"])
+
+            invalid_utf8 = root / "invalid-utf8.json"
+            invalid_utf8.write_bytes(b"{\xff")
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT),
+                    "init",
+                    "--plan",
+                    str(invalid_utf8),
+                    "--state",
+                    str(root / "utf8-state.json"),
+                    "--workspace-root",
+                    str(root),
+                ],
+                cwd=ROOT,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 2)
+            error = json.loads(result.stderr)
+            self.assertIn("valid UTF-8", error["error"])
+            self.assertNotIn("Traceback", result.stderr)
+
+    def test_plan_rejects_uri_and_drive_relative_scope_prefixes(self):
+        for prefix in ("https://example.test/", "file:///tmp/", "C:relative/", "C:/absolute/", "./https://example.test/"):
+            with self.subTest(prefix=prefix):
+                plan = make_plan()
+                plan["scope"]["allowed_paths"] = [prefix]
+                with self.assertRaises(figure_it_out.PlanError):
+                    figure_it_out.validate_plan(plan)
 
     def test_audit_refuses_state_path_without_overwriting_resume_artifact(self):
         with tempfile.TemporaryDirectory() as directory:

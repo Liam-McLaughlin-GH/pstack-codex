@@ -33,26 +33,42 @@ RUN_STATUSES = {"planned", "running", "failed", "interrupted", "blocked", "compl
 PHASE_STATUSES = {"pending", "in_progress", "passed", "failed", "interrupted", "blocked"}
 ACTION_REFUSAL_STATUSES = {"failed", "interrupted", "blocked", "completed"}
 STRUCTURED_EVIDENCE_KINDS = {"artifact", "blocker", "command", "path", "reference", "test"}
-EVIDENCE_PLACEHOLDERS = {
+EVIDENCE_PLACEHOLDER_KEYS = {
     "agent report",
-    "agent-report",
-    "agent_report",
     "agent summary",
-    "agent-summary",
-    "agent_summary",
     "checked",
     "done",
     "inconclusive",
     "looks good",
+    "n/a",
+    "na",
+    "none",
+    "no evidence",
+    "no result",
+    "no results",
+    "not applicable",
+    "not available",
+    "not checked",
+    "not found",
+    "not provided",
     "not run",
-    "not_run",
+    "not tested",
+    "not yet run",
+    "not verified",
+    "null",
     "passed",
+    "pending",
+    "placeholder",
     "self report",
-    "self-report",
-    "self_report",
+    "skipped",
     "success",
+    "tbd",
+    "todo",
+    "unknown",
+    "unavailable",
     "verified",
 }
+LOCAL_REFERENCE_NAMESPACES = {"check", "decisions", "phase", "scope", "target"}
 SAFE_ACTION = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 URI_SCHEME = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:")
 BOUNDED_REFERENCE = re.compile(
@@ -112,12 +128,40 @@ def _string_list(value: Any, field: str, *, allow_empty: bool = False) -> list[s
     return result
 
 
+def _placeholder_key(value: str) -> str:
+    return re.sub(r"[\s_-]+", " ", value.strip().casefold())
+
+
+def _is_placeholder_reference(value: str) -> bool:
+    normalized = _placeholder_key(value)
+    if normalized in EVIDENCE_PLACEHOLDER_KEYS:
+        return True
+    return bool(re.fullmatch(r"(?:agent|assistant|model) (?:claim|report|summary)", normalized))
+
+
+def _is_scheme_shaped_reference(value: str) -> bool:
+    match = URI_SCHEME.match(value)
+    if not match:
+        return False
+    scheme = match.group(0)[:-1].casefold()
+    suffix = value[match.end() :]
+    if scheme in LOCAL_REFERENCE_NAMESPACES:
+        return False
+    # A file:line reference is a local source location, not a URI. The slash
+    # form (tests/file.py:42) does not match URI_SCHEME at all.
+    if "." in scheme and suffix.isdigit():
+        return False
+    return True
+
+
 def _is_bounded_reference(value: str) -> bool:
     if value.startswith(("/", "~", "\\")) or re.match(r"^[A-Za-z]:", value):
         return False
     if "\\" in value:
         return False
     if ".." in PurePosixPath(value).parts or any(char.isspace() for char in value):
+        return False
+    if _is_placeholder_reference(value) or _is_scheme_shaped_reference(value):
         return False
     return bool(BOUNDED_REFERENCE.fullmatch(value))
 
@@ -164,8 +208,7 @@ def _evidence(value: Any, field: str = "evidence") -> list[Any]:
     for index, item in enumerate(value):
         if isinstance(item, str):
             reference = _text(item, f"{field}[{index}]", max_length=500)
-            lowered = reference.casefold()
-            if lowered in EVIDENCE_PLACEHOLDERS or re.fullmatch(r"(?:agent|assistant|model)[ _-](?:claim|report|summary)", lowered):
+            if _is_placeholder_reference(reference):
                 raise PlanError(f"{field}[{index}] must identify inspectable evidence")
             if not _is_bounded_reference(reference):
                 raise PlanError(f"{field}[{index}] must be a bounded local reference or structured evidence")
@@ -194,7 +237,12 @@ def _copy_json(value: Any) -> Any:
 
 def _relative_path(value: Any, field: str, *, max_length: int = 500) -> str:
     path = _text(value, field, max_length=max_length).replace("\\", "/")
-    if path.startswith(("/", "~")) or re.match(r"^[A-Za-z]:/", path):
+    path_without_dot_prefix = re.sub(r"^(?:\./)+", "", path)
+    if (
+        path.startswith(("/", "~"))
+        or re.match(r"^[A-Za-z]:", path_without_dot_prefix)
+        or URI_SCHEME.match(path_without_dot_prefix)
+    ):
         raise PlanError(f"{field} must be relative and contained")
     if ".." in PurePosixPath(path).parts:
         raise PlanError(f"{field} must be relative and contained")
@@ -481,6 +529,8 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
             or not 0 <= phase["attempt"] <= validated_plan["limits"]["max_attempts_per_phase"]
         ):
             raise StateError(f"invalid state: phases[{index}].attempt must be a non-negative integer")
+        if phase["status"] in {"in_progress", "passed", "failed", "interrupted"} and phase["attempt"] < 1:
+            raise StateError(f"invalid state: phases[{index}] has a lifecycle status with zero attempts")
         if not isinstance(phase["checkpoints"], list):
             raise StateError(f"invalid state: phases[{index}].checkpoints must be a list")
         checkpoint_refs: list[str] = []
@@ -519,8 +569,32 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
     current_phase = state["current_phase"]
     if current_phase is not None and (not isinstance(current_phase, str) or current_phase not in phase_ids):
         raise StateError("invalid state: current_phase must name a declared phase or be null")
-    if status == "completed" and current_phase is not None:
-        raise StateError("invalid state: completed runs cannot have a current phase")
+
+    phase_statuses = [phase["status"] for phase in phases]
+    all_phases_passed = all(phase_status == "passed" for phase_status in phase_statuses)
+    if all_phases_passed:
+        if current_phase is not None:
+            raise StateError("invalid state: all passed runs cannot have a current phase")
+        if status not in {"running", "blocked", "completed"}:
+            raise StateError("invalid state: completed phases require a running, blocked, or completed run")
+    else:
+        first_incomplete = next(index for index, phase_status in enumerate(phase_statuses) if phase_status != "passed")
+        if any(phase_status != "passed" for phase_status in phase_statuses[:first_incomplete]):
+            raise StateError("invalid state: phase lifecycle is not sequential")
+        if any(phase_status != "pending" for phase_status in phase_statuses[first_incomplete + 1 :]):
+            raise StateError("invalid state: later phases must remain pending")
+        if current_phase != phase_ids[first_incomplete]:
+            raise StateError("invalid state: current_phase must identify the first incomplete phase")
+        current_status = phase_statuses[first_incomplete]
+        allowed_current_statuses = {
+            "planned": {"pending"},
+            "running": {"pending", "in_progress"},
+            "failed": {"failed"},
+            "interrupted": {"interrupted"},
+            "blocked": {"blocked", "failed"},
+        }
+        if status == "completed" or current_status not in allowed_current_statuses.get(status, set()):
+            raise StateError("invalid state: run status and current phase status do not agree")
 
     if isinstance(state["resume_count"], bool) or not isinstance(state["resume_count"], int) or state["resume_count"] < 0:
         raise StateError("invalid state: resume_count must be a non-negative integer")
@@ -610,19 +684,12 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
         replacement = replan["replacement"]
         if not isinstance(replacement, Mapping):
             raise StateError(f"invalid state: replans[{index}].replacement must be an object")
-        if "verification" in replacement:
-            try:
-                replacement_spec = _phase_spec(replacement, index)
-            except (PlanError, TypeError, ValueError, KeyError, AttributeError) as exc:
-                raise StateError(f"invalid state: replans[{index}].replacement is invalid: {exc}") from exc
-            if replacement_spec["id"] != replan["phase"]:
-                raise StateError(f"invalid state: replans[{index}].replacement id does not match the phase")
-        else:
-            _require_state_fields(replacement, {"id", "method"}, f"replans[{index}].replacement")
-            _state_text(replacement["id"], f"replans[{index}].replacement.id", max_length=100)
-            _state_text(replacement["method"], f"replans[{index}].replacement.method", max_length=1000)
-            if replacement["id"] != replan["phase"]:
-                raise StateError(f"invalid state: replans[{index}].replacement id does not match the phase")
+        try:
+            replacement_spec = _phase_spec(replacement, index)
+        except (PlanError, TypeError, ValueError, KeyError, AttributeError) as exc:
+            raise StateError(f"invalid state: replans[{index}].replacement is invalid: {exc}") from exc
+        if replacement_spec["id"] != replan["phase"]:
+            raise StateError(f"invalid state: replans[{index}].replacement id does not match the phase")
 
     for index, event in enumerate(state["events"]):
         if not isinstance(event, Mapping):
@@ -630,6 +697,38 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
         _require_state_fields(event, {"at", "event"}, f"events[{index}]")
         _state_text(event["at"], f"events[{index}].at")
         _state_text(event["event"], f"events[{index}].event")
+
+    def has_event(event_name: str, **expected: Any) -> bool:
+        return any(
+            event.get("event") == event_name and all(event.get(key) == value for key, value in expected.items())
+            for event in state["events"]
+        )
+
+    if status == "completed" and not has_event("completed"):
+        raise StateError("invalid state: completed runs require a completed event")
+
+    for index, (phase, spec) in enumerate(zip(phases, validated_plan["phases"])):
+        if phase["attempt"] > 0 and not has_event("phase_started", phase=phase["id"]):
+            raise StateError(f"invalid state: phases[{index}] has attempts without a phase_started event")
+        if phase["status"] == "passed" and not has_event(
+            "phase_passed",
+            phase=phase["id"],
+            check_id=spec["verification"]["id"],
+        ):
+            raise StateError(f"invalid state: phases[{index}].passed has no phase_passed event")
+        if phase["status"] == "failed" and not has_event("phase_failed", phase=phase["id"]):
+            raise StateError(f"invalid state: phases[{index}].failed has no phase_failed event")
+        if phase["status"] == "interrupted" and not phase["checkpoints"]:
+            raise StateError(f"invalid state: phases[{index}].interrupted requires a checkpoint")
+
+    for check_id, result in predicate_results.items():
+        if result is not None and result["passed"]:
+            if not all_phases_passed or current_phase is not None or status not in {"running", "blocked", "completed"}:
+                raise StateError(
+                    f"invalid state: verified predicate_results[{check_id}] were recorded before all phases passed"
+                )
+            if not has_event("predicate_recorded", check_id=check_id, passed=True):
+                raise StateError(f"invalid state: predicate_results[{check_id}] has no predicate_recorded event")
 
     blocker = state["blocker"]
     if blocker is not None:
@@ -644,6 +743,10 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
         _state_evidence(blocker["evidence"], "blocker.evidence")
     if status == "blocked" and blocker is None:
         raise StateError("invalid state: blocked runs require a blocker")
+    if status != "blocked" and blocker is not None:
+        raise StateError("invalid state: only blocked runs may have a blocker")
+    if status == "blocked" and blocker is not None and blocker["phase"] != current_phase:
+        raise StateError("invalid state: blocker.phase must match current_phase")
 
     interruption = state["interruption"]
     if interruption is not None:
@@ -659,6 +762,8 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
             raise StateError("invalid state: interruption.checkpoint is not a checkpoint for the phase")
     if status == "interrupted" and interruption is None:
         raise StateError("invalid state: interrupted runs require interruption details")
+    if status == "interrupted" and interruption is not None and interruption["phase"] != current_phase:
+        raise StateError("invalid state: interruption.phase must match current_phase")
     if status != "interrupted" and any(phase["status"] == "interrupted" for phase in phases):
         raise StateError("invalid state: interrupted phases require an interrupted run")
 
@@ -701,7 +806,15 @@ class Workflow:
     ) -> "Workflow":
         contract = validate_plan(plan)
         path, root = _state_path(state_path, workspace_root)
-        if path.exists():
+        try:
+            existing_mode = path.lstat().st_mode
+        except FileNotFoundError:
+            existing_mode = None
+        except OSError as exc:
+            raise StateError(f"state path could not be inspected: {path}") from exc
+        if existing_mode is not None:
+            if not stat.S_ISREG(existing_mode):
+                raise StateError(f"state path must be a regular file: {path}")
             raise StateError(f"state file already exists: {path}")
         path.parent.mkdir(parents=True, exist_ok=True)
         phases = []
@@ -753,10 +866,16 @@ class Workflow:
     ) -> "Workflow":
         path, root = _state_path(state_path, workspace_root)
         try:
-            with path.open("r", encoding="utf-8") as handle:
-                state = json.load(handle)
+            state_mode = path.lstat().st_mode
         except FileNotFoundError as exc:
             raise StateError(f"state file does not exist: {path}") from exc
+        except OSError as exc:
+            raise StateError(f"state file could not be inspected: {path}") from exc
+        if not stat.S_ISREG(state_mode):
+            raise StateError(f"state file must be a regular file: {path}")
+        try:
+            with path.open("r", encoding="utf-8") as handle:
+                state = json.load(handle)
         except json.JSONDecodeError as exc:
             raise StateError(f"state file is not valid JSON: {path}") from exc
         except (OSError, UnicodeError) as exc:
@@ -769,6 +888,14 @@ class Workflow:
         self.state["updated_at"] = _now()
         _require_state_object(self.state)
         self._validate_state_limits()
+        try:
+            state_mode = self.state_path.lstat().st_mode
+        except FileNotFoundError:
+            state_mode = None
+        except OSError as exc:
+            raise StateError(f"state path could not be inspected: {self.state_path}") from exc
+        if state_mode is not None and not stat.S_ISREG(state_mode):
+            raise StateError(f"state path must be a regular file: {self.state_path}")
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(prefix=f".{self.state_path.name}.", suffix=".tmp", dir=str(self.state_path.parent))
         try:
@@ -781,6 +908,17 @@ class Workflow:
         finally:
             if os.path.exists(temporary):
                 os.unlink(temporary)
+
+    def _persist_candidate(self, candidate: dict[str, Any]) -> None:
+        """Persist a candidate state without exposing a partial in-memory mutation."""
+
+        previous = self.state
+        self.state = candidate
+        try:
+            self._persist()
+        except Exception:
+            self.state = previous
+            raise
 
     def _validate_state_limits(self) -> None:
         limits = self.state["plan"]["limits"]
@@ -1040,29 +1178,43 @@ class Workflow:
         candidate_plan = deepcopy(self.state["plan"])
         candidate_plan["phases"] = candidate_phases
         validated_plan = validate_plan(candidate_plan)
-        self.state["plan"]["phases"] = validated_plan["phases"]
-        if replacement_spec is not None:
-            phase.update(validated_plan["phases"][failed_phase_index])
-        phase["status"] = "pending"
-        phase["failure"] = None
-        phase["output_value"] = None
-        phase["verification_result"] = None
-        phase["checkpoints"] = []
+        if len(self.state["decisions"]) >= self.state["plan"]["limits"]["max_decisions"]:
+            self._block_and_persist(
+                "decision limit reached",
+                [{"kind": "reference", "ref": f"decisions:{len(self.state['decisions'])}"}],
+                "request a new bounded plan from the owner",
+            )
+            raise StateError("decision limit reached; run is blocked")
+
+        candidate = deepcopy(self.state)
+        candidate["plan"]["phases"] = validated_plan["phases"]
+        candidate_phase = candidate["phases"][failed_phase_index]
+        candidate_phase.update(validated_plan["phases"][failed_phase_index])
+        candidate_phase["status"] = "pending"
+        candidate_phase["failure"] = None
+        candidate_phase["output_value"] = None
+        candidate_phase["verification_result"] = None
+        candidate_phase["checkpoints"] = []
         replan_record = {
-            "number": len(self.state["replans"]) + 1,
+            "number": len(candidate["replans"]) + 1,
             "at": _now(),
-            "phase": phase["id"],
+            "phase": candidate_phase["id"],
             "reason": reason,
             "evidence": evidence_values,
             "next_action": next_action,
-            "replacement": deepcopy(replacement_spec or phase["verification"]),
+            "replacement": deepcopy(validated_plan["phases"][failed_phase_index]),
         }
-        self.state["replans"].append(replan_record)
-        self.state["status"] = "planned"
-        self.state["next_action"] = f"start replanned phase {phase['id']}"
-        self.record_decision(phase["id"], "replan phase", reason, evidence_values, "open", persist=False)
-        self._event("replanned", phase=phase["id"], number=replan_record["number"])
-        self._persist()
+        candidate["replans"].append(replan_record)
+        candidate["status"] = "planned"
+        candidate["next_action"] = f"start replanned phase {candidate_phase['id']}"
+        candidate["blocker"] = None
+        candidate["decisions"].append(
+            self._decision_record(candidate_phase["id"], "replan phase", reason, evidence_values, "open")
+        )
+        candidate["events"].append(
+            {"at": _now(), "event": "replanned", "phase": candidate_phase["id"], "number": replan_record["number"]}
+        )
+        self._persist_candidate(candidate)
         return deepcopy(self.state)
 
     def interrupt(self, reason: str) -> dict[str, Any]:
@@ -1184,6 +1336,12 @@ class Workflow:
         _require_state_object(self.state)
         if self.state["status"] == "completed":
             raise PredicateError("completed workflow is terminal and immutable")
+        if (
+            self.state["status"] != "running"
+            or self.state["current_phase"] is not None
+            or any(phase["status"] != "passed" for phase in self.state["phases"])
+        ):
+            raise PredicateError("terminal predicate checks require every phase to be passed")
         check_id = _text(check_id, "predicate.check_id", max_length=100)
         if not isinstance(passed, bool):
             raise PredicateError("predicate.passed must be a boolean")
@@ -1439,18 +1597,45 @@ class Workflow:
                 },
             )
         rows = [["ts", "phase", "decision", "why", "evidence", "result"]]
+        records: list[tuple[str, int, list[str]]] = []
+
+        def evidence_text(values: Sequence[Any]) -> str:
+            return "; ".join(
+                value if isinstance(value, str) else json.dumps(value, sort_keys=True, separators=(",", ":"))
+                for value in values
+            )
+
         for item in self.state["decisions"]:
-            rows.append([
-                item["at"],
-                item["phase"],
-                item["decision"],
-                item["why"],
-                "; ".join(
-                    value if isinstance(value, str) else json.dumps(value, sort_keys=True, separators=(",", ":"))
-                    for value in item["evidence"]
-                ),
-                item["result"],
-            ])
+            records.append(
+                (
+                    item["at"],
+                    1,
+                    [
+                        item["at"],
+                        item["phase"],
+                        item["decision"],
+                        item["why"],
+                        evidence_text(item["evidence"]),
+                        item["result"],
+                    ],
+                )
+            )
+        for checkpoint in self.state["checkpoints"]:
+            records.append(
+                (
+                    checkpoint["at"],
+                    0,
+                    [
+                        checkpoint["at"],
+                        checkpoint["phase"],
+                        f"checkpoint: {checkpoint['label']}",
+                        checkpoint["next_action"],
+                        evidence_text(checkpoint["evidence"]),
+                        "open",
+                    ],
+                )
+            )
+        rows.extend(record for _, _, record in sorted(records, key=lambda item: (item[0], item[1])))
         path.parent.mkdir(parents=True, exist_ok=True)
         fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
         try:
@@ -1466,13 +1651,24 @@ class Workflow:
 
 
 def _load_json(path: str) -> Any:
+    candidate = Path(path)
     try:
-        with Path(path).open("r", encoding="utf-8") as handle:
-            return json.load(handle)
+        input_mode = candidate.lstat().st_mode
     except FileNotFoundError as exc:
         raise PlanError(f"JSON file does not exist: {path}") from exc
+    except OSError as exc:
+        raise PlanError(f"JSON file could not be inspected: {path}") from exc
+    if not stat.S_ISREG(input_mode):
+        raise PlanError(f"JSON input must be a regular file: {path}")
+    try:
+        with candidate.open("r", encoding="utf-8") as handle:
+            return json.load(handle)
     except json.JSONDecodeError as exc:
         raise PlanError(f"JSON file is invalid: {path}") from exc
+    except UnicodeError as exc:
+        raise PlanError(f"JSON file is not valid UTF-8: {path}") from exc
+    except OSError as exc:
+        raise PlanError(f"JSON file could not be read: {path}") from exc
 
 
 def _parse_json_argument(value: str, field: str) -> Any:
