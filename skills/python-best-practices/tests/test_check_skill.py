@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib.util
 import unittest
 from pathlib import Path
@@ -29,6 +30,43 @@ class RoutingRegressionTests(unittest.TestCase):
             "Review the live environment",
             "production",
             "live",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "unsafe")
+
+    def test_exact_cues_accept_sentence_punctuation(self) -> None:
+        for punctuation in (".", ",", "!", "?", ";", ":"):
+            request = f"Review web-app{punctuation}"
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "web-app")
+                self.assertEqual(CHECKER.repositories_for_task(request), ("web-app",))
+
+        for request, expected_route, expected_repositories in (
+            ("Review the Showpass backend.", "web-app", ("web-app",)),
+            ("Change packages/core.", "showpass-frontend", ("showpass-frontend",)),
+            ("Fix Next.js bridge.", "web-app", ("web-app",)),
+            ("Fix the Showpass Next.js bridge.", "web-app", ("web-app",)),
+            ("Fix Next.js bridge-route.", "web-app", ("web-app",)),
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), expected_route)
+                self.assertEqual(
+                    CHECKER.repositories_for_task(request), expected_repositories
+                )
+
+    def test_gcloud_read_only_is_safe_but_mutation_is_manual_review(self) -> None:
+        for request in (
+            "gcloud compute instances list",
+            "gcloud auth list",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "web-k8s")
+                self.assertEqual(CHECKER.repositories_for_task(request), ("web-k8s",))
+
+        for request in (
+            "gcloud compute instances create vm",
+            "gcloud compute instances update vm",
+            "gcloud compute instances delete vm",
         ):
             with self.subTest(request=request):
                 self.assertEqual(CHECKER.route_for_task(request), "unsafe")
@@ -208,6 +246,50 @@ class RoutingRegressionTests(unittest.TestCase):
             with self.subTest(request=request):
                 self.assertEqual(CHECKER.route_for_task(request), "unsafe")
 
+    def test_natural_language_fabric_noun_stays_general(self) -> None:
+        request = "Discuss the fabric of the application"
+
+        self.assertEqual(CHECKER.route_for_task(request), "general")
+        self.assertEqual(CHECKER.repositories_for_task(request), ())
+
+    def test_documented_infrastructure_cues_route_to_web_k8s(self) -> None:
+        for request in (
+            "Review a Showpass Jinja template",
+            "Review a Showpass Kubernetes manifest",
+            "Review fabfile.py",
+            "Review deploy/fabfile.py",
+            "Review a Fabric task",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "web-k8s")
+                self.assertEqual(CHECKER.repositories_for_task(request), ("web-k8s",))
+
+    def test_fabricated_and_filename_decoys_stay_general(self) -> None:
+        for request in (
+            "Review a fabricated operation in beta",
+            "Review a fabrication operation in beta",
+            "Review a manufactured operation in beta",
+            "Review fabric",
+            "Review a kubectl-extra parser",
+            "Review a gcloud-extra parser",
+            "Review a Jinja-extra template",
+            "Review a Kubernetes-extra manifest",
+            "Review fabfile.py.bak",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "general")
+                self.assertEqual(CHECKER.repositories_for_task(request), ())
+
+    def test_bridge_precedes_generic_mixed_backend_frontend_cues(self) -> None:
+        for request in (
+            "Fix web-app Next.js bridge",
+            "Fix Django Next.js bridge",
+            "Fix showpass-frontend Next.js bridge",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "web-app")
+                self.assertEqual(CHECKER.repositories_for_task(request), ("web-app",))
+
 
 class LedgerRegistrationTests(unittest.TestCase):
     def test_new_routing_cases_name_registered_source_rules(self) -> None:
@@ -219,6 +301,15 @@ class LedgerRegistrationTests(unittest.TestCase):
             "fabric3-task",
             "fabric-3-task",
             "fabric-beta-operation",
+            "gcloud-create",
+            "gcloud-update",
+            "gcloud-delete",
+            "showpass-jinja-template",
+            "showpass-kubernetes-manifest",
+            "fabfile-python",
+            "web-app-nextjs-bridge-only",
+            "django-nextjs-bridge-only",
+            "frontend-repository-nextjs-bridge-only",
             "legacy-ui-bridge",
             "angularjs-bridge",
             "nextjs-bridge-only",
@@ -292,6 +383,57 @@ class CommandTableConsistencyTests(unittest.TestCase):
         candidate = self.skill_text.replace(self._row(command), stale_row, 1)
 
         self.assertTrue(CHECKER.check_documents(candidate, self.ledger))
+
+
+class DocumentIntegrityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.skill_text = CHECKER.SKILL_PATH.read_text(encoding="utf-8")
+        self.ledger = CHECKER.load_ledger()
+
+    def test_blank_frontmatter_name_is_rejected(self) -> None:
+        candidate = self.skill_text.replace("name: python-best-practices", "name:\n", 1)
+
+        self.assertTrue(CHECKER.check_documents(candidate, self.ledger))
+
+    def test_missing_local_references_are_rejected(self) -> None:
+        missing_ledger = self.skill_text.replace(
+            "references/source-ledger.json", "references/missing-ledger.json", 1
+        )
+        missing_checker = self.skill_text.replace(
+            "skills/python-best-practices/scripts/check_skill.py",
+            "skills/python-best-practices/scripts/missing-checker.py",
+            1,
+        )
+
+        self.assertTrue(CHECKER.check_documents(missing_ledger, self.ledger))
+        self.assertTrue(CHECKER.check_documents(missing_checker, self.ledger))
+
+    def test_pinned_ledger_metadata_mutations_are_rejected(self) -> None:
+        mutations = (
+            lambda candidate: candidate.__setitem__(
+                "upstream_sha_checked", "0" * 40
+            ),
+            lambda candidate: candidate["repositories"]["web-app"].__setitem__(
+                "root", "wrong-root"
+            ),
+            lambda candidate: candidate["repositories"]["web-app"].__setitem__(
+                "sha", "0" * 40
+            ),
+            lambda candidate: candidate["rules"][2].__setitem__(
+                "route", "web-k8s"
+            ),
+            lambda candidate: candidate["rules"][2].__setitem__(
+                "repo", "showpass-frontend"
+            ),
+            lambda candidate: candidate["rules"][0].__setitem__(
+                "citation", candidate["rules"][0]["citations"][1]["citation"]
+            ),
+        )
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                candidate = copy.deepcopy(self.ledger)
+                mutate(candidate)
+                self.assertTrue(CHECKER.check_documents(self.skill_text, candidate))
 
 
 if __name__ == "__main__":

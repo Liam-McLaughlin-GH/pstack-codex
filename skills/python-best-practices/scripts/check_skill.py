@@ -15,6 +15,53 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 SKILL_DIR = Path(__file__).resolve().parents[1]
 SKILL_PATH = SKILL_DIR / "SKILL.md"
 LEDGER_PATH = SKILL_DIR / "references" / "source-ledger.json"
+EXPECTED_UPSTREAM_SHA = "53e579f1481697931fc44f5445171397cfa2b24b"
+EXPECTED_REPOSITORIES = {
+    "web-app": {
+        "sha": "508b22a3fa7a25ef5cdac465a29195117f3f97cc",
+        "root": "web-app",
+    },
+    "showpass-frontend": {
+        "sha": "0aae56009bb1aabe09942adb04f6aa4782f98450",
+        "root": "showpass-frontend",
+    },
+    "web-k8s": {
+        "sha": "daa154cab26375c721251c0d6e74717c79c563ae",
+        "root": "web-k8s",
+    },
+}
+EXPECTED_RULE_REPOSITORIES = {
+    **{rule_id: "web-app" for rule_id in (
+        "SP-WEB-ENV",
+        "SP-WEB-OWNERS",
+        "SP-WEB-LEGACY-ROUTING",
+        "SP-WEB-LIFECYCLE",
+        "SP-WEB-TRANSACTION",
+        "SP-WEB-QUERY",
+        "SP-WEB-SERVICE",
+        "SP-WEB-CELERY",
+        "SP-WEB-IMPORTS",
+        "SP-WEB-TEST",
+        "SP-WEB-RUFF",
+    )},
+    **{rule_id: "web-k8s" for rule_id in (
+        "SP-K8S-VERSION",
+        "SP-K8S-OFFLINE",
+        "SP-K8S-CONTEXT",
+        "SP-K8S-SAFETY",
+        "SP-K8S-DEPLOYED",
+    )},
+    "SP-FRONTEND-BOUNDARY": "showpass-frontend",
+    "SP-FRONTEND-PACKAGES": "showpass-frontend",
+}
+EXPECTED_RULE_ROUTES = {
+    rule_id: "unsafe/manual-review" if rule_id == "SP-K8S-SAFETY" else repository
+    for rule_id, repository in EXPECTED_RULE_REPOSITORIES.items()
+}
+LOCAL_REFERENCE_TARGETS = {
+    "references/source-ledger.json": LEDGER_PATH,
+    "skills/python-best-practices/scripts/check_skill.py": Path(__file__).resolve(),
+}
 SOURCE_RE = re.compile(
     r"(?:web-app|web-k8s|showpass-frontend)@[0-9a-f]{40}:"
     r"[^`#\s]+#L[1-9][0-9]*-L[1-9][0-9]*"
@@ -48,15 +95,21 @@ REGISTERED_REPOSITORY_TOKENS = (
 
 
 REAL_TOKEN_BOUNDARY_CHARS = "a-z0-9_.-"
+REAL_TOKEN_SUFFIX_CHARS = "a-z0-9_-"
+REAL_TOKEN_END = (
+    r"(?=$|[^%s]|\.(?=$|[^%s]))"
+    % (REAL_TOKEN_BOUNDARY_CHARS, REAL_TOKEN_SUFFIX_CHARS)
+)
+COMMAND_END = r"(?=$|[.!?,;:](?:\s|$))"
 
 
 def _real_token_expression(expression: str) -> str:
-    """Require a cue to be separated from letters, digits, dots, or hyphens."""
+    """Match an exact cue, allowing punctuation but rejecting dotted suffixes."""
 
-    return r"(?<![%s])(?:%s)(?![%s])" % (
+    return r"(?<![%s])(?:%s)%s" % (
         REAL_TOKEN_BOUNDARY_CHARS,
         expression,
-        REAL_TOKEN_BOUNDARY_CHARS,
+        REAL_TOKEN_END,
     )
 
 
@@ -80,16 +133,31 @@ FRONTEND_BOUNDARY_UNSUPPORTED = (
     "owns React, Next.js, and React Native surfaces",
     "Do not apply Django or deployment rules",
 )
-FAB_CUE_RE = re.compile(_real_token_pattern("fab", "fabric"))
+FAB_COMMAND_RE = re.compile(
+    _real_token_expression(r"fab\s+(?:--list|[a-z0-9_.-]+)")
+)
 FAB_LIST_RE = re.compile(
-    _real_token_pattern("fab") + r"\s+--list(?:\s|$)"
+    _real_token_pattern("fab") + r"\s+--list" + COMMAND_END
 )
 FABRIC3_RE = re.compile(
-    _real_token_expression(r"fabric\s*3")
+    _real_token_expression(r"fabric[-\s]*3")
 )
 FAB_ENVIRONMENT_RE = re.compile(
     _real_token_expression(r"fab\s+(?:demo|beta|live|prod|production)")
 )
+FABRIC_OPERATION_CONTEXT_RE = re.compile(
+    r"(?:"
+    + _real_token_expression(
+        r"fabric\s+(?:task|tasks|command|commands|operation|operations|"
+        r"tool|tooling|environment|cluster|deployment|deployments|runner|run|job|jobs)"
+    )
+    + r"|"
+    + _real_token_expression(r"(?:run|use|inspect|debug|test)\s+fabric")
+    + r")"
+)
+JINJA_CUE_RE = re.compile(_real_token_pattern("jinja", "jinja2"))
+KUBERNETES_CUE_RE = re.compile(_real_token_pattern("kubernetes", "k8s"))
+FABFILE_CUE_RE = re.compile(_real_token_pattern("fabfile.py"))
 FABRIC_ENVIRONMENT_CUES = _real_token_pattern(
     "environment",
     "cluster",
@@ -122,20 +190,29 @@ MUTATION_TOKEN = (
     r"patch|promote|provision|publish|release|replace|reset|restart|roll(?:out|ing)?|"
     r"rolling|scale|seed|set|truncate|update|upgrade)(?![a-z0-9])"
 )
-FAB_MUTATION_RE = re.compile(
-    _real_token_expression(r"fab(?:ric)?") + r"[^\n]*" + MUTATION_TOKEN
-)
 ENVIRONMENT_RE = re.compile(
-    r"(?<![a-z0-9])(?:beta|demo|live|prod|production|staging|"
-    r"beta\.showpass\.com|demo\.showpass\.com|www\.showpass\.com)(?![a-z0-9])"
+    _real_token_pattern(
+        "beta",
+        "demo",
+        "live",
+        "prod",
+        "production",
+        "staging",
+        "beta.showpass.com",
+        "demo.showpass.com",
+        "www.showpass.com",
+    )
 )
 MUTATION_RE = re.compile(MUTATION_TOKEN)
+GCLOUD_MUTATION_RE = re.compile(
+    _real_token_expression("gcloud") + r"[^\n]*" + MUTATION_TOKEN
+)
 DEPLOYMENT_OPERATION_RE = re.compile(
     r"(?<![a-z0-9])(?:deploy(?:ed|ing|ment)?|promote|provision|publish|release|"
     r"roll(?:out|ing)?|rolling|scale)"
-    r"(?![a-z0-9])"
+    r"(?=$|[ \t\r\n,!?;:]|\.(?=$|[ \t\r\n,!?;:]))"
 )
-PRODUCTION_LIVE_RE = re.compile(r"\b(?:production|prod|live)\b")
+PRODUCTION_LIVE_RE = re.compile(_real_token_pattern("production", "prod", "live"))
 BACKEND_CUE_RE = re.compile(
     r"(?:%s|%s)"
     % (
@@ -199,12 +276,33 @@ SHOWPASS_UI_CUE_RE = re.compile(
     )
 )
 MODERN_UI_WORK_RE = re.compile(
-    r"\b(?:component|page|screen|hook|widget|modal|form|button|layout|"
-    r"style|styles|styling|css|tsx|user\s+interface|render(?:er|ing)?)\b|"
+    r"(?:"
+    + _real_token_pattern(
+        "component",
+        "page",
+        "screen",
+        "hook",
+        "widget",
+        "modal",
+        "form",
+        "button",
+        "layout",
+        "style",
+        "styles",
+        "styling",
+        "css",
+        "tsx",
+        "user interface",
+        "render",
+        "renderer",
+        "rendering",
+    )
+    + r"|"
     + _real_token_expression(
         r"(?:modern\s+(?:ui|frontend|client)|"
         r"(?:react|next(?:\.js|js)?)\s+(?:ui|frontend|client))"
     )
+    + r")"
 )
 LEGACY_UI_CUE_RE = re.compile(
     r"(?:"
@@ -305,6 +403,22 @@ ROUTING_GUARD_CASES = (
         "general",
     ),
     (
+        "infrastructure-manufactured-word",
+        "Review a manufactured operation in beta",
+        "general",
+    ),
+    (
+        "natural-language-fabric-noun",
+        "Discuss the fabric of the application",
+        "general",
+    ),
+    ("bare-fabric-noun", "Review fabric", "general"),
+    ("infrastructure-kubectl-suffix", "Review a kubectl-extra parser", "general"),
+    ("infrastructure-gcloud-suffix", "Review a gcloud-extra parser", "general"),
+    ("infrastructure-jinja-suffix", "Review a Jinja-extra template", "general"),
+    ("infrastructure-kubernetes-suffix", "Review a Kubernetes-extra manifest", "general"),
+    ("infrastructure-fabfile-suffix", "Review fabfile.py.bak", "general"),
+    (
         "showpass-nextjs-dotted-suffix",
         "Change a Showpass Next.jsx component",
         "general",
@@ -323,8 +437,12 @@ def _has_infrastructure_cue(text: str) -> bool:
     return (
         bool(INFRASTRUCTURE_REPOSITORY_CUE_RE.search(text))
         or bool(re.search(_real_token_pattern("kubectl", "gcloud"), text))
-        or bool(FAB_CUE_RE.search(text))
+        or bool(FAB_COMMAND_RE.search(text))
         or bool(FABRIC3_RE.search(text))
+        or bool(FABRIC_OPERATION_CONTEXT_RE.search(text))
+        or bool(JINJA_CUE_RE.search(text))
+        or bool(KUBERNETES_CUE_RE.search(text))
+        or bool(FABFILE_CUE_RE.search(text))
     )
 
 
@@ -348,17 +466,17 @@ def repositories_for_task(task: str) -> Tuple[str, ...]:
     )
     legacy_ui_cue = bool(LEGACY_UI_CUE_RE.search(text))
     modern_ui_work = bool(MODERN_UI_WORK_RE.search(text))
-    legacy_ui_only = legacy_ui_cue and not modern_ui_work
 
     repositories: List[str] = []
-    if backend_cue or legacy_ui_cue:
+    if legacy_ui_cue:
         repositories.append("web-app")
-    if (
-        explicit_repository_cue
-        or (showpass_modern_cue and not legacy_ui_only)
-        or (backend_cue and frontend_cue)
-        or (legacy_ui_cue and modern_ui_work)
-    ):
+        if modern_ui_work:
+            repositories.append("showpass-frontend")
+    elif backend_cue:
+        repositories.append("web-app")
+        if frontend_cue:
+            repositories.append("showpass-frontend")
+    elif explicit_repository_cue or showpass_modern_cue:
         repositories.append("showpass-frontend")
     if infrastructure:
         repositories.append("web-k8s")
@@ -366,7 +484,18 @@ def repositories_for_task(task: str) -> Tuple[str, ...]:
 
 
 def _is_documented_read_only_fab_list(text: str) -> bool:
-    return bool(re.fullmatch(r"\s*fab\s+--list\s*", text))
+    return bool(re.fullmatch(r"\s*fab\s+--list[.!?,;:]*\s*", text))
+
+
+def _has_fabric_mutation(text: str) -> bool:
+    """Treat Fabric mutations as unsafe only in a command/tooling context."""
+
+    for line in text.splitlines() or [text]:
+        if not MUTATION_RE.search(line):
+            continue
+        if FAB_COMMAND_RE.search(line) or FABRIC_OPERATION_CONTEXT_RE.search(line):
+            return True
+    return False
 
 
 def route_for_task(task: str) -> str:
@@ -377,13 +506,15 @@ def route_for_task(task: str) -> str:
     cluster_mutation = bool(
         FABRIC3_RE.search(text)
         or FAB_ENVIRONMENT_RE.search(text)
-        or FAB_MUTATION_RE.search(text)
+        or _has_fabric_mutation(text)
         or KUBECTL_MUTATION_RE.search(text)
+        or GCLOUD_MUTATION_RE.search(text)
     )
     environment_mutation = bool(ENVIRONMENT_RE.search(text) and MUTATION_RE.search(text))
     deployment_mutation = bool(DEPLOYMENT_OPERATION_RE.search(text))
     natural_fabric_environment_operation = bool(
         FABRIC_ENVIRONMENT_OPERATION_RE.search(text)
+        and FABRIC_OPERATION_CONTEXT_RE.search(text)
     )
     if (
         cluster_mutation
@@ -409,6 +540,94 @@ def route_for_task(task: str) -> str:
 
 def load_ledger() -> Dict[str, Any]:
     return json.loads(LEDGER_PATH.read_text(encoding="utf-8"))
+
+
+def _validate_ledger_metadata(ledger: Dict[str, Any]) -> List[str]:
+    """Fail closed when pinned ledger identity or rule ownership drifts."""
+
+    errors: List[str] = []
+    if ledger.get("upstream_sha_checked") != EXPECTED_UPSTREAM_SHA:
+        errors.append("source ledger has an unexpected upstream SHA")
+
+    repositories = ledger.get("repositories")
+    if not isinstance(repositories, dict):
+        return errors + ["source ledger repositories must be an object"]
+    expected_repository_names = set(EXPECTED_REPOSITORIES)
+    actual_repository_names = set(repositories)
+    for missing in sorted(expected_repository_names - actual_repository_names):
+        errors.append("source ledger is missing repository metadata: %s" % missing)
+    for unexpected in sorted(actual_repository_names - expected_repository_names):
+        errors.append("source ledger contains unknown repository metadata: %s" % unexpected)
+    for repository, expected in EXPECTED_REPOSITORIES.items():
+        metadata = repositories.get(repository)
+        if not isinstance(metadata, dict):
+            errors.append("source ledger repository metadata is malformed: %s" % repository)
+            continue
+        for field in ("sha", "root"):
+            if metadata.get(field) != expected[field]:
+                errors.append(
+                    "source ledger %s %s does not match the pinned evidence"
+                    % (repository, field)
+                )
+        root = metadata.get("root")
+        if (
+            not isinstance(root, str)
+            or not root
+            or root.startswith("/")
+            or ".." in Path(root).parts
+        ):
+            errors.append("source ledger repository root is unsafe: %s" % repository)
+        if not re.fullmatch(r"[0-9a-f]{40}", metadata.get("sha", "")):
+            errors.append("source ledger repository SHA is invalid: %s" % repository)
+
+    rules = ledger.get("rules")
+    if not isinstance(rules, list):
+        return errors + ["source ledger rules must be a list"]
+    actual_rule_ids = {
+        rule.get("id") for rule in rules if isinstance(rule, dict)
+    }
+    expected_rule_ids = set(EXPECTED_RULE_REPOSITORIES)
+    for missing in sorted(expected_rule_ids - actual_rule_ids):
+        errors.append("source ledger is missing source rule: %s" % missing)
+    for unexpected in sorted(actual_rule_ids - expected_rule_ids):
+        errors.append("source ledger contains unknown source rule: %s" % unexpected)
+
+    for rule in rules:
+        if not isinstance(rule, dict):
+            errors.append("source ledger contains a malformed source rule")
+            continue
+        rule_id = rule.get("id", "<unknown rule>")
+        expected_repository = EXPECTED_RULE_REPOSITORIES.get(rule_id)
+        if expected_repository is None:
+            continue
+        if rule.get("repo") != expected_repository:
+            errors.append("%s has unexpected repository ownership" % rule_id)
+        if rule.get("route") != EXPECTED_RULE_ROUTES[rule_id]:
+            errors.append("%s has an unexpected route" % rule_id)
+
+        citations = rule.get("citations")
+        if not isinstance(citations, list) or not citations:
+            errors.append("%s must contain a non-empty citation register" % rule_id)
+            continue
+        primary = citations[0]
+        if not isinstance(primary, dict):
+            errors.append("%s has a malformed primary citation" % rule_id)
+            continue
+        for field in ("path", "lines", "citation"):
+            if rule.get(field) != primary.get(field):
+                errors.append("%s primary %s disagrees with its citation register" % (rule_id, field))
+
+    return errors
+
+
+def _validate_local_references(skill_text: str) -> List[str]:
+    errors: List[str] = []
+    for reference, target in LOCAL_REFERENCE_TARGETS.items():
+        if reference not in skill_text:
+            errors.append("SKILL.md is missing local reference %s" % reference)
+        if not target.is_file():
+            errors.append("local reference target does not exist: %s" % reference)
+    return errors
 
 
 def _citation_entries(rule: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -451,7 +670,8 @@ def _validate_citation(
     path = entry.get("path", "")
     if not isinstance(path, str) or not path or path.startswith("/") or ".." in Path(path).parts:
         errors.append("%s has an unsafe source path" % rule_id)
-    expected_citation_path = "%s/%s" % (repo, path)
+    root = source.get("root", "")
+    expected_citation_path = "%s/%s" % (root, path)
     if match.group("path") != expected_citation_path:
         errors.append("%s citation path does not match its ledger path: %s" % (rule_id, citation))
 
@@ -473,6 +693,9 @@ def _registered_citations(
     registered: Dict[str, str] = {}
     rule_ids = set()
     for rule in ledger.get("rules", []):
+        if not isinstance(rule, dict):
+            errors.append("source ledger contains a malformed source rule")
+            continue
         rule_id = rule.get("id")
         if rule_id in rule_ids:
             errors.append("duplicate source rule: %s" % rule_id)
@@ -678,7 +901,7 @@ def check_documents(skill_text: str, ledger: Dict[str, Any]) -> List[str]:
     else:
         frontmatter = skill_text[4 : skill_text.index("\n---\n", 4)]
         for field in ("name", "description"):
-            if not re.search(r"^%s:\s*\S" % field, frontmatter, re.MULTILINE):
+            if not re.search(r"^%s:[ \t]*\S" % field, frontmatter, re.MULTILINE):
                 errors.append("SKILL.md frontmatter is missing %s" % field)
 
     for line_number, line in enumerate(skill_text.splitlines(), start=1):
@@ -687,7 +910,13 @@ def check_documents(skill_text: str, ledger: Dict[str, Any]) -> List[str]:
     if "\r" in skill_text:
         errors.append("SKILL.md contains carriage returns")
 
-    rule_ids = {rule.get("id") for rule in ledger.get("rules", [])}
+    rule_ids = {
+        rule.get("id")
+        for rule in ledger.get("rules", [])
+        if isinstance(rule, dict)
+    }
+    errors.extend(_validate_ledger_metadata(ledger))
+    errors.extend(_validate_local_references(skill_text))
     registered_citations = _registered_citations(ledger, skill_text, errors)
     errors.extend(_validate_frontend_boundary(skill_text))
 
@@ -813,6 +1042,70 @@ def check_negative_cases(skill_text: str, ledger: Dict[str, Any]) -> List[str]:
         errors.append("frontend-boundary negative fixture did not replace the supported claim")
     elif not check_documents(overclaimed, ledger):
         errors.append("negative case was accepted: overclaimed-frontend-boundary")
+
+    blank_name = skill_text.replace("name: python-best-practices", "name:\n", 1)
+    if blank_name == skill_text or not check_documents(blank_name, ledger):
+        errors.append("negative case was accepted: blank-frontmatter-name")
+
+    missing_ledger_reference = skill_text.replace(
+        "references/source-ledger.json", "references/missing-ledger.json", 1
+    )
+    if (
+        missing_ledger_reference == skill_text
+        or not check_documents(missing_ledger_reference, ledger)
+    ):
+        errors.append("negative case was accepted: missing-local-ledger-reference")
+
+    missing_checker_reference = skill_text.replace(
+        "skills/python-best-practices/scripts/check_skill.py",
+        "skills/python-best-practices/scripts/missing-checker.py",
+        1,
+    )
+    if (
+        missing_checker_reference == skill_text
+        or not check_documents(missing_checker_reference, ledger)
+    ):
+        errors.append("negative case was accepted: missing-local-checker-reference")
+
+    metadata_mutations = (
+        (
+            "upstream-sha-metadata",
+            lambda candidate: candidate.__setitem__("upstream_sha_checked", "0" * 40),
+        ),
+        (
+            "repository-root-metadata",
+            lambda candidate: candidate["repositories"]["web-app"].__setitem__(
+                "root", "wrong-root"
+            ),
+        ),
+        (
+            "repository-sha-metadata",
+            lambda candidate: candidate["repositories"]["web-app"].__setitem__(
+                "sha", "0" * 40
+            ),
+        ),
+        (
+            "rule-route-metadata",
+            lambda candidate: candidate["rules"][2].__setitem__("route", "web-k8s"),
+        ),
+        (
+            "rule-repository-metadata",
+            lambda candidate: candidate["rules"][2].__setitem__(
+                "repo", "showpass-frontend"
+            ),
+        ),
+        (
+            "rule-primary-citation-metadata",
+            lambda candidate: candidate["rules"][0].__setitem__(
+                "citation", candidate["rules"][0]["citations"][1]["citation"]
+            ),
+        ),
+    )
+    for name, mutate in metadata_mutations:
+        candidate = copy.deepcopy(ledger)
+        mutate(candidate)
+        if not check_documents(skill_text, candidate):
+            errors.append("negative case was accepted: %s" % name)
     return errors
 
 
@@ -839,7 +1132,7 @@ def main() -> int:
     rule_count = len(ledger.get("rules", []))
     command_count = len(ledger.get("commands", []))
     if args.scenario == "negative":
-        case_count = len(NEGATIVE_STATUS_CASES) + len(ROUTING_GUARD_CASES) + 7
+        case_count = len(NEGATIVE_STATUS_CASES) + len(ROUTING_GUARD_CASES) + 16
     else:
         case_count = len(ledger.get("routing_cases", [])) if scenario is None else sum(
             case.get("safety") == scenario for case in ledger.get("routing_cases", [])
