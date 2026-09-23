@@ -1608,44 +1608,19 @@ def validate_generated_skill(
     return tuple(errors)
 
 
-def _remove_path(path: Path) -> None:
-    try:
-        mode = os.lstat(path).st_mode
-    except FileNotFoundError:
-        return
-    if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-        path.unlink()
-    else:
-        shutil.rmtree(path)
-
-
-def _remove_empty_parents(created_parents: list[Path]) -> None:
-    for directory in reversed(created_parents):
-        try:
-            mode = os.lstat(directory).st_mode
-        except FileNotFoundError:
-            continue
-        if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
-            continue
-        try:
-            directory.rmdir()
-        except OSError:
-            pass
-
-
-def _existing_directory(path: Path, label: str) -> bool:
-    try:
-        mode = os.lstat(path).st_mode
-    except FileNotFoundError:
-        return False
-    if stat.S_ISLNK(mode):
-        raise ScaffoldError(f"{label} must not be a symlink: {path}")
-    if not stat.S_ISDIR(mode):
-        raise ScaffoldError(f"{label} must be a directory: {path}")
-    return True
-
-
 PublishedEntry = tuple[int, str, int, int, bool]
+
+
+def _descriptor_identity(descriptor: int, label: str, *, is_directory: bool) -> tuple[int, int]:
+    try:
+        identity = os.fstat(descriptor)
+    except OSError as exc:
+        raise ScaffoldError(f"{label} descriptor cannot be inspected") from exc
+    if is_directory and not stat.S_ISDIR(identity.st_mode):
+        raise ScaffoldError(f"{label} is not a directory")
+    if not is_directory and not stat.S_ISREG(identity.st_mode):
+        raise ScaffoldError(f"{label} is not a regular file")
+    return identity.st_dev, identity.st_ino
 
 
 def _open_directory_descriptor(
@@ -1679,13 +1654,116 @@ def _open_directory_descriptor(
     return descriptor
 
 
-def _published_identity(parent_fd: int, name: str, *, is_directory: bool) -> PublishedEntry:
-    identity = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-    if is_directory and not stat.S_ISDIR(identity.st_mode):
+def _open_or_create_directory(
+    parent_fd: int,
+    name: str,
+    label: str,
+) -> tuple[int, bool]:
+    """Open or create one directory entry without resolving through its parent path."""
+
+    try:
+        return _open_directory_descriptor(name, label, dir_fd=parent_fd), False
+    except ScaffoldError as exc:
+        if not isinstance(exc.__cause__, FileNotFoundError):
+            raise
+
+    try:
+        os.mkdir(name, mode=0o777, dir_fd=parent_fd)
+    except FileExistsError:
+        return _open_directory_descriptor(name, label, dir_fd=parent_fd), False
+
+    try:
+        return _open_directory_descriptor(name, label, dir_fd=parent_fd), True
+    except Exception:
+        # Do not remove the entry here: if a concurrent actor replaced it after
+        # mkdir, a path-based cleanup could delete that actor's directory.
+        raise
+
+
+def _published_identity(
+    parent_fd: int,
+    name: str,
+    *,
+    is_directory: bool,
+    entry_fd: int | None = None,
+) -> PublishedEntry:
+    """Record an entry's identity, preferring the descriptor that was opened."""
+
+    if entry_fd is None:
+        identity = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        device, inode = identity.st_dev, identity.st_ino
+    else:
+        device, inode = _descriptor_identity(
+            entry_fd,
+            f"published entry {name}",
+            is_directory=is_directory,
+        )
+        try:
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise CollisionError(f"published entry changed during publication: {name}") from exc
+        if (current.st_dev, current.st_ino) != (device, inode):
+            raise CollisionError(f"published entry changed during publication: {name}")
+    if is_directory and entry_fd is None and not stat.S_ISDIR(identity.st_mode):
         raise CollisionError(f"published entry is not a directory: {name}")
-    if not is_directory and not stat.S_ISREG(identity.st_mode):
+    if not is_directory and entry_fd is None and not stat.S_ISREG(identity.st_mode):
         raise CollisionError(f"published entry is not a regular file: {name}")
-    return os.dup(parent_fd), name, identity.st_dev, identity.st_ino, is_directory
+    return os.dup(parent_fd), name, device, inode, is_directory
+
+
+def _create_staging_directory(parent_fd: int, prefix: str) -> tuple[str, int]:
+    """Create a private staging directory relative to an already-open parent."""
+
+    candidates = tempfile._get_candidate_names()
+    for _ in range(100):
+        name = f"{prefix}{next(candidates)}"
+        try:
+            os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+
+        descriptor: int | None = None
+        try:
+            descriptor = _open_directory_descriptor(
+                name,
+                "staging directory",
+                dir_fd=parent_fd,
+                collision=True,
+            )
+            reservation = _published_identity(
+                parent_fd,
+                name,
+                is_directory=True,
+                entry_fd=descriptor,
+            )
+            os.close(reservation[0])
+            return name, descriptor
+        except Exception:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            raise
+    raise ScaffoldError("could not reserve a unique staging directory")
+
+
+def _assert_path_matches_descriptor(path: Path, descriptor: int, label: str) -> None:
+    """Reject a path that no longer names the directory held by descriptor."""
+
+    if _symlink_component_errors(path):
+        raise CollisionError(f"{label} contains a symlinked path component: {path}")
+    try:
+        path_stat = os.stat(path, follow_symlinks=False)
+        descriptor_stat = os.fstat(descriptor)
+    except OSError as exc:
+        raise CollisionError(f"{label} changed during publication: {path}") from exc
+    if (
+        not stat.S_ISDIR(path_stat.st_mode)
+        or not stat.S_ISDIR(descriptor_stat.st_mode)
+        or (path_stat.st_dev, path_stat.st_ino) != (descriptor_stat.st_dev, descriptor_stat.st_ino)
+    ):
+        raise CollisionError(f"{label} changed during publication: {path}")
 
 
 def _close_published(entries: list[PublishedEntry]) -> None:
@@ -1756,11 +1834,45 @@ def _remove_reserved_target(parent_fd: int, target_name: str, identity: tuple[in
         pass
 
 
+def _remove_reserved_directory_tree(entry: PublishedEntry) -> bool:
+    """Remove a reserved directory tree only if the entry still has its inode."""
+
+    parent_fd, name, device, inode, is_directory = entry
+    try:
+        if not is_directory or not getattr(shutil.rmtree, "avoids_symlink_attacks", False):
+            return False
+        try:
+            current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+        if (
+            not stat.S_ISDIR(current.st_mode)
+            or (current.st_dev, current.st_ino) != (device, inode)
+        ):
+            return False
+        try:
+            shutil.rmtree(name, dir_fd=parent_fd)
+        except FileNotFoundError:
+            return False
+        except (NotImplementedError, OSError):
+            return False
+        return True
+    finally:
+        try:
+            os.close(parent_fd)
+        except OSError:
+            pass
+
+
 def _publish_entry_no_replace(
     source: Path,
     destination: Path,
     *,
     destination_dir_fd: int,
+    source_dir_fd: int | None = None,
+    source_name: str | None = None,
 ) -> list[PublishedEntry]:
     """Publish one staged entry through a reserved directory descriptor."""
 
@@ -1778,15 +1890,28 @@ def _publish_entry_no_replace(
     else:
         raise CollisionError(f"target changed during publication: {destination}")
 
-    source_mode = os.lstat(source).st_mode
+    if source_dir_fd is None:
+        source_name = source.name
+        source_stat = os.lstat(source)
+    else:
+        if source_name is None:
+            raise ScaffoldError(f"staging source name is missing: {source}")
+        try:
+            source_stat = os.stat(source_name, dir_fd=source_dir_fd, follow_symlinks=False)
+        except OSError as exc:
+            raise ScaffoldError(f"staging source cannot be inspected: {source}") from exc
+    source_mode = source_stat.st_mode
     published: list[PublishedEntry] = []
     if stat.S_ISDIR(source_mode):
+        child_fd: int | None = None
+        source_child_fd: int | None = None
+        published_directory = False
+        child_identity: tuple[int, int] | None = None
         try:
             os.mkdir(destination_name, dir_fd=destination_dir_fd)
         except FileExistsError as exc:
             raise CollisionError(f"target changed during publication: {destination}") from exc
         try:
-            child_fd: int | None = None
             child_fd = _open_directory_descriptor(
                 destination_name,
                 "published directory",
@@ -1794,34 +1919,83 @@ def _publish_entry_no_replace(
                 collision=True,
             )
             published.append(
-                _published_identity(destination_dir_fd, destination_name, is_directory=True)
+                _published_identity(
+                    destination_dir_fd,
+                    destination_name,
+                    is_directory=True,
+                    entry_fd=child_fd,
+                )
             )
+            published_directory = True
+            if source_dir_fd is not None:
+                source_child_fd = _open_directory_descriptor(
+                    source_name,
+                    "staging source directory",
+                    dir_fd=source_dir_fd,
+                    collision=True,
+                )
+                if _descriptor_identity(
+                    source_child_fd,
+                    f"staging source {source}",
+                    is_directory=True,
+                ) != (source_stat.st_dev, source_stat.st_ino):
+                    raise CollisionError(f"staging source changed during publication: {source}")
         except Exception:
+            if not published_directory and child_fd is not None:
+                try:
+                    child_identity = _descriptor_identity(
+                        child_fd,
+                        f"published directory {destination_name}",
+                        is_directory=True,
+                    )
+                except ScaffoldError:
+                    child_identity = None
             if child_fd is not None:
                 try:
                     os.close(child_fd)
                 except OSError:
                     pass
-            try:
-                os.rmdir(destination_name, dir_fd=destination_dir_fd)
-            except OSError:
-                pass
+            if not published_directory and child_identity is not None:
+                _remove_reserved_directory_tree(
+                    (
+                        os.dup(destination_dir_fd),
+                        destination_name,
+                        *child_identity,
+                        True,
+                    )
+                )
+            elif published_directory:
+                _rollback_published(published)
             raise
         try:
-            for child in sorted(source.iterdir(), key=lambda path: path.name):
+            if source_child_fd is None:
+                child_names = sorted(path.name for path in source.iterdir())
+            else:
+                with os.scandir(source_child_fd) as entries:
+                    child_names = sorted(entry.name for entry in entries)
+            for child_name in child_names:
+                child = source / child_name
                 published.extend(
                     _publish_entry_no_replace(
                         child,
-                        destination / child.name,
+                        destination / child_name,
                         destination_dir_fd=child_fd,
+                        source_dir_fd=source_child_fd,
+                        source_name=child_name,
                     )
                 )
-            source.rmdir()
+            # Keep the staged source intact until the top-level reservation is
+            # removed through its descriptor-bound cleanup path.
             return published
         except Exception:
             _rollback_published(published)
             raise
         finally:
+            if source_child_fd is not None:
+                try:
+                    os.close(source_child_fd)
+                except OSError:
+                    pass
             if child_fd is not None:
                 try:
                     os.close(child_fd)
@@ -1833,22 +2007,28 @@ def _publish_entry_no_replace(
     try:
         # A hard link through the reserved descriptor is an atomic no-replace
         # publication that cannot follow a replacement target symlink.
-        os.link(
-            source,
-            destination_name,
-            dst_dir_fd=destination_dir_fd,
-            follow_symlinks=False,
-        )
+        if source_dir_fd is None:
+            os.link(
+                source,
+                destination_name,
+                dst_dir_fd=destination_dir_fd,
+                follow_symlinks=False,
+            )
+        else:
+            os.link(
+                source_name,
+                destination_name,
+                src_dir_fd=source_dir_fd,
+                dst_dir_fd=destination_dir_fd,
+                follow_symlinks=False,
+            )
     except FileExistsError as exc:
         raise CollisionError(f"target changed during publication: {destination}") from exc
     published.append(
         _published_identity(destination_dir_fd, destination_name, is_directory=False)
     )
-    try:
-        source.unlink()
-    except Exception:
-        _rollback_published(published)
-        raise
+    # The top-level staging reservation removes the source tree after all
+    # entries publish; do not unlink a name that could have been replaced.
     return published
 
 
@@ -1871,25 +2051,64 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
         raise CollisionError(f"output already exists: {target}")
     parent = project_root / ".agents"
     skills_parent = parent / "skills"
-    created_parents: list[Path] = []
+    project_fd: int | None = None
+    parent_fd: int | None = None
+    created_parent_entries: list[PublishedEntry] = []
     staging: Path | None = None
+    staging_name: str | None = None
+    staging_fd: int | None = None
+    staging_reservation: PublishedEntry | None = None
     target_reserved = False
     published_entries: list[PublishedEntry] = []
     skills_parent_fd: int | None = None
     target_fd: int | None = None
     target_identity: tuple[int, int] | None = None
     try:
-        for directory, label in ((parent, ".agents"), (skills_parent, ".agents/skills")):
-            if not _existing_directory(directory, f"output parent {label}"):
-                try:
-                    directory.mkdir()
-                except FileExistsError:
-                    _existing_directory(directory, f"output parent {label}")
-                else:
-                    created_parents.append(directory)
-        skills_parent_fd = _open_directory_descriptor(skills_parent, "output parent .agents/skills")
-        staging = Path(tempfile.mkdtemp(prefix=f".verify-{spec['app']['name']}.staging-", dir=skills_parent))
+        project_fd = _open_directory_descriptor(project_root, "project root")
+        parent_fd, parent_created = _open_or_create_directory(
+            project_fd,
+            ".agents",
+            "output parent .agents",
+        )
+        if parent_created:
+            created_parent_entries.append(
+                _published_identity(
+                    project_fd,
+                    ".agents",
+                    is_directory=True,
+                    entry_fd=parent_fd,
+                )
+            )
+        skills_parent_fd, skills_parent_created = _open_or_create_directory(
+            parent_fd,
+            "skills",
+            "output parent .agents/skills",
+        )
+        if skills_parent_created:
+            created_parent_entries.append(
+                _published_identity(
+                    parent_fd,
+                    "skills",
+                    is_directory=True,
+                    entry_fd=skills_parent_fd,
+                )
+            )
+        _assert_path_matches_descriptor(skills_parent, skills_parent_fd, "output parent")
+        staging_name, staging_fd = _create_staging_directory(
+            skills_parent_fd,
+            f".verify-{spec['app']['name']}.staging-",
+        )
+        staging = skills_parent / staging_name
+        staging_reservation = _published_identity(
+            skills_parent_fd,
+            staging_name,
+            is_directory=True,
+            entry_fd=staging_fd,
+        )
+        _assert_path_matches_descriptor(staging, staging_fd, "staging directory")
         _write_tree(spec, staging)
+        _assert_path_matches_descriptor(skills_parent, skills_parent_fd, "output parent")
+        _assert_path_matches_descriptor(staging, staging_fd, "staging directory")
         errors = validate_generated_skill(
             staging,
             expected_name=target.name,
@@ -1922,7 +2141,12 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
             target_fd,
             target_identity,
         )
-        for child in sorted(staging.iterdir(), key=lambda path: path.name):
+        if staging is None or staging_fd is None:
+            raise ScaffoldError("staging directory descriptor is unavailable")
+        _assert_path_matches_descriptor(staging, staging_fd, "staging directory")
+        with os.scandir(staging_fd) as entries:
+            child_names = sorted(entry.name for entry in entries)
+        for child_name in child_names:
             _assert_reserved_target_identity(
                 skills_parent_fd,
                 target.name,
@@ -1930,12 +2154,15 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
                 target_fd,
                 target_identity,
             )
-            destination = target / child.name
+            child = staging / child_name
+            destination = target / child_name
             published_entries.extend(
                 _publish_entry_no_replace(
                     child,
                     destination,
                     destination_dir_fd=target_fd,
+                    source_dir_fd=staging_fd,
+                    source_name=child_name,
                 )
             )
             _assert_reserved_target_identity(
@@ -1952,21 +2179,35 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
             target_fd,
             target_identity,
         )
-        staging.rmdir()
+        _assert_path_matches_descriptor(skills_parent, skills_parent_fd, "output parent")
+        _assert_path_matches_descriptor(target, target_fd, "reserved target")
+        if staging_reservation is None or not _remove_reserved_directory_tree(staging_reservation):
+            staging_reservation = None
+            raise CollisionError(f"staging directory changed during publication: {staging}")
+        staging_reservation = None
         staging = None
         _close_published(published_entries)
         published_entries = []
+        _close_published(created_parent_entries)
+        created_parent_entries = []
         return target
     except Exception:
-        if staging is not None:
-            _remove_path(staging)
+        if staging_reservation is not None:
+            _remove_reserved_directory_tree(staging_reservation)
+            staging_reservation = None
         if target_reserved:
             _rollback_published(published_entries)
             if skills_parent_fd is not None and target_identity is not None:
                 _remove_reserved_target(skills_parent_fd, target.name, target_identity)
-        _remove_empty_parents(created_parents)
+        _rollback_published(created_parent_entries)
+        created_parent_entries = []
         raise
     finally:
+        if staging_fd is not None:
+            try:
+                os.close(staging_fd)
+            except OSError:
+                pass
         if target_fd is not None:
             try:
                 os.close(target_fd)
@@ -1975,6 +2216,16 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
         if skills_parent_fd is not None:
             try:
                 os.close(skills_parent_fd)
+            except OSError:
+                pass
+        if parent_fd is not None:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
+        if project_fd is not None:
+            try:
+                os.close(project_fd)
             except OSError:
                 pass
 

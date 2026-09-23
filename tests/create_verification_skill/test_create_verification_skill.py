@@ -734,6 +734,121 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
             self.assertFalse((outside / "features").exists())
             self.assertFalse((detached / "SKILL.md").exists())
 
+    def test_directory_publication_binds_identity_to_open_descriptor(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-directory-identity-") as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            copy_fixture(project)
+            target = project / ".agents" / "skills" / "verify-tiny-fixture"
+            detached = root / "detached-features"
+            replaced = False
+            original_open = scaffold_module._open_directory_descriptor
+
+            def race_open(
+                name: Path | str,
+                label: str,
+                *,
+                dir_fd: int | None = None,
+                collision: bool = False,
+            ) -> int:
+                nonlocal replaced
+                descriptor = original_open(name, label, dir_fd=dir_fd, collision=collision)
+                if label == "published directory" and name == "features" and not replaced:
+                    replaced = True
+                    (target / "features").rename(detached)
+                    (target / "features").mkdir()
+                    (target / "features" / "sentinel.txt").write_text(
+                        "preserve\n",
+                        encoding="utf-8",
+                    )
+                return descriptor
+
+            with mock.patch.object(scaffold_module, "_open_directory_descriptor", side_effect=race_open):
+                with self.assertRaises(CollisionError):
+                    scaffold_module.scaffold(spec_for(), project)
+
+            self.assertTrue(replaced)
+            self.assertEqual((target / "features" / "sentinel.txt").read_text(encoding="utf-8"), "preserve\n")
+            self.assertTrue(detached.is_dir())
+            self.assertFalse((detached / "README.md").exists())
+            self.assertFalse((target / "SKILL.md").exists())
+
+    def test_rollback_refuses_a_replaced_staging_directory(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-staging-rollback-") as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            copy_fixture(project)
+            detached = root / "detached-staging"
+            replacement: Path | None = None
+            original_write = scaffold_module._write_tree
+
+            def race_write(current_spec: dict[str, object], staging: Path) -> None:
+                nonlocal replacement
+                original_write(current_spec, staging)
+                staging.rename(detached)
+                staging.mkdir()
+                (staging / "sentinel.txt").write_text("preserve\n", encoding="utf-8")
+                replacement = staging
+
+            with mock.patch.object(scaffold_module, "_write_tree", side_effect=race_write):
+                with self.assertRaises(ScaffoldError):
+                    scaffold_module.scaffold(spec_for(), project)
+
+            if replacement is None:
+                self.fail("the staging replacement race did not run")
+            self.assertEqual(
+                (replacement / "sentinel.txt").read_text(encoding="utf-8"),
+                "preserve\n",
+            )
+            self.assertTrue((detached / "SKILL.md").is_file())
+            self.assertFalse((project / ".agents" / "skills" / "verify-tiny-fixture").exists())
+
+    def test_staging_creation_stays_on_open_parent_when_parent_is_replaced_or_symlinked(self) -> None:
+        for kind in ("replacement", "symlink"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(
+                prefix=f"create-verification-staging-parent-{kind}-"
+            ) as temporary:
+                root = Path(temporary)
+                project = root / "project"
+                project.mkdir()
+                copy_fixture(project)
+                outside = root / "outside"
+                outside.mkdir()
+                detached = root / "detached-agents"
+                original_create = scaffold_module._create_staging_directory
+                created_in_detached: Path | None = None
+                replaced = False
+
+                def race_create(parent_fd: int, prefix: str) -> tuple[str, int]:
+                    nonlocal created_in_detached, replaced
+                    agents = project / ".agents"
+                    agents.rename(detached)
+                    if kind == "replacement":
+                        agents.mkdir()
+                    else:
+                        os.symlink(outside, agents, target_is_directory=True)
+                    replaced = True
+                    result = original_create(parent_fd, prefix)
+                    created_in_detached = detached / "skills" / result[0]
+                    self.assertTrue(created_in_detached.is_dir())
+                    self.assertFalse((outside / "skills" / result[0]).exists())
+                    return result
+
+                with mock.patch.object(scaffold_module, "_create_staging_directory", side_effect=race_create):
+                    with self.assertRaises(ScaffoldError):
+                        scaffold_module.scaffold(spec_for(), project)
+
+                self.assertTrue(replaced)
+                self.assertIsNotNone(created_in_detached)
+                self.assertTrue(
+                    (project / ".agents").is_symlink()
+                    if kind == "symlink"
+                    else (project / ".agents").is_dir()
+                )
+                self.assertFalse((outside / "skills").exists())
+
     def test_existing_tree_revalidates_all_emitted_command_contracts(self) -> None:
         with tempfile.TemporaryDirectory(prefix="create-verification-command-validation-") as temporary:
             root = Path(temporary)
