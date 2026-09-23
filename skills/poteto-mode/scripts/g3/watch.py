@@ -404,8 +404,13 @@ class JsonProviderAdapter:
 
     @classmethod
     def from_file(cls, path: str | Path) -> "JsonProviderAdapter":
+        fixture_path = Path(path).expanduser()
+        if fixture_path.is_symlink() or not fixture_path.is_file():
+            raise UnknownProviderData(
+                f"provider fixture must be an explicit regular file: {fixture_path}"
+            )
         try:
-            value = json.loads(Path(path).read_text(encoding="utf-8"))
+            value = json.loads(fixture_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise UnknownProviderData(f"provider fixture could not be read: {exc}") from exc
         return cls(_mapping(value, "provider payload"))

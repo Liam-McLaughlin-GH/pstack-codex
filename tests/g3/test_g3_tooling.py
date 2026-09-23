@@ -97,6 +97,13 @@ class G3WatcherTests(unittest.TestCase):
         with self.assertRaises(UnknownProviderData):
             reader.pull_request(PRContext("owner", "repo", 24))
 
+    def test_provider_fixture_symlink_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            link = Path(temporary) / "provider.json"
+            link.symlink_to(FIXTURES / "provider-ready.json")
+            with self.assertRaises(UnknownProviderData):
+                JsonProviderAdapter.from_file(link)
+
     def test_recorded_fast_path_falls_back_to_rollup_pages(self) -> None:
         payload = json.loads((FIXTURES / "provider-ready.json").read_text())
         payload["checks"] = {
