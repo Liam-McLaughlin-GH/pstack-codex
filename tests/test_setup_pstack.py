@@ -1395,6 +1395,48 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertEqual(victim.read_text(encoding="utf-8"), "competitor\n")
             self.assertEqual((root / "expected-private").read_text(encoding="utf-8"), "expected\n")
 
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin FSRef behavior is platform-specific")
+    def test_darwin_reference_rejects_a_renamed_directory_path(self) -> None:
+        safe_fs = load_module(SAFE_FS, "safe_fs_darwin_path_binding_test")
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-darwin-path-race-test-") as temporary:
+            root = Path(temporary)
+            original = root / "private-dir"
+            replacement = root / "replacement-dir"
+            original.mkdir()
+            replacement.mkdir()
+            (original / "entry").write_text("expected\n", encoding="utf-8")
+            (replacement / "entry").write_text("replacement\n", encoding="utf-8")
+            directory_fd = os.open(original, safe_fs._DIRECTORY_FLAGS)
+            expected_metadata = safe_fs.lstat_at(directory_fd, "entry")
+            original_path_for_fd = safe_fs._darwin_path_for_fd
+            swapped = False
+
+            def swap_directory_path(fd: int) -> bytes:
+                nonlocal swapped
+                path = original_path_for_fd(fd)
+                if not swapped:
+                    swapped = True
+                    os.rename(original, root / "moved-private")
+                    os.rename(replacement, original)
+                return path
+
+            safe_fs._darwin_path_for_fd = swap_directory_path
+            try:
+                with self.assertRaises(safe_fs.SafeFilesystemError):
+                    safe_fs._darwin_identity_reference_at(
+                        directory_fd,
+                        "entry",
+                        expected_metadata,
+                        receipt_path=root / "receipt" / "entry",
+                    )
+            finally:
+                safe_fs._darwin_path_for_fd = original_path_for_fd
+                os.close(directory_fd)
+
+            self.assertTrue(swapped)
+            self.assertEqual((root / "moved-private" / "entry").read_text(encoding="utf-8"), "expected\n")
+            self.assertEqual((root / "private-dir" / "entry").read_text(encoding="utf-8"), "replacement\n")
+
     def test_created_parent_recovery_receipt_is_bounded_and_deterministic(self) -> None:
         module = load_module(CONFIGURER, "configure_for_bounded_cleanup_receipt_test")
         safe_fs = sys.modules["safe_fs"]

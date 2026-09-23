@@ -463,9 +463,31 @@ def _darwin_identity_reference_at(
         reference = _DarwinFSRef()
         is_directory = ctypes.c_ubyte()
         entry_path = _darwin_path_for_fd(directory_fd).rstrip(b"/") + b"/" + os.fsencode(name)
+
+        def validate_path_binding() -> None:
+            path_parent = entry_path.rsplit(b"/", 1)[0] or b"/"
+            try:
+                path_parent_metadata = os.stat(path_parent, follow_symlinks=False)
+            except OSError as exc:
+                raise SafeFilesystemError(f"could not validate the Darwin directory path: {name}") from exc
+            if not _same_entry(path_parent_metadata, os.fstat(directory_fd)):
+                raise SafeFilesystemError(f"Darwin directory path changed during removal: {name}")
+            try:
+                path_metadata = os.lstat(entry_path)
+            except OSError as exc:
+                raise SafeFilesystemError(f"could not validate the Darwin entry path: {name}") from exc
+            if not _same_entry(path_metadata, expected_metadata):
+                raise SafeFilesystemError(f"Darwin entry path changed during removal: {name}")
+
+        # F_GETPATH produces a pathname, not a descriptor-relative handle.
+        # Validate both the parent directory and the entry through that path
+        # before and after the path-based FSRef call so a renamed directory
+        # cannot redirect the reference to a replacement tree.
+        validate_path_binding()
         status = make_reference(entry_path, 0x01, ctypes.byref(reference), ctypes.byref(is_directory))
         if status != 0:
             raise OSError(errno.EIO, f"FSPathMakeRefWithOptions failed with status {status}", name)
+        validate_path_binding()
         current_after = lstat_at(directory_fd, name)
         if not _same_entry(current_after, expected_metadata):
             raise SafeFilesystemError(f"entry identity changed during removal: {name}")
