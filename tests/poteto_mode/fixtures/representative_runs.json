@@ -1,0 +1,43 @@
+{
+  "autonomous": {
+    "predicate_after": 2,
+    "outcomes": ["no-progress", "predicate-met"],
+    "expected_status": "PASS",
+    "expected_iterations": 2
+  },
+  "autonomous_dead_end": {
+    "predicate_after": null,
+    "outcomes": ["no-progress", "no-progress"],
+    "expected_status": "BLOCKED",
+    "expected_iterations": 2
+  },
+  "shipping_without_authorization": {
+    "verified": true,
+    "authorized": false,
+    "expected_status": "NOT RUN",
+    "expected_merge_calls": 0
+  },
+  "shipping_with_authorization": {
+    "verified": true,
+    "authorized": true,
+    "expected_status": "PASS",
+    "expected_merge_calls": 1
+  },
+  "pause": {
+    "explicit_pause": true,
+    "expected_checkpoint": true
+  },
+  "normal_continuation": {
+    "explicit_pause": false,
+    "expected_checkpoint": false
+  },
+  "cleanup_dry_run": {
+    "candidates": [
+      {"path": "clean-merged", "merged": true, "dirty": false, "active": false},
+      {"path": "dirty-merged", "merged": true, "dirty": true, "active": false},
+      {"path": "active-merged", "merged": true, "dirty": false, "active": true}
+    ],
+    "expected_proposals": ["clean-merged"],
+    "expected_deletions": 0
+  }
+}

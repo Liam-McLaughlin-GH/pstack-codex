@@ -25,7 +25,7 @@ The following 30 upstream skills are active in this repo without changing their 
 
 These skills carry over the parts of pstack that do not depend on Cursor APIs. They cover design principles, root-cause debugging, behavior-focused verification, plain explanations, TypeScript modeling, and clean writing.
 
-The following 10 skills are present as Codex-native rewrites.
+The following skills are present as Codex-native rewrites.
 
 | Skill | Codex port |
 | --- | --- |
@@ -44,6 +44,14 @@ The following 10 skills are present as Codex-native rewrites.
 
 The port preserves the names of these workflows where possible. In Codex, invoke them as skills such as `$poteto-mode`, `$how`, `$architect`, or `$tdd`.
 
+The 23 poteto-mode playbooks are active under
+skills/poteto-mode/playbooks. They retain the upstream workflow contracts and
+use the local capability and side-effect rules in
+skills/poteto-mode/references/capability-boundaries.md. Forge, watcher,
+deployment, message, delegation, and deletion steps remain fixture-only or
+require explicit authorization.
+The source and MIT attribution remain in the source and license section above.
+
 ## What is missing
 
 The following 7 upstream skills are not active in the port.
@@ -54,10 +62,6 @@ The following 7 upstream skills are not active in the port.
 - `maintain-verification-skill`. It assumes the same Cursor verification-skill layout.
 - `recall`. It reads Cursor agent transcripts.
 - `setup-pstack`. It writes Cursor model configuration to `~/.cursor/rules/pstack-models.mdc`.
-
-The upstream `poteto-mode` playbooks are not copied into the active port. The missing playbook files are:
-
-`authoring-a-skill.md`, `autonomous-run.md`, `autopilot-full.md`, `autopilot-stack.md`, `babysit.md`, `bug-fix.md`, `eval.md`, `feature.md`, `hillclimb.md`, `investigation.md`, `multi-phase-plan.md`, `opening-a-pr.md`, `orchestrate.md`, `pause-safely.md`, `perf-issue.md`, `prototype.md`, `refactoring.md`, `runtime-forensics.md`, `session-pickup.md`, `shipping.md`, `trace-forensics.md`, `visual-parity.md`, and `worktree-cleanup.md`.
 
 The upstream agent and runtime pieces are also not ported.
 
