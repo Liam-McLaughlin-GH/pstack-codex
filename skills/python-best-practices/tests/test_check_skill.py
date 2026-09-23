@@ -37,6 +37,20 @@ class RoutingRegressionTests(unittest.TestCase):
             with self.subTest(request=request):
                 self.assertEqual(CHECKER.route_for_task(request), "unsafe")
 
+    def test_effectful_cloud_commands_and_clients_are_unsafe(self) -> None:
+        for request in (
+            "gcloud storage objects compose gs://source gs://target",
+            "gcloud compute instance-groups managed abandon-instances group --instances vm",
+            "gcloud iam service-accounts keys upload key.json --iam-account account",
+            "gcloud compute instances \\\n            update vm",
+            "google.cloud.storage.Client().bucket('b').blob('o').delete()",
+            "google.cloud.compute_v1.InstancesClient().delete(project='p')",
+            "kubernetes.client.CoreV1Api().patch_namespaced_pod('pod', 'ns')",
+            "requests.post('https://cluster.example/apply', json=payload)",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "unsafe")
+
     def test_generic_production_and_live_operations_are_manual_review(self) -> None:
         for request in (
             "Run a production operation",
@@ -563,10 +577,7 @@ class DocumentIntegrityTests(unittest.TestCase):
                         1,
                     )
                     errors = CHECKER.check_documents(candidate, self.ledger)
-                    self.assertFalse(
-                        any(field in error for error in errors),
-                        errors,
-                    )
+                    self.assertTrue(any(field in error for error in errors), errors)
 
             for value in ("0o12", "0O12"):
                 with self.subTest(field=field, value=value):
@@ -664,6 +675,16 @@ class DocumentIntegrityTests(unittest.TestCase):
         self.assertTrue(
             CHECKER.required_frontmatter_errors(
                 "name: |2\n  value\n\t\ndescription: desc\n"
+            )
+        )
+        self.assertFalse(
+            CHECKER.required_frontmatter_errors(
+                "name: |2\n  \tvalue\ndescription: desc\n"
+            )
+        )
+        self.assertTrue(
+            CHECKER.required_frontmatter_errors(
+                "name: |\n    \n  value\ndescription: desc\n"
             )
         )
 
@@ -885,7 +906,14 @@ class DocumentIntegrityTests(unittest.TestCase):
         )
         production_case["rule"] = "SP-WEB-OWNERS"
         errors = CHECKER.check_documents(self.skill_text, ownerless_rule)
-        self.assertTrue(any("rule requires a task owner" in error for error in errors), errors)
+        self.assertTrue(
+            any(
+                "rule requires a task owner" in error
+                or "unsafe cases must use SP-K8S-SAFETY" in error
+                for error in errors
+            ),
+            errors,
+        )
 
     def test_copied_skill_checker_runs_without_repository_scripts(self) -> None:
         with tempfile.TemporaryDirectory(prefix="python-best-practices-copy-") as temporary:

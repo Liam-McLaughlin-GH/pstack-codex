@@ -15,7 +15,7 @@ YAML_NUMBER_RE = re.compile(
     rf"""[-+]?(?:
         (?:{YAML_DECIMAL_DIGITS})\.(?:{YAML_DECIMAL_DIGITS})?(?:[eE][-+]?{YAML_DECIMAL_DIGITS})?
         |\.{YAML_DECIMAL_DIGITS}(?:[eE][-+]?{YAML_DECIMAL_DIGITS})?
-        |(?:{YAML_DECIMAL_DIGITS})
+        |(?:{YAML_DECIMAL_DIGITS})(?:[eE][-+]?{YAML_DECIMAL_DIGITS})?
     )""",
     re.VERBOSE,
 )
@@ -138,7 +138,7 @@ def _scalar_value_error(field: str, raw_value: str) -> str | None:
             return f"{field} must be a scalar string, not a boolean"
         return f"{field} must be a non-null scalar string"
     if (
-        (YAML_NUMBER_RE.fullmatch(value) and not YAML_INVALID_LEGACY_OCTAL_RE.fullmatch(value))
+        YAML_NUMBER_RE.fullmatch(value)
         or YAML_BASE_PREFIX_RE.fullmatch(value)
         or YAML_OCTAL_PREFIX_RE.fullmatch(value)
         or YAML_LEGACY_OCTAL_RE.fullmatch(value)
@@ -186,22 +186,30 @@ def required_frontmatter_errors(metadata: str) -> list[str]:
             explicit_indent = block_match.group("indent")
             block_indent = int(explicit_indent) if explicit_indent else None
             invalid_indent = False
+            leading_blank_indents: list[int] = []
+            saw_content = False
             while index < len(lines):
                 next_line = lines[index]
                 if not next_line:
+                    if not saw_content:
+                        leading_blank_indents.append(0)
                     content.append("")
                     index += 1
                     continue
-                whitespace_prefix = next_line[: len(next_line) - len(next_line.lstrip(" \t"))]
-                if "\t" in whitespace_prefix:
-                    invalid_indent = True
-                    index += 1
-                    continue
                 if not next_line.strip():
+                    leading_spaces = len(next_line) - len(next_line.lstrip(" "))
+                    if "\t" in next_line[: leading_spaces + 1]:
+                        invalid_indent = True
+                    if not saw_content:
+                        leading_blank_indents.append(leading_spaces)
                     content.append("")
                     index += 1
                     continue
                 leading = len(next_line) - len(next_line.lstrip(" "))
+                if leading == 0 and next_line.startswith("\t"):
+                    invalid_indent = True
+                    index += 1
+                    continue
                 if leading == 0:
                     if next_line.startswith("#") or re.match(r"^[A-Za-z_][A-Za-z0-9_-]*:", next_line):
                         break
@@ -217,9 +225,12 @@ def required_frontmatter_errors(metadata: str) -> list[str]:
                     continue
                 if block_indent is None:
                     block_indent = leading
+                    if any(blank_indent > block_indent for blank_indent in leading_blank_indents):
+                        invalid_indent = True
                 if leading < block_indent:
                     invalid_indent = True
                 content.append(next_line[block_indent:])
+                saw_content = True
                 index += 1
             if invalid_indent or not any(part.strip() for part in content):
                 errors.append(f"{field} must be a non-empty scalar string")

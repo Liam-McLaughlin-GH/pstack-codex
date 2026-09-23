@@ -301,8 +301,20 @@ GCLOUD_EFFECTFUL_RE = re.compile(
     + r"topic\s+(?:formats|startup|uninstall)|"
     + r"transfer\s+(?:agents\s+install|operations\s+(?:cancel|pause))|"
     + r"vmware\s+(?:private-clouds\s+migrate-management-vms|sddc\s+clusters\s+(?:addnodes|removenodes))|"
-    + r"workbench\s+schedules\s+pause)(?![a-z0-9_-])"
+    + r"workbench\s+schedules\s+pause|"
+    + r"storage\s+objects\s+compose|"
+    + r"compute\s+instance-groups\s+managed\s+abandon-instances|"
+    + r"iam\s+service-accounts\s+keys\s+upload)(?![a-z0-9_-])"
 )
+CLIENT_CUE_RE = re.compile(
+    r"\b(?:google(?:\.cloud|apiclient)|google-cloud-[a-z0-9_-]+|compute_v1|"
+    r"kubernetes(?:\.client)?|k8s(?:\.client)?|requests|httpx|urllib3|aiohttp)\b"
+)
+CLIENT_MUTATION_RE = re.compile(
+    r"(?:\.(?:create|delete|update|patch|insert|replace|execute|post|put|request)(?:[_-][a-z0-9]+)*\s*\(|"
+    r"\b(?:create|delete|update|patch|insert|replace|execute|post|put|request)\b)"
+)
+COMMAND_CONTINUATION_RE = re.compile(r"\\[ \t]*\r?\n[ \t]*")
 DEPLOYMENT_OPERATION_RE = re.compile(
     r"(?<![a-z0-9])(?:deploy(?:ed|ing|ment)?|promote|provision|publish|release|"
     r"roll(?:out|ing)?|rolling|scale)"
@@ -594,18 +606,30 @@ def _has_fabric_mutation(text: str) -> bool:
     return False
 
 
+def _has_client_mutation(text: str) -> bool:
+    """Treat mutating cloud, cluster, and network clients as unsafe."""
+
+    normalized = COMMAND_CONTINUATION_RE.sub(" ", text)
+    for line in normalized.splitlines() or [normalized]:
+        if CLIENT_CUE_RE.search(line) and CLIENT_MUTATION_RE.search(line):
+            return True
+    return False
+
+
 def route_for_task(task: str) -> str:
     """Return a safe repository route for a short task cue."""
 
     text = task.lower()
     infrastructure = _has_infrastructure_cue(text)
+    command_text = COMMAND_CONTINUATION_RE.sub(" ", text)
     cluster_mutation = bool(
         FABRIC3_RE.search(text)
         or FAB_ENVIRONMENT_RE.search(text)
         or _has_fabric_mutation(text)
         or KUBECTL_MUTATION_RE.search(text)
-        or GCLOUD_MUTATION_RE.search(text)
-        or GCLOUD_EFFECTFUL_RE.search(text)
+        or GCLOUD_MUTATION_RE.search(command_text)
+        or GCLOUD_EFFECTFUL_RE.search(command_text)
+        or _has_client_mutation(command_text)
     )
     environment_mutation = bool(ENVIRONMENT_RE.search(text) and MUTATION_RE.search(text))
     deployment_mutation = bool(DEPLOYMENT_OPERATION_RE.search(text))
@@ -913,6 +937,8 @@ def _validate_routing_case_records(ledger: Dict[str, Any]) -> List[str]:
                         "%s.rule is incompatible with task owners and safe routing: SP-K8S-SAFETY requires unsafe/manual review"
                         % context
                     )
+            elif safety == "unsafe":
+                errors.append("%s unsafe cases must use SP-K8S-SAFETY" % context)
             elif not expected_repositories:
                 errors.append("%s.rule requires a task owner" % context)
             elif EXPECTED_RULE_REPOSITORIES[rule] not in expected_repositories:
