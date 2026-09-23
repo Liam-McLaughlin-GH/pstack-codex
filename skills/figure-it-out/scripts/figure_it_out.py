@@ -1765,20 +1765,20 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                 )
                 for item in evidence
             )
-        reason = record.get("reason") or record.get("why") or "legacy refusal"
-        record["decision"] = f"refused action {action_reference}"
-        record["result"] = "blocked"
-        record["status"] = "refused"
-        record["evidence"] = [
-            {"kind": "reference", "ref": f"scope:{action_reference}"},
-            {"kind": "reference", "ref": "target:provided" if target_provided else "target:none"},
-        ]
-        record["reason"] = reason
-        record["next_action"] = record.get(
-            "next_action", "choose a declared local action or replan with owner approval"
-        )
-        record.pop("target", None)
-        return record
+        return {
+            "at": record.get("at", _now()),
+            "phase": record.get("phase", "run"),
+            "decision": f"refused action {action_reference}",
+            "why": "legacy refusal",
+            "evidence": [
+                {"kind": "reference", "ref": f"scope:{action_reference}"},
+                {"kind": "reference", "ref": "target:provided" if target_provided else "target:none"},
+            ],
+            "result": "blocked",
+            "status": "refused",
+            "reason": "legacy refusal",
+            "next_action": "choose a declared local action or replan with owner approval",
+        }
 
     def matching_decision(event: Mapping[str, Any], used: set[int]) -> tuple[dict[str, Any] | None, int | None]:
         event_name = event.get("event")
@@ -1837,7 +1837,7 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                     {"kind": "reference", "ref": f"scope:{action_reference}"},
                     {"kind": "reference", "ref": "target:provided" if event.get("target") is not None else "target:none"},
                 ]
-            return record, False
+            return sanitize_orphaned_decision(record), False
         record, index = matching_decision(event, used)
         if record is not None and index is not None:
             used.add(index)
@@ -1849,7 +1849,7 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                     {"kind": "reference", "ref": f"scope:{action_reference}"},
                     {"kind": "reference", "ref": "target:provided" if event.get("target") is not None else "target:none"},
                 ]
-            return deepcopy(record), True
+            return sanitize_orphaned_decision(record), True
         phase = event.get("phase") or "run"
         if event_name == "phase_passed":
             snapshot = event.get("verification_snapshot") or {}
@@ -1876,7 +1876,18 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                 {"kind": "reference", "ref": f"scope:{action_reference}"},
                 {"kind": "reference", "ref": "target:provided" if event.get("target") is not None else "target:none"},
             ]
-            return make_decision(phase, f"refused action {action_reference}", event.get("reason", "legacy refusal"), evidence, "blocked", status="refused", reason=event.get("reason", "legacy refusal"), next_action=event.get("next_action", "choose a declared local action or replan with owner approval")), False
+            return sanitize_orphaned_decision(
+                make_decision(
+                    phase,
+                    f"refused action {action_reference}",
+                    "legacy refusal",
+                    evidence,
+                    "blocked",
+                    status="refused",
+                    reason="legacy refusal",
+                    next_action="choose a declared local action or replan with owner approval",
+                )
+            ), False
         raise StateError(f"invalid state: schema-1 has an unsupported decision event {event_name!r}")
 
     used_legacy_decisions: set[int] = set()
@@ -1926,6 +1937,8 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                         )
         if event_name == "action_refused":
             event["target"] = _sanitize_refusal_target(event.get("target"))
+            event["reason"] = "legacy refusal"
+            event["next_action"] = "choose a declared local action or replan with owner approval"
         if event_name == "checkpoint":
             checkpoint_id = event.get("checkpoint")
             if not isinstance(checkpoint_id, str):

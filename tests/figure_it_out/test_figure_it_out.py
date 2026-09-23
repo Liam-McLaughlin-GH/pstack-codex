@@ -1270,6 +1270,9 @@ class WorkflowBehaviorTests(unittest.TestCase):
             orphan_legacy["events"] = []
             orphan_decision = orphan_legacy["decisions"][0]
             orphan_decision["evidence"] = ["scope:deploy", "target:token@host"]
+            orphan_decision["why"] = "target token@host was out of scope"
+            orphan_decision["reason"] = "target token@host was out of scope"
+            orphan_decision["private"] = {"target": "token@host"}
             orphan_path = root / "orphan-refusal.json"
             orphan_path.write_text(json.dumps(orphan_legacy), encoding="utf-8")
             migrated_orphan = figure_it_out.Workflow.load(orphan_path, workspace_root=root)
@@ -1278,6 +1281,23 @@ class WorkflowBehaviorTests(unittest.TestCase):
             audit_text = audit_path.read_text(encoding="utf-8")
             self.assertNotIn("token@host", migrated_orphan_text)
             self.assertNotIn("token@host", audit_text)
+
+            mislabeled_legacy = legacy_state(json.loads(refusal_state_path.read_text(encoding="utf-8")))
+            mislabeled_legacy["events"] = [{
+                "at": orphan_decision["at"],
+                "event": "decision_recorded",
+                "phase": "phase-1",
+            }]
+            mislabeled_decision = mislabeled_legacy["decisions"][0]
+            mislabeled_decision["evidence"] = ["scope:deploy", "target:token@host"]
+            mislabeled_decision["why"] = "target token@host was out of scope"
+            mislabeled_decision["reason"] = "target token@host was out of scope"
+            mislabeled_path = root / "mislabeled-refusal.json"
+            mislabeled_path.write_text(json.dumps(mislabeled_legacy), encoding="utf-8")
+            migrated_mislabeled = figure_it_out.Workflow.load(mislabeled_path, workspace_root=root)
+            mislabeled_audit = migrated_mislabeled.export_audit(root / "mislabeled-refusal.tsv").read_text(encoding="utf-8")
+            self.assertNotIn("token@host", json.dumps(migrated_mislabeled.state))
+            self.assertNotIn("token@host", mislabeled_audit)
 
             malformed_cases = {
                 "predicate-results": lambda state: state.update(predicate_results=[]),
