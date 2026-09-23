@@ -61,6 +61,9 @@ SKILL_NAME_PATTERN = re.compile(r"^verify-[a-z0-9]+(?:-[a-z0-9]+)*$")
 TOP_LEVEL_FRONTMATTER_FIELD = re.compile(
     r"^(?P<key>[A-Za-z_][A-Za-z0-9_-]*):(?:[ \t]*(?P<value>.*))?$"
 )
+BLOCK_SCALAR_HEADER = re.compile(
+    r"^(?P<style>[|>])(?P<modifiers>[1-9+-]{0,2})(?:[ \t]+(?:#.*)?)?$"
+)
 YAML_NON_STRING_PLAIN_SCALAR = re.compile(
     r"^[+-]?(?:"
     r"0[bB][01_]+|0[oO][0-7_]+|0[xX][0-9a-fA-F_]+|"
@@ -263,12 +266,90 @@ def _is_non_string_yaml_scalar(value: str) -> bool:
     )
 
 
+def _block_scalar_header(value: str, key: str) -> tuple[str, str, int | None] | None:
+    if not value.startswith(("|", ">")):
+        return None
+    match = BLOCK_SCALAR_HEADER.fullmatch(value)
+    if match is None:
+        raise MaintainError(f"frontmatter field {key!r} has an invalid block scalar header")
+
+    chomping = ""
+    indent: int | None = None
+    for modifier in match.group("modifiers"):
+        if modifier in "+-":
+            if chomping:
+                raise MaintainError(f"frontmatter field {key!r} has an invalid block scalar header")
+            chomping = modifier
+        else:
+            if indent is not None:
+                raise MaintainError(f"frontmatter field {key!r} has an invalid block scalar header")
+            indent = int(modifier)
+    return match.group("style"), chomping, indent
+
+
+def _block_scalar_value(
+    lines: list[str], start: int, key: str, style: str, chomping: str, explicit_indent: int | None
+) -> tuple[str, int]:
+    end = start
+    while end < len(lines):
+        line = lines[end]
+        if not line.strip():
+            end += 1
+            continue
+        if not line.startswith((" ", "\t")):
+            if line.lstrip().startswith("#") or TOP_LEVEL_FRONTMATTER_FIELD.fullmatch(line):
+                break
+            raise MaintainError(f"invalid YAML frontmatter line: {line!r}")
+        end += 1
+
+    block_lines = lines[start:end]
+    non_empty_lines = [line for line in block_lines if line.strip()]
+    if not non_empty_lines:
+        return "", end
+
+    if any(line.startswith("\t") for line in non_empty_lines):
+        raise MaintainError(f"frontmatter field {key!r} has invalid block scalar indentation")
+    indent = explicit_indent or min(len(line) - len(line.lstrip(" ")) for line in non_empty_lines)
+    if indent < 1 or any(len(line) - len(line.lstrip(" ")) < indent for line in non_empty_lines):
+        raise MaintainError(f"frontmatter field {key!r} has invalid block scalar indentation")
+
+    content = [line[indent:] if line.strip() else "" for line in block_lines]
+    if style == "|":
+        parsed = "\n".join(content)
+    else:
+        folded: list[str] = []
+        for index, line in enumerate(content):
+            folded.append(line)
+            if index == len(content) - 1:
+                continue
+            following = content[index + 1]
+            if not line:
+                separator = "\n" if not following else ""
+            elif not following or line.startswith(" ") or following.startswith(" "):
+                separator = "\n"
+            else:
+                separator = " "
+            folded.append(separator)
+        parsed = "".join(folded)
+
+    parsed += "\n"
+    if chomping == "-":
+        parsed = parsed.rstrip("\n")
+    elif not chomping:
+        parsed = parsed.rstrip("\n") + "\n"
+    return parsed, end
+
+
 def _strict_frontmatter_subset(text: str) -> dict[str, str]:
     """Parse the supported frontmatter subset without a YAML dependency."""
 
     fields: dict[str, str] = {}
-    for line in text.splitlines():
+    lines = text.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         if not line.strip() or line.lstrip().startswith("#"):
+            index += 1
             continue
         match = TOP_LEVEL_FRONTMATTER_FIELD.fullmatch(line)
         if not match:
@@ -279,6 +360,11 @@ def _strict_frontmatter_subset(text: str) -> dict[str, str]:
         value = (match.group("value") or "").strip()
         if not value:
             raise MaintainError(f"frontmatter field {key!r} is empty")
+
+        block_header = _block_scalar_header(value, key)
+        if block_header is not None:
+            fields[key], index = _block_scalar_value(lines, index + 1, key, *block_header)
+            continue
         if value.startswith('"'):
             try:
                 parsed = json.loads(value)
@@ -287,17 +373,23 @@ def _strict_frontmatter_subset(text: str) -> dict[str, str]:
             if not isinstance(parsed, str):
                 raise MaintainError(f"frontmatter field {key!r} must be a string")
             fields[key] = parsed
+            index += 1
             continue
         if value.startswith("'"):
             if len(value) < 2 or not value.endswith("'"):
                 raise MaintainError(f"frontmatter field {key!r} has an unterminated quote")
             fields[key] = value[1:-1].replace("''", "'")
+            index += 1
             continue
-        if value.startswith(("[", "{", "&", "*", "!", "|", ">", "%", "@", "`")):
+        if value.startswith(("[", "{", "&", "*", "!", "%", "@", "`")):
             raise MaintainError(f"frontmatter field {key!r} is not a supported scalar")
-        if _is_non_string_yaml_scalar(value):
+        plain_value = re.split(r"[ \t]+#", value, maxsplit=1)[0].rstrip()
+        if re.search(r":(?:[ \t]|$)", plain_value):
+            raise MaintainError(f"frontmatter field {key!r} has an invalid plain scalar mapping value")
+        if _is_non_string_yaml_scalar(plain_value):
             raise MaintainError(f"frontmatter field {key!r} must be a string")
-        fields[key] = re.split(r"[ \t]+#", value, maxsplit=1)[0].rstrip()
+        fields[key] = plain_value
+        index += 1
     return fields
 
 

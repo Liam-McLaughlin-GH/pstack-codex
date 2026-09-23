@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -22,6 +23,27 @@ def run_helper(*args: str) -> subprocess.CompletedProcess[str]:
         text=True,
         check=False,
     )
+
+
+def run_helper_without_yaml(*args: str) -> subprocess.CompletedProcess[str]:
+    with tempfile.TemporaryDirectory(prefix="maintain-verification-no-yaml-") as temporary:
+        shim_root = Path(temporary)
+        (shim_root / "yaml.py").write_text(
+            "raise ModuleNotFoundError('PyYAML disabled for this test')\n",
+            encoding="utf-8",
+        )
+        environment = os.environ.copy()
+        pythonpath = environment.get("PYTHONPATH")
+        environment["PYTHONPATH"] = os.pathsep.join(
+            item for item in (str(shim_root), pythonpath) if item
+        )
+        return subprocess.run(
+            [sys.executable, str(HELPER), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=environment,
+        )
 
 
 def json_output(result: subprocess.CompletedProcess[str]) -> dict[str, object]:
@@ -968,6 +990,82 @@ class MaintainVerificationSkillBehaviorTests(unittest.TestCase):
                     label,
                 )
             skill_file.write_text(original, encoding="utf-8")
+
+    def test_dependency_free_frontmatter_rejects_plain_scalar_mapping_value(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-frontmatter-mapping-") as temporary:
+            root = Path(temporary)
+            fixture = create_project(root, stale=False)
+            skill_file = fixture["skill_root"] / "SKILL.md"
+            original = skill_file.read_text(encoding="utf-8")
+            body = original.split("---\n", 2)[2]
+            skill_file.write_text(
+                "---\n"
+                "name: verify-tiny\n"
+                "description: bad: value\n"
+                "---\n"
+                + body,
+                encoding="utf-8",
+            )
+            result = run_helper_without_yaml(
+                "audit",
+                "--skill-root",
+                str(fixture["skill_root"]),
+                "--project-root",
+                str(fixture["project"]),
+                "--reader-report",
+                str(fixture["reader_path"]),
+                "--live-report",
+                str(fixture["live_path"]),
+                "--json",
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            payload = json_output(result)
+            self.assertEqual(payload["outcome"], "blocked")
+            self.assertTrue(
+                any(
+                    item["kind"] == "doc-drift"
+                    and item.get("path") == "SKILL.md"
+                    and "invalid plain scalar mapping value" in item["message"]
+                    for item in payload["findings"]
+                )
+            )
+
+    def test_dependency_free_frontmatter_accepts_folded_and_literal_scalars(self) -> None:
+        variants = {
+            "folded": "description: >-\n  Verify the tiny CLI:\n  through its shell harness.\n",
+            "literal": "description: |-\n  Verify the tiny CLI.\n  Keep line breaks.\n",
+        }
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-frontmatter-block-") as temporary:
+            root = Path(temporary)
+            for label, description in variants.items():
+                fixture_root = root / label
+                fixture_root.mkdir()
+                fixture = create_project(fixture_root, stale=False)
+                skill_file = fixture["skill_root"] / "SKILL.md"
+                original = skill_file.read_text(encoding="utf-8")
+                body = original.split("---\n", 2)[2]
+                skill_file.write_text(
+                    "---\n"
+                    "name: verify-tiny\n"
+                    + description
+                    + "---\n"
+                    + body,
+                    encoding="utf-8",
+                )
+                result = run_helper_without_yaml(
+                    "audit",
+                    "--skill-root",
+                    str(fixture["skill_root"]),
+                    "--project-root",
+                    str(fixture["project"]),
+                    "--reader-report",
+                    str(fixture["reader_path"]),
+                    "--live-report",
+                    str(fixture["live_path"]),
+                    "--json",
+                )
+                self.assertEqual(result.returncode, 0, label + ": " + result.stderr)
+                self.assertEqual(json_output(result)["outcome"], "clean", label)
 
     def test_source_entries_need_citations_and_regular_files(self) -> None:
         with tempfile.TemporaryDirectory(prefix="maintain-verification-sources-") as temporary:
