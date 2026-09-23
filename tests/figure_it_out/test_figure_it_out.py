@@ -1266,6 +1266,19 @@ class WorkflowBehaviorTests(unittest.TestCase):
             self.assertEqual(len(migrated_refusal.state["decisions"]), 1)
             self.assertNotIn("token@host", json.dumps(migrated_refusal.state["decisions"]))
 
+            orphan_legacy = legacy_state(json.loads(refusal_state_path.read_text(encoding="utf-8")))
+            orphan_legacy["events"] = []
+            orphan_decision = orphan_legacy["decisions"][0]
+            orphan_decision["evidence"] = ["scope:deploy", "target:token@host"]
+            orphan_path = root / "orphan-refusal.json"
+            orphan_path.write_text(json.dumps(orphan_legacy), encoding="utf-8")
+            migrated_orphan = figure_it_out.Workflow.load(orphan_path, workspace_root=root)
+            audit_path = migrated_orphan.export_audit(root / "orphan-refusal.tsv")
+            migrated_orphan_text = json.dumps(migrated_orphan.state)
+            audit_text = audit_path.read_text(encoding="utf-8")
+            self.assertNotIn("token@host", migrated_orphan_text)
+            self.assertNotIn("token@host", audit_text)
+
             malformed_cases = {
                 "predicate-results": lambda state: state.update(predicate_results=[]),
                 "phase-checkpoints": lambda state: state["phases"][0].update(checkpoints={}),

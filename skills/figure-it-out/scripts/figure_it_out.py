@@ -1731,6 +1731,55 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             record["next_action"] = next_action
         return record
 
+    def sanitize_orphaned_decision(decision: Mapping[str, Any]) -> dict[str, Any]:
+        """Keep private refusal targets out of synthetic legacy events."""
+
+        record = deepcopy(dict(decision))
+        decision_text = record.get("decision")
+        action_reference = (
+            decision_text.removeprefix("refused action ")
+            if isinstance(decision_text, str) and decision_text.startswith("refused action ")
+            else "invalid-action"
+        )
+        is_refusal = record.get("status") == "refused" or (
+            isinstance(decision_text, str) and decision_text.startswith("refused action ")
+        )
+        if not is_refusal:
+            return record
+        if SAFE_ACTION.fullmatch(action_reference) is None:
+            action_reference = "invalid-action"
+        evidence = record.get("evidence", [])
+        target_provided = "target" in record
+        if isinstance(evidence, list):
+            target_provided = target_provided or any(
+                (
+                    isinstance(item, str)
+                    and item.startswith("target:")
+                    and item != "target:none"
+                )
+                or (
+                    isinstance(item, Mapping)
+                    and isinstance(item.get("ref"), str)
+                    and item["ref"].startswith("target:")
+                    and item["ref"] != "target:none"
+                )
+                for item in evidence
+            )
+        reason = record.get("reason") or record.get("why") or "legacy refusal"
+        record["decision"] = f"refused action {action_reference}"
+        record["result"] = "blocked"
+        record["status"] = "refused"
+        record["evidence"] = [
+            {"kind": "reference", "ref": f"scope:{action_reference}"},
+            {"kind": "reference", "ref": "target:provided" if target_provided else "target:none"},
+        ]
+        record["reason"] = reason
+        record["next_action"] = record.get(
+            "next_action", "choose a declared local action or replan with owner approval"
+        )
+        record.pop("target", None)
+        return record
+
     def matching_decision(event: Mapping[str, Any], used: set[int]) -> tuple[dict[str, Any] | None, int | None]:
         event_name = event.get("event")
         for index, decision in enumerate(legacy_decisions):
@@ -1987,11 +2036,12 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
     for index, decision in enumerate(legacy_decisions):
         if index in used_legacy_decisions:
             continue
+        migrated_decision = sanitize_orphaned_decision(decision)
         event = {
             "at": decision.get("at", _now()),
             "event": "decision_recorded",
             "phase": decision.get("phase", "run"),
-            "__migration_decision": deepcopy(decision),
+            "__migration_decision": migrated_decision,
             "__migration_listed": True,
         }
         normalized_events.insert(completed_index, event)
