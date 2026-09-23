@@ -500,36 +500,48 @@ def _native_unlink_at(
     identity_reference: _DarwinFSRef | None = None,
     receipt_path: Path | None = None,
 ) -> None:
-    """Remove an entry through an identity-bound primitive when required."""
+    """Claim an identity-bound entry before removing it by descriptor."""
 
-    if sys.platform == "darwin":
-        if identity_reference is None:
-            unavailable = SafeFilesystemError(
-                "Darwin identity-bound cleanup is unavailable; private entry preserved",
-                preserve_private=True,
-            )
-            raise _with_cleanup_receipt(
-                unavailable,
-                path=receipt_path or Path(name),
-                expected_metadata=expected_metadata,
-                reason="identity-delete-unavailable",
-            )
-        _darwin_delete_reference(identity_reference, name)
-        return
+    current_metadata = lstat_at(parent_fd, name)
+    if not _same_entry(current_metadata, expected_metadata):
+        raise _with_cleanup_receipt(
+            SafeFilesystemError(f"entry identity changed during removal: {name}"),
+            path=receipt_path or Path(name),
+            expected_metadata=expected_metadata,
+            reason="replaced",
+        )
+    if stat.S_ISDIR(expected_metadata.st_mode) != is_directory:
+        raise SafeFilesystemError(f"entry type changed during removal: {name}")
 
+    claimed_name = unique_entry_name(parent_fd, ".pstack-unlink-")
+    atomic_rename_noreplace_at(parent_fd, name, claimed_name)
     try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        function = getattr(libc, "unlinkat")
-    except AttributeError as exc:
-        raise SafeFilesystemError("the platform has no descriptor-relative unlink primitive") from exc
-
-    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
-    function.restype = ctypes.c_int
-    flags = 0x00000200 if is_directory else 0
-    result = function(parent_fd, os.fsencode(name), flags)
-    if result != 0:
-        error_number = ctypes.get_errno()
-        raise OSError(error_number, os.strerror(error_number), name)
+        claimed_metadata = lstat_at(parent_fd, claimed_name)
+        if not _same_entry(claimed_metadata, expected_metadata):
+            raise SafeFilesystemError(f"entry identity changed during removal: {name}")
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            function = getattr(libc, "unlinkat")
+        except AttributeError as exc:
+            raise SafeFilesystemError("the platform has no descriptor-relative unlink primitive") from exc
+        function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+        function.restype = ctypes.c_int
+        flags = (0x00000080 if sys.platform == "darwin" else 0x00000200) if is_directory else 0
+        result = function(parent_fd, os.fsencode(claimed_name), flags)
+        if result != 0:
+            error_number = ctypes.get_errno()
+            raise OSError(error_number, os.strerror(error_number), claimed_name)
+    except BaseException as exc:
+        try:
+            atomic_rename_noreplace_at(parent_fd, claimed_name, name)
+        except (OSError, SafeFilesystemError) as restore_error:
+            raise _with_cleanup_receipt(
+                SafeFilesystemError(f"{exc}; could not restore claimed cleanup entry: {restore_error}"),
+                path=(receipt_path or Path(name)).parent / claimed_name,
+                expected_metadata=expected_metadata,
+                reason="cleanup-recovery-pending",
+            ) from exc
+        raise
 
 
 def _native_rename(old_dir_fd: int, old_name: str, new_dir_fd: int, new_name: str, flags: int) -> bool:
@@ -812,14 +824,6 @@ def _delete_private_entry(
         claimed_metadata = lstat_at(parent_fd, delete_name)
         if not _same_entry(claimed_metadata, expected_metadata):
             raise SafeFilesystemError(f"private cleanup identity changed: {private_name}")
-        if sys.platform == "darwin":
-            quarantine_entry_reference = _darwin_identity_reference_at(
-                parent_fd,
-                delete_name,
-                claimed_metadata,
-                receipt_path=receipt_path,
-            )
-
         quarantine_name, quarantine_fd = create_unique_directory(
             parent_fd,
             ".pstack-dispose-",
@@ -827,13 +831,6 @@ def _delete_private_entry(
         )
         quarantine_receipt_path = receipt_path.parent / quarantine_name
         quarantine_directory_metadata = os.fstat(quarantine_fd)
-        if sys.platform == "darwin":
-            quarantine_directory_reference = _darwin_identity_reference_at(
-                parent_fd,
-                quarantine_name,
-                quarantine_directory_metadata,
-                receipt_path=quarantine_receipt_path,
-            )
         atomic_rename_noreplace_between(
             parent_fd,
             delete_name,
