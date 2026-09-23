@@ -2687,16 +2687,29 @@ def _publish_entry_no_replace(
     published: list[PublishedEntry] = []
 
     def record(entry: PublishedEntry) -> None:
-        if reservation_sink is not None:
-            outer_entry = (
-                os.dup(entry[0]),
-                entry[1],
-                entry[2],
-                entry[3],
-                entry[4],
-            )
-            reservation_sink.append(outer_entry)
         published.append(entry)
+        if reservation_sink is None:
+            return
+        outer_parent_fd: int | None = None
+        try:
+            outer_parent_fd = os.dup(entry[0])
+            reservation_sink.append(
+                (
+                    outer_parent_fd,
+                    entry[1],
+                    entry[2],
+                    entry[3],
+                    entry[4],
+                )
+            )
+        except BaseException:
+            published.pop()
+            if outer_parent_fd is not None:
+                try:
+                    os.close(outer_parent_fd)
+                except OSError:
+                    pass
+            raise
 
     if stat.S_ISDIR(source_mode):
         child_fd: int | None = None
@@ -2776,6 +2789,7 @@ def _publish_entry_no_replace(
     destination_reservation: PublishedEntry | None = None
     private_link_created = False
     temporary_identity: tuple[int, int] | None = None
+    reservation_recorded = False
     try:
         reservation_parent_fd = os.dup(destination_dir_fd)
         temporary_name = _unique_private_name(destination_dir_fd, ".verify-publish-")
@@ -2827,6 +2841,7 @@ def _publish_entry_no_replace(
             False,
         )
         record(destination_reservation)
+        reservation_recorded = True
         # The private name was created by this call even when the source path
         # changed between validation and os.link(). Bind rollback to the
         # identity actually created so a failed race cannot strand our private
@@ -2903,7 +2918,7 @@ def _publish_entry_no_replace(
         )
         _close_published([observed])
     except Exception:
-        if destination_reservation is None and private_link_created and temporary_identity is not None:
+        if not reservation_recorded and private_link_created and temporary_identity is not None:
             _rollback_published(
                 [
                     (

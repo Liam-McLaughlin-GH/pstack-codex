@@ -1540,6 +1540,45 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
             finally:
                 os.close(source_fd)
                 os.close(destination_fd)
+
+    def test_private_link_sink_dup_failure_removes_private_link(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-private-link-sink-dup-") as temporary:
+            root = Path(temporary)
+            source_dir = root / "source"
+            destination_dir = root / "destination"
+            source_dir.mkdir()
+            destination_dir.mkdir()
+            source = source_dir / "source.txt"
+            source.write_text("owned\n", encoding="utf-8")
+            source_fd = os.open(source_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            destination_fd = os.open(destination_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            original_dup = scaffold_module.os.dup
+            calls = 0
+
+            def fail_sink_dup(fd: int) -> int:
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("forced sink reservation dup failure")
+                return original_dup(fd)
+
+            try:
+                with mock.patch.object(scaffold_module.os, "dup", side_effect=fail_sink_dup):
+                    with self.assertRaisesRegex(OSError, "forced sink reservation dup failure"):
+                        scaffold_module._publish_entry_no_replace(
+                            source,
+                            destination_dir / "published.txt",
+                            destination_dir_fd=destination_fd,
+                            source_dir_fd=source_fd,
+                            source_name="source.txt",
+                            reservation_sink=[],
+                        )
+            finally:
+                os.close(source_fd)
+                os.close(destination_fd)
+
+            self.assertGreaterEqual(calls, 2)
+            self.assertEqual(list(destination_dir.iterdir()), [])
             self.assertEqual(list(destination_dir.iterdir()), [])
 
     def test_publication_swap_after_identity_observation_rolls_back(self) -> None:
