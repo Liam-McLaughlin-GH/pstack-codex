@@ -83,7 +83,9 @@ SOURCE_TASK_RE = re.compile(
     r"\b(?:component|function|class|module|parser|source|code|file|package|"
     r"queryset|serializer|view)\b"
 )
-BACKEND_CUE_RE = re.compile(r"\b(?:web-app|django|drf|orm|manage\.py|celery)\b")
+BACKEND_CUE_RE = re.compile(
+    r"\b(?:showpass\s+backend|web-app|django|drf|orm|manage\.py|celery)\b"
+)
 FRONTEND_CUE_RE = re.compile(
     r"\b(?:showpass-frontend|next(?:\.js|js)?|react(?:\s+native)?|frontend|client)\b"
 )
@@ -181,21 +183,21 @@ def repositories_for_task(task: str) -> Tuple[str, ...]:
     frontend_cue = bool(FRONTEND_CUE_RE.search(text))
     modern_frontend_cue = bool(FRONTEND_OWNER_CUE_RE.search(text))
     showpass_ui_cue = bool(SHOWPASS_UI_CUE_RE.search(text))
-    explicit_frontend_cue = bool(FRONTEND_REPOSITORY_CUE_RE.search(text)) or bool(
+    explicit_repository_cue = bool(FRONTEND_REPOSITORY_CUE_RE.search(text))
+    showpass_modern_cue = bool(
         SHOWPASS_PRODUCT_CUE_RE.search(text)
         and (modern_frontend_cue or showpass_ui_cue)
     )
     legacy_ui_cue = bool(LEGACY_UI_CUE_RE.search(text))
     modern_ui_work = bool(MODERN_UI_WORK_RE.search(text))
+    legacy_ui_only = legacy_ui_cue and not modern_ui_work
 
     repositories: List[str] = []
     if backend_cue or legacy_ui_cue:
         repositories.append("web-app")
     if (
-        (
-            explicit_frontend_cue
-            and (modern_frontend_cue or frontend_cue or showpass_ui_cue)
-        )
+        explicit_repository_cue
+        or (showpass_modern_cue and not legacy_ui_only)
         or (backend_cue and frontend_cue)
         or (legacy_ui_cue and modern_ui_work)
     ):

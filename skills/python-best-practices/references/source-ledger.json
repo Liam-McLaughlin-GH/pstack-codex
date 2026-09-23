@@ -229,6 +229,17 @@
       "citations": [
         {"path": "AGENTS.md", "lines": "3-7", "citation": "showpass-frontend@0aae56009bb1aabe09942adb04f6aa4782f98450:showpass-frontend/AGENTS.md#L3-L7"}
       ]
+    },
+    {
+      "id": "SP-FRONTEND-PACKAGES",
+      "route": "showpass-frontend",
+      "repo": "showpass-frontend",
+      "path": "AGENTS.md",
+      "lines": "28-35",
+      "citation": "showpass-frontend@0aae56009bb1aabe09942adb04f6aa4782f98450:showpass-frontend/AGENTS.md#L28-L35",
+      "citations": [
+        {"path": "AGENTS.md", "lines": "28-35", "citation": "showpass-frontend@0aae56009bb1aabe09942adb04f6aa4782f98450:showpass-frontend/AGENTS.md#L28-L35"}
+      ]
     }
   ],
   "commands": [
@@ -256,6 +267,12 @@
     {"name": "framework-only-react-component", "safety": "safe", "input": "Change a React component", "expected": "general"},
     {"name": "framework-only-nextjs-component", "safety": "safe", "input": "Change a Next.js component", "expected": "general"},
     {"name": "showpass-nextjs-component", "safety": "safe", "input": "Change a Showpass Next.js component", "expected": "showpass-frontend"},
+    {"name": "showpass-backend", "safety": "safe", "input": "Review the Showpass backend", "expected": "web-app", "rule": "SP-WEB-OWNERS", "repositories": ["web-app"]},
+    {"name": "frontend-core-package", "safety": "safe", "input": "Change packages/core", "expected": "showpass-frontend", "rule": "SP-FRONTEND-PACKAGES", "repositories": ["showpass-frontend"]},
+    {"name": "frontend-next-app-package", "safety": "safe", "input": "Change packages/next-app", "expected": "showpass-frontend", "rule": "SP-FRONTEND-PACKAGES", "repositories": ["showpass-frontend"]},
+    {"name": "frontend-mobile-package", "safety": "safe", "input": "Change packages/mobile", "expected": "showpass-frontend", "rule": "SP-FRONTEND-PACKAGES", "repositories": ["showpass-frontend"]},
+    {"name": "frontend-desktop-package", "safety": "safe", "input": "Change packages/desktop", "expected": "showpass-frontend", "rule": "SP-FRONTEND-PACKAGES", "repositories": ["showpass-frontend"]},
+    {"name": "unknown-frontend-package", "safety": "safe", "input": "Change packages/unknown", "expected": "general"},
     {"name": "fab-list", "safety": "safe", "input": "fab --list", "expected": "web-k8s"},
     {"name": "fabric3-task", "safety": "unsafe", "input": "Review a Fabric3 task", "expected": "unsafe", "rule": "SP-K8S-SAFETY"},
     {"name": "fabric-3-task", "safety": "unsafe", "input": "Review a Fabric 3 task", "expected": "unsafe", "rule": "SP-K8S-SAFETY"},
@@ -288,6 +305,13 @@
     {"name": "nextjs-redirect-only", "safety": "safe", "input": "Fix the Next.js redirect", "expected": "web-app", "rule": "SP-WEB-LEGACY-ROUTING", "repositories": ["web-app"]},
     {"name": "nextjs-bridge-route-only", "safety": "safe", "input": "Fix the Next.js bridge-route", "expected": "web-app", "rule": "SP-WEB-LEGACY-ROUTING", "repositories": ["web-app"]},
     {"name": "nextjs-bridge-modern-ui", "safety": "safe", "input": "Fix the Next.js bridge and update the React component", "expected": "ambiguous", "rule": "SP-WEB-LEGACY-ROUTING", "repositories": ["web-app", "showpass-frontend"]},
+    {"name": "showpass-nextjs-bridge-only", "safety": "safe", "input": "Fix the Showpass Next.js bridge", "expected": "web-app", "rule": "SP-WEB-LEGACY-ROUTING", "repositories": ["web-app"]},
+    {"name": "showpass-nextjs-redirect-only", "safety": "safe", "input": "Fix the Showpass Next.js redirect", "expected": "web-app", "rule": "SP-WEB-LEGACY-ROUTING", "repositories": ["web-app"]},
+    {"name": "showpass-nextjs-bridge-route-only", "safety": "safe", "input": "Fix the Showpass Next.js bridge-route", "expected": "web-app", "rule": "SP-WEB-LEGACY-ROUTING", "repositories": ["web-app"]},
+    {"name": "showpass-nextjs-bridge-route-space-only", "safety": "safe", "input": "Fix the Showpass Next.js bridge route", "expected": "web-app", "rule": "SP-WEB-LEGACY-ROUTING", "repositories": ["web-app"]},
+    {"name": "showpass-nextjs-bridge-modern-ui", "safety": "safe", "input": "Fix the Showpass Next.js bridge and update the React component", "expected": "ambiguous", "rule": "SP-WEB-LEGACY-ROUTING", "repositories": ["web-app", "showpass-frontend"]},
+    {"name": "showpass-nextjs-redirect-modern-ui", "safety": "safe", "input": "Fix the Showpass Next.js redirect and update the modern UI", "expected": "ambiguous", "rule": "SP-WEB-LEGACY-ROUTING", "repositories": ["web-app", "showpass-frontend"]},
+    {"name": "showpass-nextjs-bridge-route-modern-ui", "safety": "safe", "input": "Fix the Showpass Next.js bridge-route and update the Next.js client", "expected": "ambiguous", "rule": "SP-WEB-LEGACY-ROUTING", "repositories": ["web-app", "showpass-frontend"]},
     {"name": "mixed-angularjs-react", "safety": "safe", "input": "Fix the AngularJS bridge and update the React component", "expected": "ambiguous", "rule": "SP-WEB-LEGACY-ROUTING", "repositories": ["web-app", "showpass-frontend"]},
     {"name": "mixed-django-nextjs", "safety": "safe", "input": "Review a web-app Django QuerySet and Next.js serializer boundary", "expected": "ambiguous"},
     {"name": "mixed-django-nextjs-api", "safety": "safe", "input": "Review a Django-backed Next.js API route", "expected": "ambiguous"},

@@ -88,6 +88,17 @@ class RoutingRegressionTests(unittest.TestCase):
                 self.assertEqual(CHECKER.route_for_task(request), "web-app")
                 self.assertEqual(CHECKER.repositories_for_task(request), ("web-app",))
 
+    def test_showpass_nextjs_bridge_wording_keeps_bridge_precedence(self) -> None:
+        for request in (
+            "Fix the Showpass Next.js bridge",
+            "Fix the Showpass Next.js redirect",
+            "Fix the Showpass Next.js bridge-route",
+            "Fix the Showpass Next.js bridge route",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "web-app")
+                self.assertEqual(CHECKER.repositories_for_task(request), ("web-app",))
+
     def test_nextjs_bridge_with_modern_ui_work_keeps_both_owners(self) -> None:
         for request in (
             "Fix the Next.js bridge and update the React component",
@@ -100,6 +111,41 @@ class RoutingRegressionTests(unittest.TestCase):
                     CHECKER.repositories_for_task(request),
                     ("web-app", "showpass-frontend"),
                 )
+
+    def test_showpass_nextjs_bridge_with_modern_ui_work_keeps_both_owners(self) -> None:
+        for request in (
+            "Fix the Showpass Next.js bridge and update the React component",
+            "Fix the Showpass Next.js redirect and update the modern UI",
+            "Fix the Showpass Next.js bridge-route and update the Next.js client",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "ambiguous")
+                self.assertEqual(
+                    CHECKER.repositories_for_task(request),
+                    ("web-app", "showpass-frontend"),
+                )
+
+    def test_explicit_frontend_package_cues_route_to_frontend(self) -> None:
+        for package in ("core", "next-app", "mobile", "desktop"):
+            request = f"Change packages/{package}"
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "showpass-frontend")
+                self.assertEqual(
+                    CHECKER.repositories_for_task(request),
+                    ("showpass-frontend",),
+                )
+
+    def test_unknown_frontend_package_cues_stay_general(self) -> None:
+        request = "Change packages/unknown"
+
+        self.assertEqual(CHECKER.route_for_task(request), "general")
+        self.assertEqual(CHECKER.repositories_for_task(request), ())
+
+    def test_showpass_backend_cue_routes_to_web_app(self) -> None:
+        request = "Review the Showpass backend"
+
+        self.assertEqual(CHECKER.route_for_task(request), "web-app")
+        self.assertEqual(CHECKER.repositories_for_task(request), ("web-app",))
 
     def test_natural_language_fabric_environment_operations_are_manual_review(self) -> None:
         for request in (
@@ -127,6 +173,18 @@ class LedgerRegistrationTests(unittest.TestCase):
             "nextjs-redirect-only",
             "nextjs-bridge-route-only",
             "nextjs-bridge-modern-ui",
+            "showpass-nextjs-bridge-only",
+            "showpass-nextjs-redirect-only",
+            "showpass-nextjs-bridge-route-only",
+            "showpass-nextjs-bridge-route-space-only",
+            "showpass-nextjs-bridge-modern-ui",
+            "showpass-nextjs-redirect-modern-ui",
+            "showpass-nextjs-bridge-route-modern-ui",
+            "frontend-core-package",
+            "frontend-next-app-package",
+            "frontend-mobile-package",
+            "frontend-desktop-package",
+            "showpass-backend",
             "mixed-angularjs-react",
         ):
             with self.subTest(name=name):
