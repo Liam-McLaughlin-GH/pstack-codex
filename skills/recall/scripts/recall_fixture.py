@@ -233,6 +233,17 @@ def stat_identity(info: os.stat_result) -> tuple[int, int, int, int]:
     return (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode), info.st_ctime_ns)
 
 
+def artifact_identity(info: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    """Identify an artifact and the bounded file state consumed by the parser."""
+
+    return (
+        *stat_identity(info),
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_nlink,
+    )
+
+
 def close_fd(file_descriptor: int | None) -> None:
     if file_descriptor is None:
         return
@@ -286,13 +297,31 @@ def revalidate_workspace(
         raise RecallError(f"workspace changed during read: {quote_path(workspace)}")
 
 
+def revalidate_artifact(
+    resolved: Path,
+    expected_identity: tuple[int, int, int, int, int, int, int],
+) -> None:
+    """Reject a path mutation after the descriptor-backed read and before parsing."""
+
+    try:
+        current = os.stat(resolved, follow_symlinks=False)
+    except (OSError, ValueError) as exc:
+        raise RecallError(f"artifact changed after safe read: {quote_path(resolved)}") from exc
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or current.st_nlink != 1
+        or artifact_identity(current) != expected_identity
+    ):
+        raise RecallError(f"artifact changed after safe read: {quote_path(resolved)}")
+
+
 def open_checked_artifact(
     workspace: Path,
     resolved: Path,
     *,
     workspace_fd: int | None = None,
     workspace_identity: tuple[int, int, int, int] | None = None,
-    expected_target_identity: tuple[int, int, int, int] | None = None,
+    expected_target_identity: tuple[int, int, int, int, int, int, int] | None = None,
 ) -> int:
     """Open the resolved target beneath a directory descriptor without following links."""
 
@@ -354,7 +383,7 @@ def open_checked_artifact(
             raise RecallError(f"artifact exceeds {MAX_FILE_BYTES} bytes: {quote_path(resolved)}")
         if (
             expected_target_identity is not None
-            and stat_identity(target_stat) != expected_target_identity
+            and artifact_identity(target_stat) != expected_target_identity
         ):
             raise RecallError(f"artifact changed before safe open: {quote_path(resolved)}")
         artifact_fd = os.open(relative.parts[-1], file_flags, dir_fd=parent_fd)
@@ -362,10 +391,10 @@ def open_checked_artifact(
         if (
             not stat.S_ISREG(opened_target.st_mode)
             or opened_target.st_nlink != 1
-            or stat_identity(opened_target) != stat_identity(target_stat)
+            or artifact_identity(opened_target) != artifact_identity(target_stat)
             or (
                 expected_target_identity is not None
-                and stat_identity(opened_target) != expected_target_identity
+                and artifact_identity(opened_target) != expected_target_identity
             )
         ):
             raise RecallError(f"artifact changed before safe open: {quote_path(resolved)}")
@@ -386,13 +415,13 @@ def read_checked_artifact(
     *,
     workspace_fd: int | None = None,
     workspace_identity: tuple[int, int, int, int] | None = None,
-    expected_target_identity: tuple[int, int, int, int] | None = None,
+    expected_target_identity: tuple[int, int, int, int, int, int, int] | None = None,
 ) -> str:
     """Read a bounded regular file from the descriptor that was size-checked."""
 
     if expected_target_identity is None:
         try:
-            expected_target_identity = stat_identity(
+            expected_target_identity = artifact_identity(
                 os.stat(resolved, follow_symlinks=False)
             )
         except (OSError, ValueError) as exc:
@@ -428,13 +457,7 @@ def read_checked_artifact(
                 raise RecallError(f"artifact exceeds {MAX_FILE_BYTES} bytes: {quote_path(resolved)}")
 
         after = os.fstat(artifact_fd)
-        if (
-            stat_identity(after) != stat_identity(before)
-            or after.st_size != before.st_size
-            or after.st_mtime_ns != before.st_mtime_ns
-            or after.st_ctime_ns != before.st_ctime_ns
-            or after.st_nlink != 1
-        ):
+        if artifact_identity(after) != artifact_identity(before):
             raise RecallError(f"artifact changed while it was being read: {quote_path(resolved)}")
         try:
             return b"".join(chunks).decode("utf-8")
@@ -721,7 +744,6 @@ def parse_text_artifact(
     default_origin: str | None,
     workspace_id: str,
     topic: str,
-    as_of: datetime,
 ) -> list[dict[str, Any]]:
     """Extract only the bounded, line-oriented Codex export fields we document."""
 
@@ -729,7 +751,6 @@ def parse_text_artifact(
         "id": path.stem,
         "workspace": workspace_id,
         "topic": topic,
-        "modified_at": as_of.isoformat(),
         "origin": default_origin,
         "facts": [],
         "inferences": [],
@@ -970,7 +991,7 @@ def read_artifacts(
             resolved_paths.append(path)
             revalidate_workspace(workspace, workspace_identity)
             try:
-                expected_target_identity = stat_identity(
+                expected_target_identity = artifact_identity(
                     os.stat(path, follow_symlinks=False)
                 )
             except (OSError, ValueError) as exc:
@@ -985,6 +1006,7 @@ def read_artifacts(
                 expected_target_identity=expected_target_identity,
             )
             revalidate_workspace(workspace, workspace_identity)
+            revalidate_artifact(path, expected_target_identity)
             suffix = path.suffix.lower()
             artifact_contributed = False
             if suffix in OPAQUE_SUFFIXES:
@@ -994,7 +1016,6 @@ def read_artifacts(
                     default_origin=default_origin,
                     workspace_id=workspace_id,
                     topic=topic,
-                    as_of=as_of,
                 )
                 if parsed:
                     for raw in parsed:
@@ -1011,11 +1032,6 @@ def read_artifacts(
                             records.append(normalized)
                             artifact_contributed = True
                 else:
-                    if default_origin not in ALLOWED_ORIGINS:
-                        raise RecallError(
-                            f"{quote_path(path)}: opaque documents require "
-                            "--artifact-origin synthetic or user"
-                        )
                     opaque.append(str(path))
             elif suffix == ".jsonl":
                 parsed_records = parse_jsonl_artifact(

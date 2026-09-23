@@ -62,7 +62,7 @@ The upstream agent and runtime pieces are also not ported.
 
 - `agents/poteto-agent.md` is not converted to a Codex agent configuration.
 - `agents/comment-sicko.md` is not converted to a Codex agent configuration.
-- The 21 pstack scripts are not copied. This includes the PR watcher, worktree audit, plan checker, and orchestration helper.
+- The 20 pstack scripts are not copied. This includes the PR watcher, worktree audit, plan checker, and orchestration helper.
 - `automations/benny/` is not copied. It is a Cursor automation pack with Cursor UI adapters.
 - Cursor model names and model-specific routing are not preserved.
 - Cursor transcript paths under `~/.cursor/projects/.../agent-transcripts` are not preserved.

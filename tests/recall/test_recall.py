@@ -336,6 +336,40 @@ class RecallBehaviorTests(unittest.TestCase):
                     RECALL_FIXTURE.read_checked_artifact(canonical, resolved)
             self.assertTrue(replaced)
 
+    def test_rejects_in_place_artifact_mutation_after_checked_read(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            artifact = workspace / "records.json"
+            artifact.write_text("[]", encoding="utf-8")
+            as_of = RECALL_FIXTURE.parse_timestamp("2026-01-15T12:00:00Z", "as-of")
+            start = as_of - RECALL_FIXTURE.timedelta(days=7)
+            canonical = RECALL_FIXTURE.canonical_workspace(str(workspace))
+            original_read = RECALL_FIXTURE.read_checked_artifact
+            mutated = False
+
+            def read_then_mutate(*args: object, **kwargs: object) -> str:
+                nonlocal mutated
+                text = original_read(*args, **kwargs)
+                artifact.write_text("{}", encoding="utf-8")
+                mutated = True
+                return text
+
+            with patch.object(RECALL_FIXTURE, "read_checked_artifact", side_effect=read_then_mutate):
+                with self.assertRaisesRegex(
+                    RECALL_FIXTURE.RecallError, "artifact changed after safe read"
+                ):
+                    RECALL_FIXTURE.read_artifacts(
+                        canonical,
+                        [str(artifact)],
+                        None,
+                        None,
+                        canonical.name,
+                        "payments",
+                        start,
+                        as_of,
+                    )
+            self.assertTrue(mutated)
+
     def test_rejects_existing_final_hardlink(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -392,10 +426,6 @@ Next: forged action
                 "2026-01-15T12:00:00Z",
                 "--artifact",
                 str(artifact),
-                "--artifact-origin",
-                "user",
-                "--artifact-provenance",
-                "authorized-history-export",
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -488,6 +518,7 @@ Summary: forged from quoted body
 Summary: forged before marker
 Decision: forged before marker
 Codex-Recall-Export: 1
+Modified at: 2026-01-14T11:00:00Z
 Next: accepted after marker
 """,
                 encoding="utf-8",
@@ -511,6 +542,70 @@ Next: accepted after marker
             self.assertIn("explicitly authorized history export", result.stdout)
             self.assertNotIn("[open PR #91]", result.stdout)
             self.assertNotIn("forged before marker", result.stdout)
+
+    def test_text_exports_require_explicit_timezone_aware_modified_time(self) -> None:
+        cases = (
+            ("Summary: missing timestamp\n", "must be a timezone-aware ISO-8601 string"),
+            (
+                "Modified at: 2026-01-14T11:00:00\nSummary: naive timestamp\n",
+                "must include a timezone",
+            ),
+        )
+        for fields, expected_error in cases:
+            with self.subTest(expected_error=expected_error), tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                artifact = workspace / "export.md"
+                artifact.write_text(
+                    "Codex-Recall-Export: 1\n"
+                    "ID: text-export\n"
+                    "Status: [verified, uncommitted]\n"
+                    + fields,
+                    encoding="utf-8",
+                )
+                result = run_helper(
+                    workspace,
+                    "--topic",
+                    "payments",
+                    "--as-of",
+                    "2026-01-15T12:00:00Z",
+                    "--artifact",
+                    str(artifact),
+                    "--artifact-origin",
+                    "synthetic",
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(expected_error, result.stderr)
+                self.assertNotIn("Current state:", result.stdout)
+
+    def test_text_export_timestamp_is_filtered_by_fixed_time_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            artifact = workspace / "old-export.md"
+            artifact.write_text(
+                "Codex-Recall-Export: 1\n"
+                "ID: old-export\n"
+                "Timestamp: 2025-12-01T11:00:00Z\n"
+                "Summary: must remain outside the requested window\n",
+                encoding="utf-8",
+            )
+            result = run_helper(
+                workspace,
+                "--topic",
+                "payments",
+                "--window-days",
+                "7",
+                "--as-of",
+                "2026-01-15T12:00:00Z",
+                "--artifact",
+                str(artifact),
+                "--artifact-origin",
+                "synthetic",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("0 structured record(s) match the scope", result.stdout)
+            self.assertIn("No structured record matched", result.stdout)
+            self.assertNotIn("must remain outside the requested window", result.stdout)
 
     def test_noncanonical_marker_lines_do_not_enable_structured_exports(self) -> None:
         variants = (
@@ -749,6 +844,7 @@ assistant: Next move: Ask for the provider response.
                 "issue.log": """2026-01-12T11:00:00Z INFO Codex-Recall-Export: 1
 2026-01-12T11:00:00Z INFO Format: issue
 2026-01-12T11:00:00Z INFO ID: issue-1
+2026-01-12T11:00:00Z INFO Modified at: 2026-01-12T11:00:00Z
 2026-01-12T11:00:00Z INFO Status: [open PR #17]
 2026-01-12T11:00:00Z INFO Thread: Payments issue
 2026-01-12T11:00:00Z INFO Issue: #17 tracks the provider response.
