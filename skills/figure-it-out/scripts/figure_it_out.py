@@ -724,6 +724,12 @@ def _validate_lifecycle_graph_v2(
             DECISION_REQUIRED_FIELDS,
             f"events[{index}].decision",
         )
+        if event_name in {"action_refused", "blocked"}:
+            _require_state_fields(
+                decision,
+                DECISION_REQUIRED_FIELDS | {"status", "reason", "next_action"},
+                f"events[{index}].decision",
+            )
         _state_timestamp(decision["at"], f"events[{index}].decision.at")
         for field in ("phase", "decision", "why"):
             _state_text(decision[field], f"events[{index}].decision.{field}")
@@ -1778,6 +1784,11 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             raise StateError(f"invalid state: schema-1 replans[{index}].replacement id does not match the phase")
         replan["replacement"] = replacement_spec
 
+    migration_run_status = "planned"
+
+    def migrated_refusal_reason() -> str:
+        return LIFECYCLE_REFUSAL_REASONS.get(migration_run_status, SCOPE_REFUSAL_REASON)
+
     def make_decision(
         phase: str,
         decision: str,
@@ -1844,14 +1855,14 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             "at": _now(),
             "phase": record.get("phase") if record.get("phase") in phase_by_id else "run",
             "decision": f"refused action {action_reference}",
-            "why": SCOPE_REFUSAL_REASON,
+            "why": migrated_refusal_reason(),
             "evidence": [
                 {"kind": "reference", "ref": f"scope:{action_reference}"},
                 {"kind": "reference", "ref": "target:provided" if target_provided else "target:none"},
             ],
             "result": "blocked",
             "status": "refused",
-            "reason": SCOPE_REFUSAL_REASON,
+            "reason": migrated_refusal_reason(),
             "next_action": REFUSAL_NEXT_ACTION,
         }
 
@@ -1892,7 +1903,7 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                 if decision.get("decision") == f"refused action {action_reference}" and decision.get("result") == "blocked":
                     refusal = deepcopy(decision)
                     refusal["status"] = "refused"
-                    refusal["reason"] = SCOPE_REFUSAL_REASON
+                    refusal["reason"] = migrated_refusal_reason()
                     refusal["next_action"] = REFUSAL_NEXT_ACTION
                     return refusal, index
             if event_name == "action_refused" and decision.get("status") == "refused" and decision.get("phase") == phase:
@@ -1961,11 +1972,11 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                 make_decision(
                     phase,
                     f"refused action {action_reference}",
-                    SCOPE_REFUSAL_REASON,
+                    migrated_refusal_reason(),
                     evidence,
                     "blocked",
                     status="refused",
-                    reason=SCOPE_REFUSAL_REASON,
+                    reason=migrated_refusal_reason(),
                     next_action=REFUSAL_NEXT_ACTION,
                 )
             ), False
@@ -2018,7 +2029,7 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                         )
         if event_name == "action_refused":
             event["target"] = _sanitize_refusal_target(event.get("target"))
-            event["reason"] = SCOPE_REFUSAL_REASON
+            event["reason"] = migrated_refusal_reason()
             event["next_action"] = REFUSAL_NEXT_ACTION
         if event_name == "checkpoint":
             checkpoint_id = event.get("checkpoint")
@@ -2137,7 +2148,7 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                     event["phase"] = record.get("phase", "run")
                     event["action"] = refusal_action_reference(event)
                     event["target"] = _sanitize_refusal_target(event.get("target"))
-                    event["reason"] = SCOPE_REFUSAL_REASON
+                    event["reason"] = migrated_refusal_reason()
                     event["next_action"] = REFUSAL_NEXT_ACTION
                     event.pop("evidence", None)
                     event.pop("why", None)
@@ -2154,6 +2165,20 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             event["__migration_decision"] = record
             event["__migration_listed"] = listed
         normalized_events.append(event)
+        if event_name == "phase_started":
+            migration_run_status = "running"
+        elif event_name == "phase_failed":
+            migration_run_status = "failed"
+        elif event_name == "replanned":
+            migration_run_status = "planned"
+        elif event_name == "interrupted":
+            migration_run_status = "interrupted"
+        elif event_name == "resumed":
+            migration_run_status = "running"
+        elif event_name == "blocked":
+            migration_run_status = "blocked"
+        elif event_name == "completed":
+            migration_run_status = "completed"
 
     completed_index = next((index for index, event in enumerate(normalized_events) if event.get("event") == "completed"), len(normalized_events))
     for index, decision in enumerate(legacy_decisions):

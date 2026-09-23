@@ -1224,6 +1224,58 @@ class WorkflowBehaviorTests(unittest.TestCase):
             with self.assertRaises(figure_it_out.StateError):
                 figure_it_out.Workflow.load(state_path, workspace_root=root)
 
+    def test_schema_one_refusal_migration_preserves_lifecycle_reason(self):
+        def legacy_state(state):
+            legacy = deepcopy(state)
+            legacy["schema_version"] = 1
+            legacy["plan"]["schema_version"] = 1
+            for event in legacy["events"]:
+                event.pop("sequence", None)
+                event.pop("decision", None)
+                event.pop("decision_in_list", None)
+                event.pop("decision_overflow", None)
+            for decision in legacy["decisions"]:
+                decision.pop("event_sequence", None)
+                decision.pop("status", None)
+                decision.pop("reason", None)
+                decision.pop("next_action", None)
+            return legacy
+
+        def failed(workflow):
+            workflow.start_phase()
+            workflow.fail_phase("check disagreed", ["tests/failure.txt"], "replan the phase")
+
+        def interrupted(workflow):
+            workflow.start_phase()
+            workflow.checkpoint("safe stop", ["artifacts/checkpoint.txt"], "resume phase-1")
+            workflow.interrupt("session stopped")
+
+        def blocked(workflow):
+            workflow.block("fixture unavailable", ["fixtures/missing.json"], "obtain the fixture")
+
+        setups = {
+            "failed": (failed, figure_it_out.LIFECYCLE_REFUSAL_REASONS["failed"]),
+            "interrupted": (interrupted, figure_it_out.LIFECYCLE_REFUSAL_REASONS["interrupted"]),
+            "blocked": (blocked, figure_it_out.LIFECYCLE_REFUSAL_REASONS["blocked"]),
+            "completed": (lambda workflow: workflow.finish(), figure_it_out.LIFECYCLE_REFUSAL_REASONS["completed"]),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for label, (setup, expected_reason) in setups.items():
+                with self.subTest(status=label):
+                    run_root = root / label
+                    workflow = self.workflow(run_root, phase_count=1) if label != "completed" else self.completed_workflow(run_root)
+                    if label != "completed":
+                        setup(workflow)
+                    with self.assertRaises(figure_it_out.ScopeRefusal):
+                        workflow.guard_action("deploy", "production")
+                    state_path = run_root / "run.json"
+                    state_path.write_text(json.dumps(legacy_state(workflow.state)), encoding="utf-8")
+
+                    migrated = figure_it_out.Workflow.load(state_path, workspace_root=run_root)
+                    refusal = next(event for event in migrated.state["events"] if event["event"] == "action_refused")
+                    self.assertEqual(refusal["reason"], expected_reason)
+
     def test_schema_one_state_is_explicitly_migrated_to_schema_two(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1592,6 +1644,21 @@ class WorkflowBehaviorTests(unittest.TestCase):
             state["decisions"][0]["why"] = refusal_event["reason"]
             state["decisions"][0]["reason"] = refusal_event["reason"]
             state["decisions"][0]["next_action"] = refusal_event["next_action"]
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(state_path, workspace_root=root)
+
+    def test_schema_two_refusal_missing_metadata_returns_state_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            with self.assertRaises(figure_it_out.ScopeRefusal):
+                workflow.guard_action("deploy", "production")
+            state_path = root / "run.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            refusal_event = next(event for event in state["events"] if event["event"] == "action_refused")
+            refusal_event["decision"].pop("reason")
             state_path.write_text(json.dumps(state), encoding="utf-8")
 
             with self.assertRaises(figure_it_out.StateError):
