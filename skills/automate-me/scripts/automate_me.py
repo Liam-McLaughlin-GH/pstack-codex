@@ -9,12 +9,11 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 import sys
 import tempfile
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Callable, Iterable, Iterator, Mapping, Sequence
@@ -30,12 +29,23 @@ MAX_HISTORY_RECORDS = 8
 MAX_TOTAL_ARTIFACT_BYTES = 2_000_000
 MAX_SLICE_ID_LENGTH = 128
 RECOVERY_DIRECTORY_NAME = ".automate-me-recovery"
+TRANSACTION_ARTIFACT_RE = re.compile(
+    r"^\.[a-z0-9]+(?:-[a-z0-9]+)*\.(?:backup|stage)-[A-Za-z0-9_]+$"
+)
 ARTIFACT_KINDS = frozenset({"skill", "script", "reference", "none"})
 OPERATIONS = frozenset({"create", "update", "confirm", "none"})
 SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
-MODE_RE = re.compile(r"(?<![a-z0-9-])([a-z][a-z0-9-]{0,62})-mode(?![a-z0-9-])")
+MODE_RE = re.compile(
+    r"(?<![a-z0-9_.-])([a-z][a-z0-9_.-]*-mode[a-z0-9_.-]*)(?![a-z0-9_.-])"
+)
 NAMED_RE = re.compile(
-    r"\b(?:named|called)\s+([a-z][a-z0-9-]{0,62})(?![a-z0-9-])"
+    r"\b(?:named|called)\s+([^\s,;:!?()[\]{}]+)", re.IGNORECASE
+)
+INVALID_ACTION_NAME_RE = re.compile(
+    r"\b(?:capture|create|new|fresh|record|save|start|update|refresh|revise|edit)\b"
+    r"\s+(?:(?:my|a|an|the)\s+)?([a-z][a-z0-9_.-]*\.[a-z0-9_.-]+)"
+    r"(?=$|[\s,;:!?()[\]{}])",
+    re.IGNORECASE,
 )
 MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]*)\)")
 MARKDOWN_REFERENCE_LINK_RE = re.compile(
@@ -73,25 +83,27 @@ NEGATION_PREFIX = r"(?:do\s+not|don't|dont|never|avoid|refuse\s+to|not)"
 NEGATED_ACTION_RE = re.compile(
     r"\b"
     + NEGATION_PREFIX
-    + r"\b[^\n.!?;]{0,96}?\b(?:"
+    + r"\b(?:(?!\b(?:but|however)\b)[^\n.!?;]){0,96}?\b(?:"
     + "|".join(re.escape(word) for word in ACTION_WORDS + UPDATE_WORDS)
     + r")\b",
     re.IGNORECASE,
 )
 AUTOMATE_ME_RE = re.compile(
-    r"\bautomate\b(?:[\s,;:!?()[\]{}\u2013\u2014]+)\bme\b", re.IGNORECASE
+    r"\bautomate\b(?:[\s,;:!?()[\]{}\u2013\u2014-]+)\bme\b", re.IGNORECASE
 )
 NEGATED_AUTOMATE_ME_RE = re.compile(
     r"\b"
     + NEGATION_PREFIX
-    + r"\b[^\n.!?;]{0,120}?\bautomate\b"
-    + r"(?:[\s,;:!?()[\]{}\u2013\u2014]+)\bme\b",
+    + r"\b(?:(?!\b(?:but|however)\b)[^\n.!?;]){0,120}?\bautomate\b"
+    + r"(?:[\s,;:!?()[\]{}\u2013\u2014-]+)\bme\b",
     re.IGNORECASE,
 )
 NOFOLLOW_FLAGS = getattr(os, "O_NOFOLLOW", 0)
 DIRECTORY_FLAGS = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | os.O_CLOEXEC
 if not NOFOLLOW_FLAGS:
     raise RuntimeError("automate-me requires O_NOFOLLOW support")
+
+_ALLOWLIST_READER_MARKER = object()
 
 
 class AutomateMeError(ValueError):
@@ -115,7 +127,7 @@ class ValidationError(AutomateMeError):
 
 
 class PublicationRecoveryError(OSError):
-    """Publication stopped while preserving both a competitor and recovery copy."""
+    """Publication stopped after reporting the deterministic recovery state."""
 
     def __init__(
         self,
@@ -123,18 +135,21 @@ class PublicationRecoveryError(OSError):
         target: Path,
         recovery_path: Path,
         cause: BaseException,
+        recovery_status: str,
+        cleanup_status: str,
+        competitor_preserved: bool,
     ) -> None:
         self.target = target
         self.recovery_path = recovery_path
-        self.recovery_status = "approved_tree_recovered"
-        self.cleanup_status = "hidden_backup_removed"
-        self.competitor_preserved = True
+        self.recovery_status = recovery_status
+        self.cleanup_status = cleanup_status
+        self.competitor_preserved = competitor_preserved
         self.cause = cause
         super().__init__(
-            "update publication stopped; competitor preserved at "
-            f"{target}; approved tree recovered at {recovery_path}; "
-            "recovery_status=approved_tree_recovered "
-            "cleanup_status=hidden_backup_removed"
+            "update publication stopped; recovery_status="
+            f"{recovery_status} cleanup_status={cleanup_status} "
+            f"competitor_preserved={str(competitor_preserved).lower()} "
+            f"approved_tree={recovery_path}"
         )
 
 
@@ -168,6 +183,9 @@ class ArtifactRecord:
     size_bytes: int
     slice_id: str = ""
     captured_at: datetime | None = None
+    _allowlist_reader_marker: object | None = field(
+        default=None, init=False, repr=False, compare=False
+    )
 
     def public_dict(self) -> dict[str, object]:
         return {
@@ -492,6 +510,19 @@ def _has_positive_action(text: str) -> bool:
     return _has_any(_positive_action_text(text), ACTION_WORDS + UPDATE_WORDS)
 
 
+def _has_automate_me_invocation(text: str) -> bool:
+    """Recognize an invocation, not a noun phrase naming the helper."""
+
+    for match in AUTOMATE_ME_RE.finditer(text):
+        following = text[match.end() :].lstrip(" ,;:!?()[]{}\u2013\u2014-")
+        if re.match(r"(?:helper|workflow|skill|command)\b", following):
+            continue
+        if re.match(r"(?:is|was|has|had|already|currently)\b", following):
+            continue
+        return True
+    return False
+
+
 def _has_negated_artifact_intent(text: str) -> bool:
     clean = _without_quoted_text(text)
     negated_action = NEGATED_ACTION_RE.search(clean)
@@ -516,7 +547,17 @@ def _operation_for(text: str) -> str:
 
 def _slug_from_request(text: str, default: str) -> str:
     named = NAMED_RE.search(text)
-    candidate = named.group(1) if named else default
+    candidate = named.group(1).rstrip(".") if named else default
+    if not SKILL_NAME_RE.fullmatch(candidate):
+        raise RoutingError(f"invalid artifact name: {candidate}")
+    return candidate
+
+
+def _mode_name_from_request(text: str) -> str | None:
+    match = MODE_RE.search(text)
+    if match is None:
+        return None
+    candidate = match.group(1).rstrip(".")
     if not SKILL_NAME_RE.fullmatch(candidate):
         raise RoutingError(f"invalid artifact name: {candidate}")
     return candidate
@@ -529,7 +570,8 @@ def route_request(request: str) -> RouteDecision:
     if not text:
         raise RoutingError("request must not be empty")
     unquoted_text = _without_quoted_text(text)
-    if NEGATED_AUTOMATE_ME_RE.search(unquoted_text):
+    has_positive_action = _has_positive_action(text)
+    if NEGATED_AUTOMATE_ME_RE.search(unquoted_text) and not has_positive_action:
         return RouteDecision(
             artifact="none",
             category="route-elsewhere",
@@ -546,28 +588,33 @@ def route_request(request: str) -> RouteDecision:
             reason="negated artifact intent is not a request to create or update",
         )
 
-    mode_match = MODE_RE.search(unquoted_text)
-    has_action = _has_positive_action(text)
+    invalid_name = INVALID_ACTION_NAME_RE.search(unquoted_text)
+    if invalid_name is not None:
+        raise RoutingError(f"invalid artifact name: {invalid_name.group(1).rstrip('.')}")
+    mode_name = _mode_name_from_request(unquoted_text)
+    named = NAMED_RE.search(unquoted_text)
+    if named is not None and not SKILL_NAME_RE.fullmatch(named.group(1).rstrip(".")):
+        raise RoutingError(f"invalid artifact name: {named.group(1).rstrip('.')}")
+    automate_signal = _has_automate_me_invocation(unquoted_text)
     personal_signal = (
-        AUTOMATE_ME_RE.search(unquoted_text) is not None
+        automate_signal
         or (
-            has_action
-            and mode_match is not None
+            has_positive_action
+            and mode_name is not None
             and _has_any(
                 unquoted_text,
                 ("my", "personal", "working style", "personal mode"),
             )
         )
         or (
-            has_action
+            has_positive_action
             and "working style" in unquoted_text
             and "skill" in unquoted_text
         )
     )
     if personal_signal:
         operation = _operation_for(text)
-        handle = mode_match.group(1) if mode_match else None
-        target = f"skills/{handle}-mode" if handle else None
+        target = f"skills/{mode_name}" if mode_name else None
         reason = "personal working conventions belong in an explicit -mode skill"
         return RouteDecision(
             artifact="skill",
@@ -575,7 +622,7 @@ def route_request(request: str) -> RouteDecision:
             operation=operation,
             target=target,
             reason=reason,
-            confirmation_required=handle is None or operation == "confirm",
+            confirmation_required=mode_name is None or operation == "confirm",
         )
 
     preference_signal = _has_any(
@@ -651,6 +698,25 @@ def _resolved_root(workspace_root: Path | str) -> Path:
     if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
         raise ScopeError(f"workspace root is not a directory: {root}")
     return root
+
+
+def _reject_symlinked_ancestors(path: Path, *, label: str) -> None:
+    current = Path(os.path.normpath(os.path.abspath(os.fspath(path))))
+    while True:
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            current = current.parent
+            if current == Path(current.anchor):
+                break
+            continue
+        if stat.S_ISLNK(info.st_mode):
+            resolved_name = Path(os.path.realpath(current)).name
+            if current.parent != Path(current.anchor) or resolved_name != current.name:
+                raise ScopeError(f"{label} has a symlinked ancestor: {current}")
+        if current == Path(current.anchor):
+            break
+        current = current.parent
 
 
 @dataclass(frozen=True)
@@ -938,6 +1004,36 @@ def _remove_empty_owned_directory(
     return True
 
 
+def _cleanup_owned_stage(
+    parent_fd: int,
+    stage_parent_name: str,
+    expected_parent_info: os.stat_result,
+    stage_name: str,
+    expected_stage_info: os.stat_result | None,
+) -> None:
+    """Remove only this operation's stage entries and an empty stage parent."""
+
+    current_parent = _stat_at(parent_fd, stage_parent_name)
+    if (
+        current_parent is None
+        or stat.S_ISLNK(current_parent.st_mode)
+        or not stat.S_ISDIR(current_parent.st_mode)
+        or not _same_file_identity(current_parent, expected_parent_info)
+    ):
+        return
+    stage_parent_fd: int | None = None
+    try:
+        stage_parent_fd = _open_directory_at(
+            parent_fd, stage_parent_name, label="owned stage parent"
+        )
+        if expected_stage_info is not None:
+            _remove_owned_directory(stage_parent_fd, stage_name, expected_stage_info)
+    finally:
+        if stage_parent_fd is not None:
+            os.close(stage_parent_fd)
+    _remove_empty_owned_directory(parent_fd, stage_parent_name, expected_parent_info)
+
+
 def _read_relative_bytes(
     root: Path,
     relative_parts: Sequence[str],
@@ -1094,6 +1190,10 @@ def _validate_record_set(records: Sequence[ArtifactRecord]) -> None:
     slices: set[str] = set()
     total_bytes = 0
     for record in records:
+        if not isinstance(record, ArtifactRecord):
+            raise ScopeError("history evidence must contain artifact records")
+        if not isinstance(record.text, str):
+            raise ScopeError(f"history record text is invalid: {record.path}")
         record_path = Path(record.path)
         if record_path.is_absolute() or ".." in record_path.parts:
             raise ScopeError(f"history record path is not workspace-relative: {record.path}")
@@ -1104,6 +1204,10 @@ def _validate_record_set(records: Sequence[ArtifactRecord]) -> None:
         actual_size = len(record.text.encode("utf-8"))
         if record.size_bytes != actual_size:
             raise ScopeError(f"history record size metadata is invalid: {record.path}")
+        if record.sha256 != hashlib.sha256(record.text.encode("utf-8")).hexdigest():
+            raise ScopeError(f"history record SHA-256 metadata is invalid: {record.path}")
+        if record.line_count != len(record.text.splitlines()):
+            raise ScopeError(f"history record line-count metadata is invalid: {record.path}")
         if actual_size > MAX_ARTIFACT_BYTES:
             raise ScopeError(f"history record is too large: {record.path}")
         total_bytes += actual_size
@@ -1184,19 +1288,57 @@ def read_allowlisted_artifacts(
         if total_bytes > max_total_bytes:
             raise ScopeError("aggregate history size exceeds the bounded limit")
         slice_id, captured_at = _slice_metadata(canonical.relative, text)
-        records.append(
-            ArtifactRecord(
-                path=canonical.relative,
-                text=text,
-                sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                line_count=len(text.splitlines()),
-                size_bytes=size,
-                slice_id=slice_id,
-                captured_at=captured_at,
-            )
+        record = ArtifactRecord(
+            path=canonical.relative,
+            text=text,
+            sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+            line_count=len(text.splitlines()),
+            size_bytes=size,
+            slice_id=slice_id,
+            captured_at=captured_at,
         )
+        object.__setattr__(record, "_allowlist_reader_marker", _ALLOWLIST_READER_MARKER)
+        records.append(record)
     _validate_record_set(records)
     return tuple(records)
+
+
+def _validate_generation_evidence(
+    workspace_root: Path, records: Sequence[ArtifactRecord]
+) -> tuple[ArtifactRecord, ...]:
+    """Re-read and match the exact records that authorize generation."""
+
+    if not all(isinstance(record, ArtifactRecord) for record in records):
+        raise ScopeError("generation evidence must contain artifact records")
+    if any(
+        record._allowlist_reader_marker is not _ALLOWLIST_READER_MARKER
+        for record in records
+    ):
+        raise ScopeError("generation evidence must come from the allowlisted artifact reader")
+    try:
+        current = read_allowlisted_artifacts(
+            workspace_root, [record.path for record in records]
+        )
+    except (ScopeError, TypeError, ValueError) as exc:
+        raise ScopeError(f"allowlisted generation evidence is no longer valid: {exc}") from exc
+    if len(current) != len(records):
+        raise ScopeError("allowlisted generation evidence changed record count")
+    for expected, actual in zip(records, current):
+        if expected.path != actual.path:
+            raise ScopeError(
+                f"generation evidence path changed: {expected.path} -> {actual.path}"
+            )
+        if expected.sha256 != actual.sha256:
+            raise ScopeError(f"generation evidence SHA-256 changed: {expected.path}")
+        if expected.line_count != actual.line_count:
+            raise ScopeError(f"generation evidence line count changed: {expected.path}")
+        if expected.slice_id != actual.slice_id:
+            raise ScopeError(f"generation evidence slice identity changed: {expected.path}")
+        if expected.captured_at != actual.captured_at:
+            raise ScopeError(f"generation evidence capture metadata changed: {expected.path}")
+        if expected.size_bytes != actual.size_bytes or expected.text != actual.text:
+            raise ScopeError(f"generation evidence content changed: {expected.path}")
+    return current
 
 
 def discover_existing_skills(
@@ -1228,6 +1370,10 @@ def discover_existing_skills(
                 child = PurePosixPath("skills", entry.name)
                 if stat.S_ISLNK(child_info.st_mode):
                     raise ScopeError(f"symlink skill alias is not allowed: {child}")
+                if entry.name == RECOVERY_DIRECTORY_NAME or TRANSACTION_ARTIFACT_RE.fullmatch(
+                    entry.name
+                ):
+                    continue
                 if not stat.S_ISDIR(child_info.st_mode):
                     continue
                 try:
@@ -1361,6 +1507,86 @@ def _validate_skill_name(name: str) -> None:
         raise ValidationError(f"invalid skill name: {name!r}")
 
 
+def _parse_block_scalar(
+    lines: Sequence[str], start: int, header: str
+) -> tuple[str, int]:
+    match = re.fullmatch(
+        r"(?P<style>[>|])(?P<indicators>(?:[+-]?[1-9]?|[1-9][+-]?))(?:[ \t]+#.*)?",
+        header,
+    )
+    if match is None:
+        raise ValidationError(f"invalid YAML block scalar header: {header!r}")
+    indicators = match.group("indicators")
+    chomping = next((character for character in indicators if character in "+-"), "")
+    indent_value = next(
+        (int(character) for character in indicators if character.isdigit()), None
+    )
+
+    raw_content: list[str] = []
+    index = start
+    while index < len(lines):
+        line = lines[index]
+        if line == "":
+            raw_content.append("")
+            index += 1
+            continue
+        if not line.startswith(" "):
+            break
+        raw_content.append(line)
+        index += 1
+
+    if indent_value is None and raw_content:
+        nonempty_indents = [
+            len(line) - len(line.lstrip(" "))
+            for line in raw_content
+            if line.strip()
+        ]
+        if nonempty_indents:
+            indent_value = nonempty_indents[0]
+    if indent_value is None:
+        indent_value = 1
+
+    content: list[tuple[str, bool]] = []
+    for line in raw_content:
+        if not line or not line.strip():
+            content.append(("", False))
+            continue
+        leading_spaces = len(line) - len(line.lstrip(" "))
+        if leading_spaces < indent_value:
+            raise ValidationError("YAML block scalar content is under-indented")
+        content.append((line[indent_value:], leading_spaces > indent_value))
+
+    if match.group("style") == "|":
+        value = "\n".join(line for line, _ in content)
+    else:
+        folded: list[str] = []
+        for position, (line, more_indented) in enumerate(content):
+            folded.append(line)
+            if position == len(content) - 1:
+                continue
+            next_line, next_more_indented = content[position + 1]
+            if (
+                line
+                and next_line
+                and not more_indented
+                and not next_more_indented
+            ):
+                folded.append(" ")
+            else:
+                folded.append("\n")
+        value = "".join(folded)
+
+    if content:
+        value += "\n"
+    if chomping == "-":
+        value = value.rstrip("\n")
+    elif chomping != "+":
+        value = value.rstrip("\n")
+        if value:
+            value += "\n"
+    return value, index
+
+
 def _parse_frontmatter(text: str) -> dict[str, str]:
     if not text.startswith("---\n"):
         raise ValidationError("SKILL.md must start with frontmatter")
@@ -1369,9 +1595,15 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
         raise ValidationError("SKILL.md frontmatter is not closed")
 
     fields: dict[str, str] = {}
-    for line in text[4:end].splitlines():
+    lines = text[4:end].splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         if not line.strip():
+            index += 1
             continue
+        if line[0].isspace():
+            raise ValidationError(f"unsupported frontmatter line: {line!r}")
         match = re.fullmatch(r"([a-z][a-z0-9_-]*):[ \t]*(.*)", line)
         if not match:
             raise ValidationError(f"unsupported frontmatter line: {line!r}")
@@ -1379,6 +1611,10 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
         if key in fields:
             raise ValidationError(f"duplicate frontmatter key: {key}")
         value = value.strip()
+        if value.startswith((">", "|")):
+            value, index = _parse_block_scalar(lines, index + 1, value)
+            fields[key] = value
+            continue
         if value.startswith('"'):
             if len(value) < 2 or not value.endswith('"'):
                 raise ValidationError(f"invalid quoted frontmatter value for {key}")
@@ -1398,6 +1634,7 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
             if FRONTMATTER_NON_STRING_RE.fullmatch(plain_value):
                 raise ValidationError(f"frontmatter value must be a string: {key}")
         fields[key] = value
+        index += 1
     return fields
 
 
@@ -1425,6 +1662,9 @@ def _markdown_without_fenced_code(text: str) -> str:
             ):
                 fence_character = None
                 fence_length = 0
+            masked.append(_blank_markdown_line(line))
+            continue
+        if line.startswith("    ") or line.startswith("\t"):
             masked.append(_blank_markdown_line(line))
             continue
         if fence is not None:
@@ -1576,6 +1816,10 @@ def validate_skill_tree(
     """Validate every bundled Markdown file and its local links safely."""
 
     raw_root = Path(os.path.normpath(os.path.abspath(os.fspath(skill_dir))))
+    try:
+        _reject_symlinked_ancestors(raw_root, label="skill validation path")
+    except ScopeError as exc:
+        return (str(exc),)
     if raw_root.is_symlink():
         return ("skill directory must not be a symlink",)
     root = _resolved_root(raw_root)
@@ -2128,16 +2372,6 @@ def _new_stage(target: Path) -> tuple[Path, Path]:
     return stage_parent, stage_root
 
 
-def _remove_tree_or_file(path: Path) -> None:
-    if not os.path.lexists(path):
-        return
-    info = path.lstat()
-    if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
-        shutil.rmtree(path)
-    else:
-        path.unlink()
-
-
 def _prepare_recovery_copy(
     target: Path,
     target_parent_fd: int,
@@ -2203,6 +2437,29 @@ def _prepare_recovery_copy(
         raise
 
 
+def _backup_matches_expected(
+    target_parent_fd: int,
+    backup_name: str,
+    backup_path: Path,
+    expected_info: os.stat_result,
+    expected_snapshot: tuple[tuple[object, ...], ...],
+) -> bool:
+    """Check the hidden backup again before any rollback restore or cleanup."""
+
+    current_info = _stat_at(target_parent_fd, backup_name)
+    if (
+        current_info is None
+        or stat.S_ISLNK(current_info.st_mode)
+        or not stat.S_ISDIR(current_info.st_mode)
+        or not _same_file_identity(current_info, expected_info)
+    ):
+        return False
+    try:
+        return _capture_tree_snapshot(backup_path) == expected_snapshot
+    except ScopeError:
+        return False
+
+
 def _install_staged_tree(
     stage_root: Path,
     target: Path,
@@ -2211,14 +2468,31 @@ def _install_staged_tree(
     target_parent_fd: int,
     expected_target_info: os.stat_result | None,
     expected_target_snapshot: tuple[tuple[object, ...], ...] | None,
+    expected_stage_info: os.stat_result,
+    expected_stage_snapshot: tuple[tuple[object, ...], ...],
     validate_installed: Callable[[], None],
 ) -> None:
     if failure_injector:
         failure_injector("before_install")
     stage_parent_fd = _open_directory(stage_root.parent, label="stage parent")
+    stage_fd: int | None = None
+    try:
+        stage_fd = _open_directory_at(
+            stage_parent_fd, stage_root.name, label="staged skill output"
+        )
+        stage_info = os.fstat(stage_fd)
+        if not _same_file_identity(stage_info, expected_stage_info):
+            raise ScopeError(f"staged skill output was replaced before install: {stage_root}")
+        if _capture_tree_snapshot(stage_root) != expected_stage_snapshot:
+            raise ScopeError(f"staged skill output changed before install: {stage_root}")
+    except BaseException:
+        if stage_fd is not None:
+            os.close(stage_fd)
+        os.close(stage_parent_fd)
+        raise
+    assert stage_fd is not None
     if operation == "create":
         target_fd: int | None = None
-        stage_fd: int | None = None
         owned_target_info: os.stat_result | None = None
         try:
             try:
@@ -2229,7 +2503,6 @@ def _install_staged_tree(
                 target_parent_fd, target.name, label="new skill output"
             )
             owned_target_info = os.fstat(target_fd)
-            stage_fd = _open_directory(stage_root, label="staged skill output")
             with os.scandir(stage_fd) as entries:
                 for entry in entries:
                     info = entry.stat(follow_symlinks=False)
@@ -2253,17 +2526,15 @@ def _install_staged_tree(
                 )
             raise
         finally:
-            if stage_fd is not None:
-                os.close(stage_fd)
             if target_fd is not None:
                 os.close(target_fd)
+            os.close(stage_fd)
             os.close(stage_parent_fd)
         return
 
     if expected_target_info is None or expected_target_snapshot is None:
         raise ScopeError("update publication is missing the expected target snapshot")
     backup_name = f".{target.name}.backup-{uuid.uuid4().hex}"
-    stage_fd: int | None = None
     backup_info: os.stat_result | None = None
     installed_target_info: os.stat_result | None = None
     recovery_parent_fd: int | None = None
@@ -2319,18 +2590,20 @@ def _install_staged_tree(
             failure_injector("after_backup")
         if _stat_at(target_parent_fd, target.name) is not None:
             raise CollisionError(f"update target appeared during publication: {target}")
-        stage_fd = _open_directory(stage_root.parent, label="stage parent")
-        staged_info = _stat_at(stage_fd, stage_root.name)
+        staged_info = _stat_at(stage_parent_fd, stage_root.name)
         if (
             staged_info is None
             or stat.S_ISLNK(staged_info.st_mode)
             or not stat.S_ISDIR(staged_info.st_mode)
+            or not _same_file_identity(staged_info, stage_info)
         ):
             raise ScopeError(f"staged skill output is not a directory: {stage_root}")
+        if _capture_tree_snapshot(stage_root) != expected_stage_snapshot:
+            raise ScopeError(f"staged skill output changed before install: {stage_root}")
         os.rename(
             stage_root.name,
             target.name,
-            src_dir_fd=stage_fd,
+            src_dir_fd=stage_parent_fd,
             dst_dir_fd=target_parent_fd,
         )
         installed_info = _stat_at(target_parent_fd, target.name)
@@ -2338,7 +2611,7 @@ def _install_staged_tree(
             installed_info is None
             or stat.S_ISLNK(installed_info.st_mode)
             or not stat.S_ISDIR(installed_info.st_mode)
-            or not _same_file_identity(installed_info, staged_info)
+            or not _same_file_identity(installed_info, stage_info)
         ):
             raise ScopeError(f"installed target changed during publication: {target}")
         installed_target_info = installed_info
@@ -2356,8 +2629,16 @@ def _install_staged_tree(
                 target_parent_fd, target.name, installed_target_info
             )
             current_info = _stat_at(target_parent_fd, target.name)
-        if backup_info is not None:
-            if current_info is None:
+        if backup_info is not None and recovery_info is not None and recovery_path is not None:
+            backup_valid = _backup_matches_expected(
+                target_parent_fd,
+                backup_name,
+                target.with_name(backup_name),
+                backup_info,
+                expected_target_snapshot,
+            )
+            restored = False
+            if current_info is None and backup_valid:
                 try:
                     os.rename(
                         backup_name,
@@ -2366,26 +2647,53 @@ def _install_staged_tree(
                         dst_dir_fd=target_parent_fd,
                     )
                 except FileExistsError:
-                    pass
+                    current_info = _stat_at(target_parent_fd, target.name)
                 else:
                     backup_info = None
-            else:
-                if recovery_info is not None and recovery_path is not None:
-                    if _remove_owned_directory(
-                        target_parent_fd, backup_name, backup_info
-                    ):
-                        backup_info = None
-                        preserve_recovery = True
-                        raise PublicationRecoveryError(
-                            target=target,
-                            recovery_path=recovery_path,
-                            cause=exc,
-                        ) from exc
+                    restored = True
+            if restored:
+                raise PublicationRecoveryError(
+                    target=target,
+                    recovery_path=recovery_path,
+                    cause=exc,
+                    recovery_status="approved_tree_restored",
+                    cleanup_status="hidden_backup_removed",
+                    competitor_preserved=False,
+                ) from exc
+
+            preserve_recovery = True
+            if current_info is not None:
+                if backup_valid and _remove_owned_directory(
+                    target_parent_fd, backup_name, backup_info
+                ):
+                    backup_info = None
+                    cleanup_status = "hidden_backup_removed"
+                    recovery_status = "approved_tree_recovered"
+                else:
+                    cleanup_status = "hidden_backup_preserved"
+                    recovery_status = "backup_rejected_recovery_preserved"
+                raise PublicationRecoveryError(
+                    target=target,
+                    recovery_path=recovery_path,
+                    cause=exc,
+                    recovery_status=recovery_status,
+                    cleanup_status=cleanup_status,
+                    competitor_preserved=True,
+                ) from exc
+
+            raise PublicationRecoveryError(
+                target=target,
+                recovery_path=recovery_path,
+                cause=exc,
+                recovery_status="backup_rejected_recovery_preserved",
+                cleanup_status="hidden_backup_preserved",
+                competitor_preserved=False,
+            ) from exc
         raise
     else:
         if backup_info is not None:
-            _remove_owned_directory(target_parent_fd, backup_name, backup_info)
-            backup_info = None
+            if _remove_owned_directory(target_parent_fd, backup_name, backup_info):
+                backup_info = None
     finally:
         if recovery_parent_fd is not None:
             if not preserve_recovery and recovery_info is not None:
@@ -2424,7 +2732,6 @@ def write_generated_skill(
     workspace = _resolved_root(workspace_root)
     canonical_target = _canonical_path(workspace, skill_dir)
     target = canonical_target.absolute
-    files = render_skill_files(draft)
     if canonical_target.relative_parts[:1] != ("skills",) or len(
         canonical_target.relative_parts
     ) != 2:
@@ -2452,19 +2759,27 @@ def write_generated_skill(
         raise ValidationError("approval skill_name does not match the draft")
     if len(draft.evidence) < 2:
         raise ValidationError("durable generation requires at least two history slices")
-    try:
-        _validate_record_set(draft.evidence)
-        confirmed = {signal.casefold() for signal in confirmed_signals(draft.evidence, approval.signals)}
-    except ScopeError as exc:
-        raise ValidationError(f"invalid generation evidence: {exc}") from exc
-    if {signal.casefold() for signal in approval.signals} - confirmed:
-        raise ValidationError("approval signals lack positive structured evidence")
 
     with _workspace_write_lock(workspace):
+        try:
+            live_evidence = _validate_generation_evidence(workspace, draft.evidence)
+            draft = replace(draft, evidence=live_evidence)
+            confirmed = {
+                signal.casefold()
+                for signal in confirmed_signals(draft.evidence, approval.signals)
+            }
+        except ScopeError as exc:
+            raise ValidationError(f"invalid generation evidence: {exc}") from exc
+        if {signal.casefold() for signal in approval.signals} - confirmed:
+            raise ValidationError("approval signals lack positive structured evidence")
+        files = render_skill_files(draft)
         root_fd = _open_directory(workspace, label="workspace root")
         parent_fd: int | None = None
         stage_parent: Path | None = None
         stage_root: Path | None = None
+        stage_parent_info: os.stat_result | None = None
+        expected_stage_info: os.stat_result | None = None
+        expected_stage_snapshot: tuple[tuple[object, ...], ...] | None = None
         expected_target_info: os.stat_result | None = None
         expected_target_snapshot: tuple[tuple[object, ...], ...] | None = None
         try:
@@ -2509,6 +2824,26 @@ def write_generated_skill(
                         )
 
             stage_parent, stage_root = _new_stage(target)
+            stage_parent_info = _stat_at(parent_fd, stage_parent.name)
+            if (
+                stage_parent_info is None
+                or stat.S_ISLNK(stage_parent_info.st_mode)
+                or not stat.S_ISDIR(stage_parent_info.st_mode)
+            ):
+                raise ScopeError(f"stage parent is not an owned directory: {stage_parent}")
+            stage_parent_fd = _open_directory_at(
+                parent_fd, stage_parent.name, label="stage parent"
+            )
+            try:
+                expected_stage_info = _stat_at(stage_parent_fd, stage_root.name)
+                if (
+                    expected_stage_info is None
+                    or stat.S_ISLNK(expected_stage_info.st_mode)
+                    or not stat.S_ISDIR(expected_stage_info.st_mode)
+                ):
+                    raise ScopeError(f"staged skill output is not an owned directory: {stage_root}")
+            finally:
+                os.close(stage_parent_fd)
             if operation == "update":
                 expected_target_snapshot = _copy_tree_without_symlinks(
                     target, stage_root
@@ -2519,6 +2854,13 @@ def write_generated_skill(
             errors = validate_skill_tree(stage_root)
             if errors:
                 raise ValidationError("generated skill failed validation: " + "; ".join(errors))
+            stage_parent_fd = _open_directory_at(
+                parent_fd, stage_parent.name, label="stage parent"
+            )
+            try:
+                expected_stage_snapshot = _capture_tree_snapshot(stage_root)
+            finally:
+                os.close(stage_parent_fd)
 
             def validate_installed() -> None:
                 installed_errors = validate_skill_discoverability(target)
@@ -2536,14 +2878,26 @@ def write_generated_skill(
                 parent_fd,
                 expected_target_info,
                 expected_target_snapshot,
+                expected_stage_info,
+                expected_stage_snapshot,
                 validate_installed,
             )
         finally:
+            if (
+                parent_fd is not None
+                and stage_parent is not None
+                and stage_parent_info is not None
+            ):
+                _cleanup_owned_stage(
+                    parent_fd,
+                    stage_parent.name,
+                    stage_parent_info,
+                    stage_root.name if stage_root is not None else target.name,
+                    expected_stage_info,
+                )
             if parent_fd is not None:
                 os.close(parent_fd)
             os.close(root_fd)
-            if stage_parent is not None:
-                _remove_tree_or_file(stage_parent)
     return WriteResult(
         operation=operation,
         target=canonical_target.relative,

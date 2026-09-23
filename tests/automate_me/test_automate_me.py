@@ -22,6 +22,7 @@ FIXTURE_DIR = Path(__file__).resolve().parent / "fixtures"
 sys.path.insert(0, str(HELPER_DIR))
 
 from automate_me import (  # noqa: E402
+    ArtifactRecord,
     CollisionError,
     PreferenceApproval,
     PreferenceInteraction,
@@ -196,6 +197,27 @@ class AutomateMeBehaviorTests(unittest.TestCase):
         self.assertEqual(decision.artifact, "skill")
         self.assertEqual(decision.operation, "create")
         self.assertEqual(decision.target, "skills/alex-mode")
+
+    def test_hyphenated_invocation_invalid_names_and_positive_clauses(self) -> None:
+        decision = route_request("Automate-me create my alex-mode skill")
+        self.assertEqual(decision.artifact, "skill")
+        self.assertEqual(decision.operation, "create")
+        self.assertEqual(decision.target, "skills/alex-mode")
+
+        positive_clause = route_request(
+            "Do not automate-me, but create my alex-mode skill."
+        )
+        self.assertEqual(positive_clause.artifact, "skill")
+        self.assertEqual(positive_clause.operation, "create")
+        self.assertEqual(positive_clause.target, "skills/alex-mode")
+
+        for request in (
+            "Automate me create a skill named foo.bar",
+            "Automate me create my foo.bar-mode skill",
+            "Create a project-local verification skill named foo.bar",
+        ):
+            with self.subTest(request=request), self.assertRaises(RoutingError):
+                route_request(request)
 
     def test_preference_interaction_requires_bounded_questions_and_response_states(self) -> None:
         with self.assertRaises(ValidationError):
@@ -664,6 +686,62 @@ Read [provenance](references/provenance.md).
                     approval=self._approval("create"),
                 )
 
+    def test_generation_rejects_forged_stale_and_missing_allowlisted_evidence(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-evidence-integrity-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            evidence = self._write_evidence(workspace)
+            draft = SkillDraft(
+                name="alex-mode",
+                description="Apply approved Alex working conventions.",
+                rules=("Keep replies short.",),
+                evidence=evidence,
+            )
+
+            forged = ArtifactRecord(
+                path=evidence[0].path,
+                text=evidence[0].text,
+                sha256=evidence[0].sha256,
+                line_count=evidence[0].line_count,
+                size_bytes=evidence[0].size_bytes,
+                slice_id=evidence[0].slice_id,
+                captured_at=evidence[0].captured_at,
+            )
+            with self.assertRaises(ValidationError):
+                write_generated_skill(
+                    "skills/alex-mode",
+                    SkillDraft(
+                        name=draft.name,
+                        description=draft.description,
+                        rules=draft.rules,
+                        evidence=(forged, evidence[1]),
+                    ),
+                    workspace_root=workspace,
+                    operation="create",
+                    approval=self._approval("create"),
+                )
+
+            (workspace / evidence[0].path).write_text(
+                "Preference candidate: keep replies long.\n", encoding="utf-8"
+            )
+            with self.assertRaises(ValidationError):
+                write_generated_skill(
+                    "skills/alex-mode",
+                    draft,
+                    workspace_root=workspace,
+                    operation="create",
+                    approval=self._approval("create"),
+                )
+
+            (workspace / evidence[0].path).unlink()
+            with self.assertRaises(ValidationError):
+                write_generated_skill(
+                    "skills/alex-mode",
+                    draft,
+                    workspace_root=workspace,
+                    operation="create",
+                    approval=self._approval("create"),
+                )
+
     def test_relative_links_reject_absolute_and_protocol_relative_targets(self) -> None:
         for link in (
             "/tmp/outside.md",
@@ -701,6 +779,9 @@ Read [provenance](references/provenance.md).
 ~~~text
 [missing-tilde](references/missing-tilde.md)
 ~~~
+
+    [missing-indented](references/missing-indented.md)
+	[missing-tab](references/missing-tab.md)
 """
             (skill / "SKILL.md").write_text(
                 '---\nname: safe-skill\ndescription: "Safe"\n---\n\n' + body,
@@ -737,6 +818,72 @@ Read [provenance](references/provenance.md).
                     any("frontmatter" in error for error in errors),
                     field,
                 )
+
+    def test_frontmatter_accepts_folded_and_literal_yaml_descriptions(self) -> None:
+        for style in (">-", "|-"):
+            with self.subTest(style=style):
+                with tempfile.TemporaryDirectory(prefix="automate-me-block-description-") as temp_dir:
+                    skill = Path(temp_dir) / "safe-skill"
+                    skill.mkdir()
+                    text = "\n".join(
+                        (
+                            "---",
+                            "name: safe-skill",
+                            f"description: {style}",
+                            "  A valid multi-line description.",
+                            "  It remains a YAML string.",
+                            "---",
+                            "",
+                        )
+                    )
+                    (skill / "SKILL.md").write_text(text, encoding="utf-8")
+                    self.assertEqual(
+                        validate_skill_tree(skill, require_provenance=False), ()
+                    )
+
+        malformed = (
+            "\n".join(
+                ("---", "name: safe-skill", "description: >-", "not indented", "---", "")
+            ),
+            "\n".join(
+                (
+                    "---",
+                    "name: safe-skill",
+                    "description: |-",
+                    "  valid first line",
+                    " bad second line",
+                    "---",
+                    "",
+                )
+            ),
+            "\n".join(
+                ("---", "name: safe-skill", "description: >invalid", "  content", "---", "")
+            ),
+        )
+        for text in malformed:
+            with self.subTest(text=text):
+                with tempfile.TemporaryDirectory(prefix="automate-me-bad-block-description-") as temp_dir:
+                    skill = Path(temp_dir) / "safe-skill"
+                    skill.mkdir()
+                    (skill / "SKILL.md").write_text(text, encoding="utf-8")
+                    self.assertTrue(
+                        validate_skill_tree(skill, require_provenance=False)
+                    )
+
+    def test_validation_rejects_symlinked_ancestor_components(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-ancestor-alias-") as temp_dir:
+            root = Path(temp_dir)
+            real_parent = root / "real-parent"
+            skill = real_parent / "safe-skill"
+            skill.mkdir(parents=True)
+            (skill / "SKILL.md").write_text(
+                "---\nname: safe-skill\ndescription: \"Safe\"\n---\n",
+                encoding="utf-8",
+            )
+            alias = root / "alias-parent"
+            alias.symlink_to(real_parent, target_is_directory=True)
+            errors = validate_skill_tree(alias / "safe-skill", require_provenance=False)
+            self.assertTrue(any("symlinked ancestor" in error for error in errors))
 
     def test_readme_activation_guard_skips_dangling_collision_safely(self) -> None:
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
@@ -1052,6 +1199,68 @@ Read [style](references/style.md) and [provenance](references/provenance.md).
                 "keep me",
             )
 
+    def test_stage_binding_rejects_replacement_or_tampering_and_preserves_competitors(
+        self,
+    ) -> None:
+        for mode in ("replacement", "mutation"):
+            with self.subTest(mode=mode):
+                with tempfile.TemporaryDirectory(prefix="automate-me-stage-binding-") as temp_dir:
+                    workspace = Path(temp_dir) / "project"
+                    evidence = self._write_evidence(workspace)
+                    target = workspace / "skills" / "alex-mode"
+                    draft = SkillDraft(
+                        name="alex-mode",
+                        description="Apply approved Alex conventions.",
+                        rules=("Keep replies short.",),
+                        evidence=evidence,
+                    )
+
+                    def tamper_stage(point: str) -> None:
+                        if point != "before_install":
+                            return
+                        stage_parent = next(
+                            (workspace / "skills").glob(".alex-mode.stage-*")
+                        )
+                        stage_root = stage_parent / "alex-mode"
+                        if mode == "replacement":
+                            stage_root.rename(stage_parent / "original-stage")
+                            stage_root.mkdir()
+                            (stage_root / "competitor.txt").write_text(
+                                "preserve competitor\n", encoding="utf-8"
+                            )
+                        else:
+                            (stage_root / "SKILL.md").write_text(
+                                "tampered after validation\n", encoding="utf-8"
+                            )
+
+                    with self.assertRaises(ScopeError):
+                        write_generated_skill(
+                            target,
+                            draft,
+                            workspace_root=workspace,
+                            operation="create",
+                            approval=self._approval("create"),
+                            failure_injector=tamper_stage,
+                        )
+                    self.assertFalse(target.exists())
+                    if mode == "replacement":
+                        stage_parents = list(
+                            (workspace / "skills").glob(".alex-mode.stage-*")
+                        )
+                        self.assertEqual(len(stage_parents), 1)
+                        self.assertEqual(
+                            (stage_parents[0] / "alex-mode" / "competitor.txt").read_text(
+                                encoding="utf-8"
+                            ),
+                            "preserve competitor\n",
+                        )
+                        self.assertEqual(discover_existing_skills(workspace), ())
+                    else:
+                        self.assertEqual(
+                            list((workspace / "skills").glob(".alex-mode.stage-*")),
+                            [],
+                        )
+
     def test_update_rejects_external_swap_before_publication(self) -> None:
         for replacement_kind in ("directory", "symlink"):
             with self.subTest(replacement_kind=replacement_kind):
@@ -1173,6 +1382,123 @@ Read [style](references/style.md) and [provenance](references/provenance.md).
                     path.name.startswith(".alex-mode.backup-")
                     for path in target.parent.iterdir()
                 )
+            )
+
+    def test_tampered_backup_is_never_restored_and_recovery_status_is_deterministic(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-tampered-backup-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            evidence = self._write_evidence(workspace)
+            target = workspace / "skills" / "alex-mode"
+            draft = SkillDraft(
+                name="alex-mode",
+                description="Apply approved Alex conventions.",
+                rules=("Keep replies short.",),
+                evidence=evidence,
+            )
+            write_generated_skill(
+                target,
+                draft,
+                workspace_root=workspace,
+                operation="create",
+                approval=self._approval("create"),
+            )
+
+            def tamper_backup(point: str) -> None:
+                if point != "after_backup":
+                    return
+                backup = next(target.parent.glob(".alex-mode.backup-*"))
+                (backup / "SKILL.md").write_text(
+                    "tampered backup content\n", encoding="utf-8"
+                )
+                raise OSError("injected rollback failure")
+
+            with self.assertRaises(PublicationRecoveryError) as raised:
+                write_generated_skill(
+                    target,
+                    draft,
+                    workspace_root=workspace,
+                    operation="update",
+                    approval=self._approval("update"),
+                    failure_injector=tamper_backup,
+                )
+            recovery_error = raised.exception
+            self.assertEqual(
+                recovery_error.recovery_status,
+                "backup_rejected_recovery_preserved",
+            )
+            self.assertEqual(
+                recovery_error.cleanup_status,
+                "hidden_backup_preserved",
+            )
+            self.assertFalse(target.exists())
+            self.assertTrue(Path(recovery_error.recovery_path).is_dir())
+            backups = list(target.parent.glob(".alex-mode.backup-*"))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual(
+                backups[0]
+                .joinpath("SKILL.md")
+                .read_text(encoding="utf-8"),
+                "tampered backup content\n",
+            )
+            self.assertEqual(validate_skill_tree(Path(recovery_error.recovery_path)), ())
+            self.assertEqual(discover_existing_skills(workspace), ())
+
+    def test_replaced_backup_identity_is_preserved_and_not_restored(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-replaced-backup-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            evidence = self._write_evidence(workspace)
+            target = workspace / "skills" / "alex-mode"
+            draft = SkillDraft(
+                name="alex-mode",
+                description="Apply approved Alex conventions.",
+                rules=("Keep replies short.",),
+                evidence=evidence,
+            )
+            write_generated_skill(
+                target,
+                draft,
+                workspace_root=workspace,
+                operation="create",
+                approval=self._approval("create"),
+            )
+
+            def replace_backup(point: str) -> None:
+                if point != "after_backup":
+                    return
+                backup = next(target.parent.glob(".alex-mode.backup-*"))
+                displaced = backup.with_name(backup.name + "-competitor")
+                backup.rename(displaced)
+                backup.mkdir()
+                (backup / "competitor.txt").write_text("keep competitor\n", encoding="utf-8")
+                raise OSError("injected rollback failure")
+
+            with self.assertRaises(PublicationRecoveryError) as raised:
+                write_generated_skill(
+                    target,
+                    draft,
+                    workspace_root=workspace,
+                    operation="update",
+                    approval=self._approval("update"),
+                    failure_injector=replace_backup,
+                )
+            self.assertEqual(
+                raised.exception.recovery_status,
+                "backup_rejected_recovery_preserved",
+            )
+            self.assertFalse(target.exists())
+            backup = next(
+                path
+                for path in target.parent.glob(".alex-mode.backup-*")
+                if (path / "competitor.txt").exists()
+            )
+            self.assertEqual(
+                (backup / "competitor.txt").read_text(encoding="utf-8"),
+                "keep competitor\n",
+            )
+            self.assertTrue(
+                next(target.parent.glob(".alex-mode.backup-*-competitor")).is_dir()
             )
 
     def test_update_rejects_same_directory_content_mutation_after_preflight(self) -> None:
