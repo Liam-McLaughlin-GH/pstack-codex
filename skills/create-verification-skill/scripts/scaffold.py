@@ -2515,6 +2515,111 @@ def _assert_reserved_target_identity(
         raise CollisionError(f"target changed during publication: {target}")
 
 
+def _assert_reserved_target_contents(
+    parent_fd: int,
+    target_name: str,
+    target: Path,
+    target_fd: int,
+    identity: tuple[int, int],
+    published: list[PublishedEntry],
+) -> None:
+    """Require the final target tree to match only identity-bound entries."""
+
+    _assert_reserved_target_identity(parent_fd, target_name, target, target_fd, identity)
+    expected_by_parent: dict[tuple[int, int], dict[str, tuple[int, int, bool]]] = {
+        identity: {}
+    }
+    for entry_parent_fd, name, device, inode, is_directory in published:
+        if device is None or inode is None:
+            raise CollisionError(f"published entry identity is unavailable: {target / name}")
+        parent_identity = _descriptor_identity(
+            entry_parent_fd,
+            f"target parent for {target / name}",
+            is_directory=True,
+        )
+        children = expected_by_parent.setdefault(parent_identity, {})
+        expected = (device, inode, is_directory)
+        if name in children and children[name] != expected:
+            raise CollisionError(f"target manifest contains duplicate entry: {target / name}")
+        children[name] = expected
+        if is_directory:
+            expected_by_parent.setdefault((device, inode), {})
+
+    visited: set[tuple[int, int]] = set()
+
+    def check_directory(
+        directory_fd: int,
+        directory_identity: tuple[int, int],
+        location: Path,
+    ) -> None:
+        if directory_identity in visited:
+            raise CollisionError(f"target manifest contains a directory cycle: {location}")
+        visited.add(directory_identity)
+        expected = expected_by_parent.get(directory_identity)
+        if expected is None:
+            raise CollisionError(f"target manifest lost a published directory: {location}")
+        try:
+            with os.scandir(directory_fd) as entries:
+                actual_entries = sorted(entries, key=lambda entry: entry.name)
+        except OSError as exc:
+            raise CollisionError(f"target contents cannot be inspected: {location}") from exc
+        actual_names = {entry.name for entry in actual_entries}
+        expected_names = set(expected)
+        if actual_names != expected_names:
+            unexpected = sorted(actual_names - expected_names)
+            missing = sorted(expected_names - actual_names)
+            details = []
+            if unexpected:
+                details.append(f"unrecorded entries: {', '.join(unexpected)}")
+            if missing:
+                details.append(f"missing entries: {', '.join(missing)}")
+            raise CollisionError(
+                f"target contents changed during publication: {location} ({'; '.join(details)})"
+            )
+
+        for entry in actual_entries:
+            expected_device, expected_inode, expected_directory = expected[entry.name]
+            try:
+                current = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise CollisionError(
+                    f"target entry cannot be inspected during publication: {location / entry.name}"
+                ) from exc
+            current_identity = (current.st_dev, current.st_ino)
+            if (
+                current_identity != (expected_device, expected_inode)
+                or stat.S_ISDIR(current.st_mode) != expected_directory
+                or (not expected_directory and not stat.S_ISREG(current.st_mode))
+            ):
+                raise CollisionError(
+                    f"target entry changed during publication: {location / entry.name}"
+                )
+            if expected_directory:
+                child_fd = _open_directory_descriptor(
+                    entry.name,
+                    f"target directory {location / entry.name}",
+                    dir_fd=directory_fd,
+                    collision=True,
+                )
+                try:
+                    child_identity = _descriptor_identity(
+                        child_fd,
+                        f"target directory {location / entry.name}",
+                        is_directory=True,
+                    )
+                    if child_identity != (expected_device, expected_inode):
+                        raise CollisionError(
+                            f"target directory changed during publication: {location / entry.name}"
+                        )
+                    check_directory(child_fd, child_identity, location / entry.name)
+                finally:
+                    os.close(child_fd)
+
+    check_directory(target_fd, identity, target)
+    if visited != set(expected_by_parent):
+        raise CollisionError(f"target manifest is not fully reachable: {target}")
+
+
 def _remove_reserved_target(
     parent_fd: int,
     target_name: str,
@@ -3114,6 +3219,14 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
             raise CollisionError(f"staging directory changed during publication: {staging}")
         staging_reservation = None
         staging = None
+        _assert_reserved_target_contents(
+            skills_parent_fd,
+            target.name,
+            target,
+            target_fd,
+            target_identity,
+            published_entries,
+        )
         if target_reservation is not None:
             _close_published([target_reservation])
             target_reservation = None

@@ -1341,6 +1341,42 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
             self.assertEqual((staging / "unexpected.txt").read_text(encoding="utf-8"), "competitor\n")
             self.assertFalse((project / ".agents" / "skills" / "verify-tiny-fixture").exists())
 
+    def test_final_target_content_failure_rolls_back_owned_entries_and_preserves_competitor(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-target-manifest-") as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            copy_fixture(project)
+            target = project / ".agents" / "skills" / "verify-tiny-fixture"
+            original_identity = scaffold_module._assert_reserved_target_identity
+            injected = False
+
+            def inject_competitor_after_identity(
+                parent_fd: int,
+                target_name: str,
+                target_path: Path,
+                target_fd: int,
+                identity: tuple[int, int],
+            ) -> None:
+                nonlocal injected
+                original_identity(parent_fd, target_name, target_path, target_fd, identity)
+                if not injected and (target / "features" / "check-state.md").exists():
+                    (target / "unexpected.txt").write_text("competitor\n", encoding="utf-8")
+                    injected = True
+
+            with mock.patch.object(
+                scaffold_module,
+                "_assert_reserved_target_identity",
+                side_effect=inject_competitor_after_identity,
+            ):
+                with self.assertRaises(CollisionError):
+                    scaffold_module.scaffold(spec_for(), project)
+
+            self.assertTrue(injected)
+            self.assertEqual((target / "unexpected.txt").read_text(encoding="utf-8"), "competitor\n")
+            self.assertFalse((target / "SKILL.md").exists())
+            self.assertFalse((target / "features").exists())
+
     def test_post_link_identity_failure_rolls_back_the_child(self) -> None:
         with tempfile.TemporaryDirectory(prefix="create-verification-post-link-identity-") as temporary:
             root = Path(temporary)
