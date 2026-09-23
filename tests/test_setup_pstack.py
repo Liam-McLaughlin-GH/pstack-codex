@@ -1527,6 +1527,72 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertEqual(victim.read_text(encoding="utf-8"), "competitor\n")
             self.assertEqual((root / "expected-private").read_text(encoding="utf-8"), "expected\n")
 
+    def test_darwin_status_minus_47_disposal_replacement_fails_closed_with_receipt(self) -> None:
+        safe_fs = load_module(SAFE_FS, "safe_fs_darwin_disposal_race_test")
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-darwin-disposal-race-test-") as temporary:
+            root = Path(temporary)
+            victim = root / "victim"
+            competitor = root / "competitor"
+            victim.write_text("expected\n", encoding="utf-8")
+            competitor.write_text("competitor\n", encoding="utf-8")
+            parent_fd = os.open(root, os.O_RDONLY)
+            original_platform = safe_fs.sys.platform
+            original_rename = safe_fs.atomic_rename_noreplace_at
+            original_delete = safe_fs._darwin_delete_reference
+            original_cdll = safe_fs.ctypes.CDLL
+            disposal_unlink_attempted = False
+
+            class FakeUnlinkAt:
+                def __call__(self, directory_fd: int, encoded_name: bytes, flags: int) -> int:
+                    nonlocal disposal_unlink_attempted
+                    name = os.fsdecode(encoded_name)
+                    if not name.startswith(".pstack-dispose-"):
+                        raise AssertionError(f"unexpected fallback unlink: {name}")
+                    disposal_unlink_attempted = True
+                    os.rename(name, "expected-private", src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+                    os.rename(competitor, name, dst_dir_fd=directory_fd)
+                    os.unlink(name, dir_fd=directory_fd)
+                    return 0
+
+            class FakeLibc:
+                def __init__(self) -> None:
+                    self.unlinkat = FakeUnlinkAt()
+
+            def fail_reference(reference: object, name: str) -> None:
+                raise OSError(errno.EIO, "FSDeleteObject failed with status -47", name)
+
+            def fallback_rename(parent: int, source_name: str, target_name: str) -> None:
+                os.rename(source_name, target_name, src_dir_fd=parent, dst_dir_fd=parent)
+
+            safe_fs.sys.platform = "darwin"
+            safe_fs.atomic_rename_noreplace_at = fallback_rename
+            safe_fs._darwin_delete_reference = fail_reference
+            safe_fs.ctypes.CDLL = lambda *args, **kwargs: FakeLibc()
+            try:
+                with self.assertRaises(safe_fs.SafeFilesystemError) as raised:
+                    safe_fs._native_unlink_at(
+                        parent_fd,
+                        "victim",
+                        is_directory=False,
+                        expected_metadata=safe_fs.lstat_at(parent_fd, "victim"),
+                        identity_reference=safe_fs._DarwinFSRef(),
+                        receipt_path=root / "receipt" / "victim",
+                    )
+            finally:
+                safe_fs.sys.platform = original_platform
+                safe_fs.atomic_rename_noreplace_at = original_rename
+                safe_fs._darwin_delete_reference = original_delete
+                safe_fs.ctypes.CDLL = original_cdll
+                os.close(parent_fd)
+
+            self.assertFalse(disposal_unlink_attempted)
+            self.assertEqual(victim.read_text(encoding="utf-8"), "expected\n")
+            self.assertEqual(competitor.read_text(encoding="utf-8"), "competitor\n")
+            receipt = raised.exception.cleanup_receipt
+            self.assertIsNotNone(receipt)
+            self.assertLessEqual(len(receipt.entries), 8)
+            self.assertEqual(receipt.entries[-1].reason, "identity-delete-unavailable")
+
     def test_created_parent_recovery_receipt_is_bounded_and_deterministic(self) -> None:
         module = load_module(CONFIGURER, "configure_for_bounded_cleanup_receipt_test")
         safe_fs = sys.modules["safe_fs"]
