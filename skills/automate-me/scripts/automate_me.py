@@ -10,8 +10,8 @@ import json
 import os
 import re
 import stat
+import subprocess
 import sys
-import tempfile
 import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -41,16 +41,6 @@ MODE_RE = re.compile(
 NAMED_RE = re.compile(
     r"\b(?:named|called)\s+([^\s,;:!?()[\]{}]+)", re.IGNORECASE
 )
-INVALID_ACTION_NAME_RE = re.compile(
-    r"\b(?:capture|create|new|fresh|record|save|start|update|refresh|revise|edit)\b"
-    r"\s+(?:(?:my|a|an|the)\s+)?([a-z][a-z0-9_.-]*\.[a-z0-9_.-]+)"
-    r"(?=$|[\s,;:!?()[\]{}])",
-    re.IGNORECASE,
-)
-MARKDOWN_LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]*)\)")
-MARKDOWN_REFERENCE_LINK_RE = re.compile(
-    r"(?m)^\s{0,3}\[[^\]]+\]:\s*(?:<([^>]+)>|(\S+))"
-)
 MARKDOWN_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 FRONTMATTER_METADATA_RE = re.compile(
     r"^\s*(slice_id|captured_at|recorded_at):\s*([^#\n]+?)\s*$",
@@ -79,7 +69,7 @@ NEGATED_VALUE_RE = re.compile(
 QUOTED_VALUE_RE = re.compile(r"^(?:[\"'`]).*(?:[\"'`])$")
 ACTION_WORDS = ("capture", "create", "new", "fresh", "record", "save", "start")
 UPDATE_WORDS = ("update", "refresh", "revise", "edit")
-NEGATION_PREFIX = r"(?:do\s+not|don't|dont|never|avoid|refuse\s+to|not)"
+NEGATION_PREFIX = r"(?:do(?:\s+|-)not|don't|dont|never|avoid|refuse(?:\s+|-)to|not)"
 NEGATED_ACTION_RE = re.compile(
     r"\b"
     + NEGATION_PREFIX
@@ -133,7 +123,7 @@ class PublicationRecoveryError(OSError):
         self,
         *,
         target: Path,
-        recovery_path: Path,
+        recovery_path: Path | None,
         cause: BaseException,
         recovery_status: str,
         cleanup_status: str,
@@ -149,7 +139,7 @@ class PublicationRecoveryError(OSError):
             "update publication stopped; recovery_status="
             f"{recovery_status} cleanup_status={cleanup_status} "
             f"competitor_preserved={str(competitor_preserved).lower()} "
-            f"approved_tree={recovery_path}"
+            f"approved_tree={recovery_path if recovery_path is not None else '<removed>'}"
         )
 
 
@@ -553,14 +543,37 @@ def _slug_from_request(text: str, default: str) -> str:
     return candidate
 
 
-def _mode_name_from_request(text: str) -> str | None:
-    match = MODE_RE.search(text)
-    if match is None:
+def _mode_name_from_request(text: str, *, strict: bool = True) -> str | None:
+    matches = list(MODE_RE.finditer(text))
+    if not matches:
         return None
-    candidate = match.group(1).rstrip(".")
-    if not SKILL_NAME_RE.fullmatch(candidate):
-        raise RoutingError(f"invalid artifact name: {candidate}")
-    return candidate
+
+    candidates: list[tuple[re.Match[str], str]] = []
+    for match in matches:
+        candidate = match.group(1).rstrip(".")
+        if not SKILL_NAME_RE.fullmatch(candidate):
+            if strict:
+                raise RoutingError(f"invalid artifact name: {candidate}")
+            return None
+        candidates.append((match, candidate))
+
+    unique_candidates = {candidate for _, candidate in candidates}
+    if len(unique_candidates) == 1:
+        return candidates[0][1]
+
+    # A request may mention the existing mode as a template while naming a
+    # different mode to create. Prefer the name explicitly attached to the
+    # user's skill, and refuse the rest rather than selecting the first token.
+    explicit: list[str] = []
+    for match, candidate in candidates:
+        prefix = text[max(0, match.start() - 48) : match.start()]
+        if re.search(r"(?:named|called|my|personal)\s*$", prefix):
+            explicit.append(candidate)
+    if len(set(explicit)) == 1:
+        return explicit[0]
+    if strict:
+        raise RoutingError("request contains multiple personal mode skill names")
+    return None
 
 
 def route_request(request: str) -> RouteDecision:
@@ -588,19 +601,15 @@ def route_request(request: str) -> RouteDecision:
             reason="negated artifact intent is not a request to create or update",
         )
 
-    invalid_name = INVALID_ACTION_NAME_RE.search(unquoted_text)
-    if invalid_name is not None:
-        raise RoutingError(f"invalid artifact name: {invalid_name.group(1).rstrip('.')}")
-    mode_name = _mode_name_from_request(unquoted_text)
+    mode_signal = MODE_RE.search(unquoted_text) is not None
+    mode_name = _mode_name_from_request(unquoted_text, strict=False)
     named = NAMED_RE.search(unquoted_text)
-    if named is not None and not SKILL_NAME_RE.fullmatch(named.group(1).rstrip(".")):
-        raise RoutingError(f"invalid artifact name: {named.group(1).rstrip('.')}")
     automate_signal = _has_automate_me_invocation(unquoted_text)
     personal_signal = (
         automate_signal
         or (
             has_positive_action
-            and mode_name is not None
+            and mode_signal
             and _has_any(
                 unquoted_text,
                 ("my", "personal", "working style", "personal mode"),
@@ -613,6 +622,9 @@ def route_request(request: str) -> RouteDecision:
         )
     )
     if personal_signal:
+        mode_name = _mode_name_from_request(unquoted_text, strict=True)
+        if named is not None and not SKILL_NAME_RE.fullmatch(named.group(1).rstrip(".")):
+            raise RoutingError(f"invalid artifact name: {named.group(1).rstrip('.')}")
         operation = _operation_for(text)
         target = f"skills/{mode_name}" if mode_name else None
         reason = "personal working conventions belong in an explicit -mode skill"
@@ -691,6 +703,7 @@ def route_request(request: str) -> RouteDecision:
 
 def _resolved_root(workspace_root: Path | str) -> Path:
     root = Path(os.path.normpath(os.path.abspath(os.fspath(workspace_root))))
+    _reject_symlinked_ancestors(root, label="workspace root")
     try:
         root_info = root.lstat()
     except FileNotFoundError as exc:
@@ -711,6 +724,9 @@ def _reject_symlinked_ancestors(path: Path, *, label: str) -> None:
                 break
             continue
         if stat.S_ISLNK(info.st_mode):
+            # macOS exposes /var and /tmp through same-basename /private aliases
+            # at the filesystem root. Those host aliases are not workspace
+            # aliases; reject every other symlinked component consistently.
             resolved_name = Path(os.path.realpath(current)).name
             if current.parent != Path(current.anchor) or resolved_name != current.name:
                 raise ScopeError(f"{label} has a symlinked ancestor: {current}")
@@ -739,6 +755,7 @@ class _CanonicalPath:
 def _canonical_path(
     root: Path, candidate: Path | str, *, allow_root: bool = False
 ) -> _CanonicalPath:
+    _reject_symlinked_ancestors(root, label="workspace root")
     raw = os.fspath(candidate)
     if "\x00" in raw:
         raise ScopeError("path contains a NUL byte")
@@ -814,8 +831,8 @@ def _open_directory_chain(
 
 
 @contextmanager
-def _open_relative_file(
-    root: Path,
+def _open_relative_file_at(
+    root_fd: int,
     relative_parts: Sequence[str],
     *,
     flags: int,
@@ -824,7 +841,6 @@ def _open_relative_file(
 ) -> Iterator[tuple[int, int, str]]:
     if not relative_parts:
         raise ScopeError(f"{label} must identify a file below the root")
-    root_fd = _open_directory(root, label="root")
     parent_fd: int | None = None
     leaf_fd: int | None = None
     try:
@@ -849,6 +865,28 @@ def _open_relative_file(
             os.close(leaf_fd)
         if parent_fd is not None:
             os.close(parent_fd)
+
+
+@contextmanager
+def _open_relative_file(
+    root: Path,
+    relative_parts: Sequence[str],
+    *,
+    flags: int,
+    label: str,
+    create_parent_dirs: bool = False,
+) -> Iterator[tuple[int, int, str]]:
+    root_fd = _open_directory(root, label="root")
+    try:
+        with _open_relative_file_at(
+            root_fd,
+            relative_parts,
+            flags=flags,
+            label=label,
+            create_parent_dirs=create_parent_dirs,
+        ) as opened:
+            yield opened
+    finally:
         os.close(root_fd)
 
 
@@ -891,6 +929,25 @@ def _same_file_state(left: os.stat_result, right: os.stat_result) -> bool:
     )
 
 
+def _assert_directory_descriptor_matches_path(
+    path: Path, directory_fd: int, *, label: str
+) -> None:
+    """Reject a renamed, replaced, or symlinked path beside its reserved fd."""
+
+    _reject_symlinked_ancestors(path, label=label)
+    try:
+        path_info = path.lstat()
+    except FileNotFoundError as exc:
+        raise ScopeError(f"{label} no longer exists: {path}") from exc
+    fd_info = os.fstat(directory_fd)
+    if (
+        stat.S_ISLNK(path_info.st_mode)
+        or not stat.S_ISDIR(path_info.st_mode)
+        or not _same_file_identity(path_info, fd_info)
+    ):
+        raise ScopeError(f"{label} changed while it was reserved: {path}")
+
+
 def _file_state(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
     return (
         info.st_dev,
@@ -902,86 +959,178 @@ def _file_state(info: os.stat_result) -> tuple[int, int, int, int, int, int]:
     )
 
 
-def _remove_directory_contents(directory_fd: int) -> None:
-    """Best-effort cleanup through descriptors without following aliases."""
+def _snapshot_state_matches(info: os.stat_result, state: object) -> bool:
+    return (
+        isinstance(state, tuple)
+        and len(state) == 6
+        and (info.st_dev, info.st_ino, stat.S_IFMT(info.st_mode))
+        == (state[0], state[1], state[2])
+    )
 
+
+def _snapshot_content(
+    snapshot: tuple[tuple[object, ...], ...]
+) -> tuple[tuple[object, ...], ...]:
+    """Drop inode and timestamp state when comparing copied tree contents."""
+
+    return tuple(
+        sorted(
+            (
+                (entry[0], entry[1], entry[3] if entry[1] == "file" else None)
+                for entry in snapshot
+            ),
+            key=lambda entry: (entry[0], entry[1]),
+        )
+    )
+
+
+def _snapshot_matches(
+    actual: tuple[tuple[object, ...], ...],
+    expected: tuple[tuple[object, ...], ...],
+    *,
+    compare_contents: bool = False,
+) -> bool:
+    if compare_contents:
+        return _snapshot_content(actual) == _snapshot_content(expected)
+    return actual == expected
+
+
+def _remove_owned_entries(
+    directory_fd: int,
+    snapshot: tuple[tuple[object, ...], ...],
+    prefix: tuple[str, ...] = (),
+) -> None:
+    """Remove only entries recorded in a snapshot, preserving competitors."""
+
+    expected = {
+        tuple(entry[0]): entry
+        for entry in snapshot
+        if isinstance(entry[0], tuple)
+    }
     try:
         entries = list(os.scandir(directory_fd))
     except OSError:
         return
     for entry in entries:
-        name = entry.name
+        relative = prefix + (entry.name,)
+        expected_entry = expected.get(relative)
+        if expected_entry is None:
+            continue
         try:
             entry_info = entry.stat(follow_symlinks=False)
         except OSError:
             continue
-        if stat.S_ISDIR(entry_info.st_mode) and not stat.S_ISLNK(entry_info.st_mode):
-            try:
-                child_fd = _open_directory_at(
-                    directory_fd, name, label="owned cleanup directory"
-                )
-            except ScopeError:
-                continue
-            try:
-                child_info = os.fstat(child_fd)
-                if _same_file_identity(entry_info, child_info):
-                    _remove_directory_contents(child_fd)
-            finally:
-                os.close(child_fd)
-            current_info = _stat_at(directory_fd, name)
+        if not _snapshot_state_matches(entry_info, expected_entry[2]):
+            continue
+        if expected_entry[1] == "file":
+            current_info = _stat_at(directory_fd, entry.name)
             if current_info is None or not _same_file_identity(entry_info, current_info):
                 continue
             try:
-                os.rmdir(name, dir_fd=directory_fd)
+                os.unlink(entry.name, dir_fd=directory_fd)
             except OSError:
-                continue
+                pass
             continue
-        current_info = _stat_at(directory_fd, name)
+        if expected_entry[1] != "directory" or not stat.S_ISDIR(entry_info.st_mode):
+            continue
+        try:
+            child_fd = _open_directory_at(
+                directory_fd, entry.name, label="owned cleanup directory"
+            )
+        except ScopeError:
+            continue
+        try:
+            opened_info = os.fstat(child_fd)
+            if _same_file_identity(entry_info, opened_info):
+                _remove_owned_entries(child_fd, snapshot, relative)
+        finally:
+            os.close(child_fd)
+        current_info = _stat_at(directory_fd, entry.name)
         if current_info is None or not _same_file_identity(entry_info, current_info):
             continue
         try:
-            os.unlink(name, dir_fd=directory_fd)
+            os.rmdir(entry.name, dir_fd=directory_fd)
         except OSError:
-            continue
+            # A new child or a changed child keeps this directory in place.
+            pass
 
 
-def _remove_owned_directory(
-    parent_fd: int, name: str, expected_info: os.stat_result
-) -> bool:
-    """Remove a directory only while its directory entry is still ours."""
+def _remove_owned_directory_status(
+    parent_fd: int,
+    name: str,
+    expected_info: os.stat_result,
+    *,
+    expected_snapshot: tuple[tuple[object, ...], ...] = (),
+    require_snapshot_match: bool = False,
+    compare_snapshot_contents: bool = False,
+) -> str:
+    """Remove an owned directory and report whether its state stayed safe."""
 
     current_info = _stat_at(parent_fd, name)
+    if current_info is None:
+        return "missing"
     if (
-        current_info is None
-        or stat.S_ISLNK(current_info.st_mode)
+        stat.S_ISLNK(current_info.st_mode)
         or not stat.S_ISDIR(current_info.st_mode)
         or not _same_file_identity(current_info, expected_info)
     ):
-        return False
+        return "changed"
     try:
         directory_fd = _open_directory_at(parent_fd, name, label="owned cleanup directory")
     except ScopeError:
-        return False
+        return "changed"
     try:
         opened_info = os.fstat(directory_fd)
         if not _same_file_identity(opened_info, expected_info):
-            return False
-        _remove_directory_contents(directory_fd)
+            return "changed"
+        if require_snapshot_match:
+            try:
+                if not _snapshot_matches(
+                    _capture_tree_snapshot_at(directory_fd),
+                    expected_snapshot,
+                    compare_contents=compare_snapshot_contents,
+                ):
+                    return "changed"
+            except ScopeError:
+                return "changed"
+        _remove_owned_entries(directory_fd, expected_snapshot)
     finally:
         os.close(directory_fd)
     current_info = _stat_at(parent_fd, name)
+    if current_info is None:
+        return "missing"
     if (
-        current_info is None
-        or stat.S_ISLNK(current_info.st_mode)
+        stat.S_ISLNK(current_info.st_mode)
         or not stat.S_ISDIR(current_info.st_mode)
         or not _same_file_identity(current_info, expected_info)
     ):
-        return current_info is None
+        return "changed"
     try:
         os.rmdir(name, dir_fd=parent_fd)
     except OSError:
-        return False
-    return True
+        return "preserved"
+    return "removed"
+
+
+def _remove_owned_directory(
+    parent_fd: int,
+    name: str,
+    expected_info: os.stat_result,
+    *,
+    expected_snapshot: tuple[tuple[object, ...], ...] = (),
+    require_snapshot_match: bool = False,
+    compare_snapshot_contents: bool = False,
+) -> bool:
+    """Remove a directory only while its directory entry is still ours."""
+
+    return _remove_owned_directory_status(
+        parent_fd,
+        name,
+        expected_info,
+        expected_snapshot=expected_snapshot,
+        require_snapshot_match=require_snapshot_match,
+        compare_snapshot_contents=compare_snapshot_contents,
+    ) in {"removed", "missing"}
 
 
 def _remove_empty_owned_directory(
@@ -1010,6 +1159,7 @@ def _cleanup_owned_stage(
     expected_parent_info: os.stat_result,
     stage_name: str,
     expected_stage_info: os.stat_result | None,
+    expected_stage_snapshot: tuple[tuple[object, ...], ...] = (),
 ) -> None:
     """Remove only this operation's stage entries and an empty stage parent."""
 
@@ -1027,22 +1177,27 @@ def _cleanup_owned_stage(
             parent_fd, stage_parent_name, label="owned stage parent"
         )
         if expected_stage_info is not None:
-            _remove_owned_directory(stage_parent_fd, stage_name, expected_stage_info)
+            _remove_owned_directory(
+                stage_parent_fd,
+                stage_name,
+                expected_stage_info,
+                expected_snapshot=expected_stage_snapshot,
+            )
     finally:
         if stage_parent_fd is not None:
             os.close(stage_parent_fd)
     _remove_empty_owned_directory(parent_fd, stage_parent_name, expected_parent_info)
 
 
-def _read_relative_bytes(
-    root: Path,
+def _read_relative_bytes_at(
+    root_fd: int,
     relative_parts: Sequence[str],
     *,
     max_bytes: int | None,
     label: str,
 ) -> tuple[bytes, os.stat_result]:
-    with _open_relative_file(
-        root,
+    with _open_relative_file_at(
+        root_fd,
         relative_parts,
         flags=os.O_RDONLY | os.O_CLOEXEC,
         label=label,
@@ -1080,6 +1235,43 @@ def _read_relative_bytes(
         ):
             raise ScopeError(f"{label} changed while it was read: {leaf_name}")
         return b"".join(chunks), after_fd
+
+
+def _read_relative_bytes(
+    root: Path,
+    relative_parts: Sequence[str],
+    *,
+    max_bytes: int | None,
+    label: str,
+) -> tuple[bytes, os.stat_result]:
+    root_fd = _open_directory(root, label="root")
+    try:
+        return _read_relative_bytes_at(
+            root_fd,
+            relative_parts,
+            max_bytes=max_bytes,
+            label=label,
+        )
+    finally:
+        os.close(root_fd)
+
+
+def _read_relative_text_at(
+    root_fd: int,
+    relative_parts: Sequence[str],
+    *,
+    max_bytes: int | None,
+    label: str,
+) -> tuple[str, os.stat_result]:
+    data, info = _read_relative_bytes_at(
+        root_fd, relative_parts, max_bytes=max_bytes, label=label
+    )
+    try:
+        return data.decode("utf-8"), info
+    except UnicodeDecodeError as exc:
+        raise ScopeError(
+            f"{label} is not UTF-8 text: {PurePosixPath(*relative_parts)}"
+        ) from exc
 
 
 def _read_relative_text(
@@ -1124,12 +1316,50 @@ def _relative_regular_file_exists(
         raise
 
 
+def _relative_regular_file_exists_at(
+    root_fd: int, relative_parts: Sequence[str], *, label: str
+) -> bool:
+    try:
+        with _open_relative_file_at(
+            root_fd,
+            relative_parts,
+            flags=os.O_RDONLY | os.O_CLOEXEC,
+            label=label,
+        ) as (file_fd, parent_fd, leaf_name):
+            path_info = _stat_at(parent_fd, leaf_name)
+            fd_info = os.fstat(file_fd)
+            if (
+                path_info is None
+                or stat.S_ISLNK(path_info.st_mode)
+                or not stat.S_ISREG(path_info.st_mode)
+                or not _same_file_state(path_info, fd_info)
+            ):
+                raise ScopeError(f"{label} is not a stable regular file: {leaf_name}")
+            return True
+    except ScopeError as exc:
+        if "does not exist" in str(exc):
+            return False
+        raise
+
+
 @contextmanager
-def _workspace_write_lock(root: Path) -> Iterator[None]:
+def _workspace_write_lock(root: Path) -> Iterator[int]:
+    _reject_symlinked_ancestors(root, label="workspace root")
     lock_fd = _open_directory(root, label="workspace root")
     try:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        yield
+        opened_info = os.fstat(lock_fd)
+        try:
+            current_info = root.lstat()
+        except OSError as exc:
+            raise ScopeError("workspace root changed while it was locked") from exc
+        if (
+            stat.S_ISLNK(current_info.st_mode)
+            or not stat.S_ISDIR(current_info.st_mode)
+            or not _same_file_identity(opened_info, current_info)
+        ):
+            raise ScopeError("workspace root changed while it was locked")
+        yield lock_fd
     finally:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
@@ -1587,19 +1817,57 @@ def _parse_block_scalar(
     return value, index
 
 
-def _parse_frontmatter(text: str) -> dict[str, str]:
-    if not text.startswith("---\n"):
+def _frontmatter_bounds(text: str) -> tuple[int, int]:
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
         raise ValidationError("SKILL.md must start with frontmatter")
-    end = text.find("\n---\n", 4)
-    if end < 0:
-        raise ValidationError("SKILL.md frontmatter is not closed")
+    content_start = len(lines[0])
+    offset = content_start
+    for line in lines[1:]:
+        if line.rstrip("\r\n") == "---":
+            return content_start, offset
+        offset += len(line)
+    raise ValidationError("SKILL.md frontmatter is not closed")
 
+
+def _strip_yaml_inline_comment(value: str) -> str:
+    quote: str | None = None
+    escaped = False
+    index = 0
+    while index < len(value):
+        character = value[index]
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quote = None
+        elif quote == "'":
+            if character == "'":
+                if index + 1 < len(value) and value[index + 1] == "'":
+                    index += 1
+                else:
+                    quote = None
+        elif character in {'"', "'"}:
+            quote = character
+        elif character == "#" and (index == 0 or value[index - 1].isspace()):
+            return value[:index].rstrip()
+        index += 1
+    return value.rstrip()
+
+
+def _parse_frontmatter(text: str) -> dict[str, str]:
+    content_start, content_end = _frontmatter_bounds(text)
     fields: dict[str, str] = {}
-    lines = text[4:end].splitlines()
+    lines = text[content_start:content_end].splitlines()
     index = 0
     while index < len(lines):
         line = lines[index]
         if not line.strip():
+            index += 1
+            continue
+        if line.lstrip().startswith("#"):
             index += 1
             continue
         if line[0].isspace():
@@ -1610,7 +1878,7 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
         key, value = match.groups()
         if key in fields:
             raise ValidationError(f"duplicate frontmatter key: {key}")
-        value = value.strip()
+        value = _strip_yaml_inline_comment(value.strip())
         if value.startswith((">", "|")):
             value, index = _parse_block_scalar(lines, index + 1, value)
             fields[key] = value
@@ -1630,8 +1898,7 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
                 raise ValidationError(f"invalid quoted frontmatter value for {key}")
             value = value[1:-1].replace("''", "'")
         else:
-            plain_value = value.split(" #", 1)[0].rstrip()
-            if FRONTMATTER_NON_STRING_RE.fullmatch(plain_value):
+            if FRONTMATTER_NON_STRING_RE.fullmatch(value):
                 raise ValidationError(f"frontmatter value must be a string: {key}")
         fields[key] = value
         index += 1
@@ -1646,7 +1913,7 @@ def _blank_markdown_line(line: str) -> str:
 
 
 def _markdown_without_fenced_code(text: str) -> str:
-    """Mask fenced code while retaining line boundaries for Markdown scanning."""
+    """Mask fenced, indented, and inline code for bounded Markdown scanning."""
 
     masked: list[str] = []
     fence_character: str | None = None
@@ -1673,21 +1940,219 @@ def _markdown_without_fenced_code(text: str) -> str:
             masked.append(_blank_markdown_line(line))
             continue
         masked.append(line)
-    return "".join(masked)
+    masked_text = "".join(masked)
+    characters = list(masked_text)
+    index = 0
+    while index < len(characters):
+        if characters[index] != "`":
+            index += 1
+            continue
+        start = index
+        while index < len(characters) and characters[index] == "`":
+            index += 1
+        run_length = index - start
+        closing = -1
+        cursor = index
+        while cursor < len(characters):
+            if characters[cursor] != "`":
+                cursor += 1
+                continue
+            close_start = cursor
+            while cursor < len(characters) and characters[cursor] == "`":
+                cursor += 1
+            if cursor - close_start == run_length:
+                closing = close_start
+                break
+        if closing < 0:
+            continue
+        for position in range(start, cursor):
+            if characters[position] not in "\r\n":
+                characters[position] = " "
+        index = cursor
+    return "".join(characters)
+
+
+def _escaped_at(text: str, index: int) -> bool:
+    backslashes = 0
+    index -= 1
+    while index >= 0 and text[index] == "\\":
+        backslashes += 1
+        index -= 1
+    return backslashes % 2 == 1
+
+
+def _matching_markdown_delimiter(
+    text: str, start: int, opening: str, closing: str
+) -> int | None:
+    depth = 0
+    index = start
+    while index < len(text):
+        if _escaped_at(text, index):
+            index += 1
+            continue
+        character = text[index]
+        if character == opening:
+            depth += 1
+        elif character == closing:
+            depth -= 1
+            if depth == 0:
+                return index
+        index += 1
+    return None
+
+
+def _markdown_bracket_pairs(text: str) -> dict[int, int]:
+    """Pair escaped-aware brackets once so malformed input stays linear."""
+
+    stack: list[int] = []
+    pairs: dict[int, int] = {}
+    backslashes = 0
+    for index, character in enumerate(text):
+        if character == "\\":
+            backslashes += 1
+            continue
+        escaped = backslashes % 2 == 1
+        backslashes = 0
+        if escaped:
+            continue
+        if character == "[":
+            stack.append(index)
+        elif character == "]" and stack:
+            pairs[stack.pop()] = index
+    return pairs
+
+
+def _parse_markdown_destination(
+    text: str, start: int, *, require_end: bool = True
+) -> tuple[str, int] | None:
+    index = start
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index >= len(text):
+        return None
+    if text[index] == "<":
+        destination_start = index + 1
+        index = destination_start
+        while index < len(text):
+            if text[index] == ">" and not _escaped_at(text, index):
+                destination = text[destination_start:index]
+                index += 1
+                break
+            index += 1
+        else:
+            return None
+    else:
+        destination_start = index
+        depth = 0
+        while index < len(text):
+            if _escaped_at(text, index):
+                index += 1
+                continue
+            character = text[index]
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                if depth == 0:
+                    destination = text[destination_start:index].rstrip()
+                    return destination, index + 1
+                depth -= 1
+            elif character.isspace() and depth == 0:
+                destination = text[destination_start:index]
+                break
+            index += 1
+        else:
+            destination = text[destination_start:index].rstrip()
+        if not destination:
+            return None
+
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index < len(text) and text[index] not in ")":
+        title_open = text[index]
+        title_close = {"\"": "\"", "'": "'", "(": ")"}.get(title_open)
+        if title_close is None:
+            return None
+        index += 1
+        while index < len(text):
+            if text[index] == title_close and not _escaped_at(text, index):
+                index += 1
+                break
+            index += 1
+        else:
+            return None
+        while index < len(text) and text[index].isspace():
+            index += 1
+    if require_end:
+        if index >= len(text) or text[index] != ")":
+            return None
+        return destination, index + 1
+    return destination, index
+
+
+def _reference_label(value: str) -> str:
+    value = re.sub(r"\\([\\\[\]])", r"\1", value)
+    return " ".join(value.replace("\n", " ").split()).casefold()
+
+
+def _markdown_reference_definitions(text: str) -> dict[str, str]:
+    definitions: dict[str, str] = {}
+    for line in text.splitlines(keepends=True):
+        content = line.rstrip("\r\n")
+        leading = len(content) - len(content.lstrip(" "))
+        if leading > 3:
+            continue
+        content = content[leading:]
+        if not content.startswith("["):
+            continue
+        close = _matching_markdown_delimiter(content, 0, "[", "]")
+        if close is None or close + 1 >= len(content) or content[close + 1] != ":":
+            continue
+        parsed = _parse_markdown_destination(content, close + 2, require_end=False)
+        if parsed is not None:
+            destination, end = parsed
+            if not content[end:].strip():
+                definitions[_reference_label(content[1:close])] = destination
+    return definitions
 
 
 def _markdown_link_targets(text: str) -> Iterator[str]:
-    text = _markdown_without_fenced_code(text)
-    for match in MARKDOWN_LINK_RE.finditer(text):
-        target = match.group(1).strip()
-        if target.startswith("<") and ">" in target:
-            target = target[1 : target.find(">")]
+    """Yield local link destinations outside code with bounded delimiter scans."""
+
+    masked = _markdown_without_fenced_code(text)
+    definitions = _markdown_reference_definitions(masked)
+    bracket_pairs = _markdown_bracket_pairs(masked)
+    for destination in definitions.values():
+        yield destination
+
+    index = 0
+    while index < len(masked):
+        if masked[index] != "[" or _escaped_at(masked, index):
+            index += 1
+            continue
+        close = bracket_pairs.get(index)
+        if close is None:
+            index += 1
+            continue
+        after = close + 1
+        if after < len(masked) and masked[after] == "(":
+            parsed = _parse_markdown_destination(masked, after + 1)
+            if parsed is not None:
+                destination, index = parsed
+                yield destination
+                continue
+        reference: str | None = None
+        if after + 1 < len(masked) and masked[after] == "[":
+            reference_close = bracket_pairs.get(after)
+            if reference_close is not None:
+                reference = masked[after + 1 : reference_close] or masked[index + 1 : close]
+                index = reference_close + 1
         else:
-            parts = target.split(None, 1)
-            target = parts[0] if parts else ""
-        yield target
-    for match in MARKDOWN_REFERENCE_LINK_RE.finditer(text):
-        yield (match.group(1) or match.group(2)).strip()
+            reference = masked[index + 1 : close]
+            index = close + 1
+        if reference is not None:
+            destination = definitions.get(_reference_label(reference))
+            if destination is not None:
+                yield destination
 
 
 def _relative_link_target(
@@ -1696,6 +2161,7 @@ def _relative_link_target(
     target = raw_target.strip()
     if target.startswith("<") and target.endswith(">"):
         target = target[1:-1].strip()
+    target = re.sub(r"\\([\\`*{}\[\]()#+.!_>~-])", r"\1", target)
     if target.startswith("#"):
         return None
     if not target:
@@ -1724,16 +2190,15 @@ def _relative_link_target(
     return candidate
 
 
-def _scan_tree_entries(
-    root: Path,
+def _scan_tree_entries_at(
+    root_fd: int,
 ) -> tuple[list[tuple[str, ...]], list[tuple[str, ...]], list[str]]:
-    """List a tree through directory descriptors without following aliases."""
+    """List a tree from a reserved directory descriptor."""
 
-    root_fd = _open_directory(root, label="skill directory")
     directories: list[tuple[str, ...]] = [()]
     files: list[tuple[str, ...]] = []
     errors: list[str] = []
-    pending: list[tuple[int, tuple[str, ...]]] = [(root_fd, ())]
+    pending: list[tuple[int, tuple[str, ...]]] = [(os.dup(root_fd), ())]
     try:
         while pending:
             directory_fd, directory_parts = pending.pop()
@@ -1774,24 +2239,41 @@ def _scan_tree_entries(
     return directories, files, errors
 
 
-def _capture_tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
-    """Capture bounded structure, metadata, and content for an existing tree."""
+def _scan_tree_entries(
+    root: Path,
+) -> tuple[list[tuple[str, ...]], list[tuple[str, ...]], list[str]]:
+    """List a tree through directory descriptors without following aliases."""
 
-    source_info = root.lstat()
+    root_fd = _open_directory(root, label="skill directory")
+    try:
+        return _scan_tree_entries_at(root_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _capture_tree_snapshot_at(root_fd: int) -> tuple[tuple[object, ...], ...]:
+    """Capture bounded structure, metadata, and content from a directory fd."""
+
+    source_info = os.fstat(root_fd)
     if stat.S_ISLNK(source_info.st_mode) or not stat.S_ISDIR(source_info.st_mode):
-        raise ScopeError(f"skill output must be a real directory: {root}")
-    directories, files, errors = _scan_tree_entries(root)
+        raise ScopeError("skill output must be a real directory")
+    directories, files, errors = _scan_tree_entries_at(root_fd)
     if errors:
         raise ScopeError("; ".join(errors))
 
-    entries: list[tuple[object, ...]] = [
-        (relative, "directory", ()) for relative in directories if relative
-    ]
+    entries: list[tuple[object, ...]] = []
+    for relative in directories:
+        if not relative:
+            continue
+        directory_fd = _open_directory_chain(root_fd, relative)
+        try:
+            entries.append((relative, "directory", _file_state(os.fstat(directory_fd))))
+        finally:
+            os.close(directory_fd)
     total_bytes = 0
-    source_root = _resolved_root(root)
     for relative in files:
-        data, info = _read_relative_bytes(
-            source_root,
+        data, info = _read_relative_bytes_at(
+            root_fd,
             relative,
             max_bytes=MAX_ARTIFACT_BYTES,
             label="existing skill output",
@@ -1810,26 +2292,32 @@ def _capture_tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
     return tuple(sorted(entries, key=lambda entry: (entry[0], entry[1])))
 
 
-def validate_skill_tree(
-    skill_dir: Path | str, *, require_provenance: bool = True
-) -> tuple[str, ...]:
-    """Validate every bundled Markdown file and its local links safely."""
+def _capture_tree_snapshot(root: Path) -> tuple[tuple[object, ...], ...]:
+    """Capture bounded structure, metadata, and content for an existing tree."""
 
-    raw_root = Path(os.path.normpath(os.path.abspath(os.fspath(skill_dir))))
+    _reject_symlinked_ancestors(root, label="skill output path")
+    root_fd = _open_directory(root, label="skill directory")
     try:
-        _reject_symlinked_ancestors(raw_root, label="skill validation path")
-    except ScopeError as exc:
-        return (str(exc),)
-    if raw_root.is_symlink():
-        return ("skill directory must not be a symlink",)
-    root = _resolved_root(raw_root)
+        return _capture_tree_snapshot_at(root_fd)
+    finally:
+        os.close(root_fd)
+
+
+def _validate_skill_tree_at(
+    root_fd: int,
+    root: Path,
+    *,
+    require_provenance: bool = True,
+) -> tuple[str, ...]:
+    """Validate a skill through a reserved directory descriptor."""
+
     errors: list[str] = []
     try:
         _validate_skill_name(root.name)
     except ValidationError as exc:
         errors.append(str(exc))
     try:
-        _, files, scan_errors = _scan_tree_entries(root)
+        _, files, scan_errors = _scan_tree_entries_at(root_fd)
         errors.extend(scan_errors)
     except ScopeError as exc:
         errors.append(str(exc))
@@ -1839,8 +2327,8 @@ def validate_skill_tree(
     markdown_text: dict[tuple[str, ...], str] = {}
     for relative in markdown_files:
         try:
-            markdown_text[relative], _ = _read_relative_text(
-                root,
+            markdown_text[relative], _ = _read_relative_text_at(
+                root_fd,
                 relative,
                 max_bytes=MAX_ARTIFACT_BYTES,
                 label="bundled Markdown file",
@@ -1874,7 +2362,6 @@ def validate_skill_tree(
     except ValidationError as exc:
         errors.append(str(exc))
 
-    linked_text: dict[tuple[str, ...], str] = {}
     for source_relative, source_text in markdown_text.items():
         source_dir = root / PurePosixPath(*source_relative).parent
         for raw_target in _markdown_link_targets(source_text):
@@ -1887,8 +2374,8 @@ def validate_skill_tree(
                 continue
             try:
                 target_path = _canonical_path(root, target)
-                target_text, _ = _read_relative_text(
-                    root,
+                _read_relative_text_at(
+                    root_fd,
                     target_path.relative_parts,
                     max_bytes=MAX_ARTIFACT_BYTES,
                     label="reference link target",
@@ -1896,7 +2383,6 @@ def validate_skill_tree(
             except (ScopeError, ValidationError) as exc:
                 errors.append(f"invalid reference link {raw_target}: {exc}")
                 continue
-            linked_text[target_path.relative_parts] = target_text
 
     if require_provenance:
         provenance_text = "\n".join(markdown_text.values())
@@ -1909,35 +2395,75 @@ def validate_skill_tree(
     return tuple(errors)
 
 
-def validate_skill_discoverability(skill_dir: Path | str) -> tuple[str, ...]:
-    errors = list(validate_skill_tree(skill_dir))
+def validate_skill_tree(
+    skill_dir: Path | str, *, require_provenance: bool = True
+) -> tuple[str, ...]:
+    """Validate every bundled Markdown file and its local links safely."""
+
     raw_root = Path(os.path.normpath(os.path.abspath(os.fspath(skill_dir))))
     try:
+        _reject_symlinked_ancestors(raw_root, label="skill validation path")
+        if raw_root.is_symlink():
+            return ("skill directory must not be a symlink",)
         root = _resolved_root(raw_root)
+        root_fd = _open_directory(root, label="skill directory")
     except ScopeError as exc:
-        errors.append(str(exc))
-        return tuple(errors)
-    if raw_root.parent.name != "skills":
-        errors.append("skill output must be a direct skills/<name>/ directory")
+        return (str(exc),)
     try:
-        parent_info = raw_root.parent.lstat()
-    except FileNotFoundError:
-        parent_info = None
-    if parent_info is not None and stat.S_ISLNK(parent_info.st_mode):
-        errors.append("skill discovery parent must not be a symlink alias")
+        return _validate_skill_tree_at(
+            root_fd, root, require_provenance=require_provenance
+        )
+    finally:
+        os.close(root_fd)
+
+
+def _validate_skill_discoverability_at(
+    root_fd: int, root: Path, *, require_provenance: bool = True
+) -> tuple[str, ...]:
+    errors = list(
+        _validate_skill_tree_at(
+            root_fd, root, require_provenance=require_provenance
+        )
+    )
     try:
         _validate_skill_name(root.name)
     except ValidationError as exc:
         errors.append(str(exc))
     try:
-        _read_relative_bytes(
-            root,
+        _read_relative_bytes_at(
+            root_fd,
             ("agents", "openai.yaml"),
             max_bytes=MAX_ARTIFACT_BYTES,
             label="skill discovery interface",
         )
     except ScopeError as exc:
         errors.append(str(exc))
+    return tuple(errors)
+
+
+def validate_skill_discoverability(skill_dir: Path | str) -> tuple[str, ...]:
+    raw_root = Path(os.path.normpath(os.path.abspath(os.fspath(skill_dir))))
+    errors: list[str] = []
+    try:
+        _reject_symlinked_ancestors(raw_root, label="skill discovery path")
+        if raw_root.is_symlink():
+            return ("skill directory must not be a symlink",)
+        root = _resolved_root(raw_root)
+        root_fd = _open_directory(root, label="skill directory")
+    except ScopeError as exc:
+        return (str(exc),)
+    try:
+        if raw_root.parent.name != "skills":
+            errors.append("skill output must be a direct skills/<name>/ directory")
+        try:
+            parent_info = raw_root.parent.lstat()
+        except FileNotFoundError:
+            parent_info = None
+        if parent_info is not None and stat.S_ISLNK(parent_info.st_mode):
+            errors.append("skill discovery parent must not be a symlink alias")
+        errors.extend(_validate_skill_discoverability_at(root_fd, root))
+    finally:
+        os.close(root_fd)
     return tuple(errors)
 
 
@@ -1957,7 +2483,20 @@ def _is_skill_creator_scaffold(skill_dir: Path) -> bool:
         )
     except ScopeError:
         return False
-    return re.search(r"(?m)^description:\s*\[TODO:.*\]\s*$", text) is not None
+    return re.search(r"(?mi)^description:\s*\[TODO:.*\]\s*$", text) is not None
+
+
+def _is_skill_creator_scaffold_at(root_fd: int) -> bool:
+    try:
+        text, _ = _read_relative_text_at(
+            root_fd,
+            ("SKILL.md",),
+            max_bytes=MAX_ARTIFACT_BYTES,
+            label="skill-creator scaffold",
+        )
+    except ScopeError:
+        return False
+    return re.search(r"(?mi)^description:\s*\[TODO:.*\]\s*$", text) is not None
 
 
 def _yaml_quote(value: str) -> str:
@@ -2072,18 +2611,25 @@ workflow adapts pstack's `automate-me` source at commit `{UPSTREAM_COMMIT}`.
     }
 
 
-def _write_relative_bytes(root: Path, relative_parts: Sequence[str], data: bytes) -> None:
-    canonical_root = _resolved_root(root)
-    canonical = _canonical_path(canonical_root, PurePosixPath(*relative_parts))
-    parts = canonical.relative_parts
-    root_fd = _open_directory(canonical_root, label="write root")
+def _validate_relative_parts(relative_parts: Sequence[str], *, label: str) -> tuple[str, ...]:
+    parts = tuple(relative_parts)
+    if not parts or any(
+        not isinstance(part, str) or not part or part in {".", ".."} or "/" in part
+        for part in parts
+    ):
+        raise ScopeError(f"{label} is not a normalized relative path")
+    return parts
+
+
+def _write_relative_bytes_at(
+    root_fd: int, relative_parts: Sequence[str], data: bytes
+) -> None:
+    parts = _validate_relative_parts(relative_parts, label="write path")
     parent_fd: int | None = None
     temporary_name = f".{parts[-1]}.{uuid.uuid4().hex}.tmp"
     temporary_fd: int | None = None
     try:
-        parent_fd = _open_directory_chain(
-            root_fd, parts[:-1], create=True
-        )
+        parent_fd = _open_directory_chain(root_fd, parts[:-1], create=True)
         temporary_fd = os.open(
             temporary_name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | NOFOLLOW_FLAGS,
@@ -2114,6 +2660,15 @@ def _write_relative_bytes(root: Path, relative_parts: Sequence[str], data: bytes
             except FileNotFoundError:
                 pass
             os.close(parent_fd)
+
+
+def _write_relative_bytes(root: Path, relative_parts: Sequence[str], data: bytes) -> None:
+    canonical_root = _resolved_root(root)
+    canonical = _canonical_path(canonical_root, PurePosixPath(*relative_parts))
+    root_fd = _open_directory(canonical_root, label="write root")
+    try:
+        _write_relative_bytes_at(root_fd, canonical.relative_parts, data)
+    finally:
         os.close(root_fd)
 
 
@@ -2131,44 +2686,42 @@ def _ensure_relative_directory(root: Path, relative_parts: Sequence[str]) -> Non
     canonical = _canonical_path(canonical_root, PurePosixPath(*relative_parts))
     root_fd = _open_directory(canonical_root, label="directory root")
     try:
-        directory_fd = _open_directory_chain(
-            root_fd, canonical.relative_parts, create=True
-        )
+        directory_fd = _open_directory_chain(root_fd, canonical.relative_parts, create=True)
         os.close(directory_fd)
     finally:
         os.close(root_fd)
 
 
-def _copy_tree_without_symlinks(
-    source: Path, destination: Path
+def _ensure_relative_directory_at(root_fd: int, relative_parts: Sequence[str]) -> None:
+    parts = _validate_relative_parts(relative_parts, label="directory path")
+    directory_fd = _open_directory_chain(root_fd, parts, create=True)
+    os.close(directory_fd)
+
+
+def _copy_tree_without_symlinks_at(
+    source_fd: int, destination_fd: int
 ) -> tuple[tuple[object, ...], ...]:
-    source_info = source.lstat()
-    if stat.S_ISLNK(source_info.st_mode) or not stat.S_ISDIR(source_info.st_mode):
-        raise ScopeError(f"skill output must be a real directory: {source}")
-    try:
-        destination_info = destination.lstat()
-    except FileNotFoundError:
-        destination_info = None
-    if destination_info is not None and (
-        stat.S_ISLNK(destination_info.st_mode)
+    source_info = os.fstat(source_fd)
+    destination_info = os.fstat(destination_fd)
+    if (
+        stat.S_ISLNK(source_info.st_mode)
+        or not stat.S_ISDIR(source_info.st_mode)
+        or stat.S_ISLNK(destination_info.st_mode)
         or not stat.S_ISDIR(destination_info.st_mode)
     ):
-        raise ScopeError(f"skill output must be a real directory: {destination}")
-    snapshot = _capture_tree_snapshot(source)
-    destination.mkdir(parents=True, exist_ok=True)
-    source_root = _resolved_root(source)
-    destination_root = _resolved_root(destination)
-    directories, files, errors = _scan_tree_entries(source_root)
+        raise ScopeError("skill output must be a real directory")
+    snapshot = _capture_tree_snapshot_at(source_fd)
+    directories, files, errors = _scan_tree_entries_at(source_fd)
     if errors:
         raise ScopeError("; ".join(errors))
     for relative in directories:
         if not relative:
             continue
-        _ensure_relative_directory(destination_root, relative)
+        _ensure_relative_directory_at(destination_fd, relative)
     total_bytes = 0
     for relative in files:
-        data, _ = _read_relative_bytes(
-            source_root,
+        data, _ = _read_relative_bytes_at(
+            source_fd,
             relative,
             max_bytes=MAX_ARTIFACT_BYTES,
             label="existing skill output",
@@ -2176,15 +2729,45 @@ def _copy_tree_without_symlinks(
         total_bytes += len(data)
         if total_bytes > MAX_TOTAL_ARTIFACT_BYTES:
             raise ScopeError("aggregate preserved skill size exceeds the bounded limit")
-        _write_relative_bytes(destination_root, relative, data)
-    if _capture_tree_snapshot(source) != snapshot:
-        raise ScopeError(f"existing skill output changed while it was copied: {source}")
+        _write_relative_bytes_at(destination_fd, relative, data)
+    if _capture_tree_snapshot_at(source_fd) != snapshot:
+        raise ScopeError("existing skill output changed while it was copied")
+    if not _snapshot_matches(
+        _capture_tree_snapshot_at(destination_fd), snapshot, compare_contents=True
+    ):
+        raise ScopeError("preserved skill output was not copied completely")
     return snapshot
+
+
+def _copy_tree_without_symlinks(
+    source: Path, destination: Path
+) -> tuple[tuple[object, ...], ...]:
+    _reject_symlinked_ancestors(source, label="source path")
+    _reject_symlinked_ancestors(destination, label="destination path")
+    source_fd = _open_directory(source, label="source skill directory")
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+        destination_fd = _open_directory(destination, label="destination skill directory")
+        try:
+            return _copy_tree_without_symlinks_at(source_fd, destination_fd)
+        finally:
+            os.close(destination_fd)
+    finally:
+        os.close(source_fd)
 
 
 def _write_relative_files(root: Path, files: dict[str, str]) -> None:
     for relative, content in files.items():
         _write_relative_text(root, relative, content)
+
+
+def _write_relative_files_at(root_fd: int, files: dict[str, str]) -> None:
+    for relative, content in files.items():
+        _write_relative_bytes_at(
+            root_fd,
+            tuple(PurePosixPath(relative).parts),
+            content.encode("utf-8"),
+        )
 
 
 def _merge_working_rules(body: str, rules: Sequence[str]) -> str:
@@ -2275,13 +2858,11 @@ def _merge_existing_skill(
             and str(exc) == "frontmatter value must be a string: description"
         ):
             raise
-    end = skill_text.find("\n---\n", 4)
-    if end < 0:
-        raise ValidationError("existing SKILL.md frontmatter is not closed")
-    generated_end = generated_text.find("\n---\n", 4)
-    if generated_end < 0:
-        raise ValidationError("generated SKILL.md frontmatter is not closed")
-    body = skill_text[end + len("\n---\n") :]
+    _, end = _frontmatter_bounds(skill_text)
+    _, generated_end = _frontmatter_bounds(generated_text)
+    body_start = skill_text.find("\n", end)
+    generated_body_start = generated_text.find("\n", generated_end)
+    body = skill_text[len(skill_text) if body_start < 0 else body_start + 1 :]
     body = _merge_working_rules(body, draft.rules)
     if "references/working-style.md" not in body:
         body = body.rstrip() + (
@@ -2293,7 +2874,9 @@ def _merge_existing_skill(
             "\n\nRead [provenance.md](references/provenance.md) for the retained "
             "source and license notice.\n"
         )
-    generated_frontmatter = generated_text[: generated_end + len("\n---\n")]
+    generated_frontmatter = generated_text[
+        : len(generated_text) if generated_body_start < 0 else generated_body_start + 1
+    ]
     return generated_frontmatter + body.lstrip("\n")
 
 
@@ -2363,26 +2946,174 @@ def _prepare_update_tree(
     _write_relative_files(staged_root, generated_files)
 
 
-def _new_stage(target: Path) -> tuple[Path, Path]:
-    stage_parent = Path(
-        tempfile.mkdtemp(prefix=f".{target.name}.stage-", dir=str(target.parent))
+def _prepare_update_tree_at(
+    staged_fd: int,
+    staged_root: Path,
+    generated_files: dict[str, str],
+    draft: SkillDraft,
+) -> None:
+    existing_skill, _ = _read_relative_text_at(
+        staged_fd,
+        ("SKILL.md",),
+        max_bytes=MAX_ARTIFACT_BYTES,
+        label="existing SKILL.md",
     )
-    stage_root = stage_parent / target.name
-    stage_root.mkdir()
-    return stage_parent, stage_root
+    generated_files = dict(generated_files)
+    generated_files["SKILL.md"] = _merge_existing_skill(
+        existing_skill,
+        generated_files["SKILL.md"],
+        draft,
+        allow_skill_creator_scaffold=_is_skill_creator_scaffold_at(staged_fd),
+    )
+    try:
+        provenance, _ = _read_relative_text_at(
+            staged_fd,
+            ("references", "provenance.md"),
+            max_bytes=MAX_ARTIFACT_BYTES,
+            label="existing provenance reference",
+        )
+    except ScopeError as exc:
+        if "does not exist" not in str(exc):
+            raise
+    else:
+        if _has_complete_provenance(provenance):
+            generated_files.pop("references/provenance.md", None)
+        else:
+            generated_files["references/provenance.md"] = (
+                provenance.rstrip() + "\n\n" + generated_files["references/provenance.md"]
+            )
+    try:
+        existing_working_style, _ = _read_relative_text_at(
+            staged_fd,
+            ("references", "working-style.md"),
+            max_bytes=MAX_ARTIFACT_BYTES,
+            label="existing working-style reference",
+        )
+    except ScopeError as exc:
+        if "does not exist" not in str(exc):
+            raise
+    else:
+        generated_files["references/working-style.md"] = _merge_working_style_reference(
+            existing_working_style,
+            generated_files["references/working-style.md"],
+            draft.rules,
+        )
+    if _relative_regular_file_exists_at(
+        staged_fd,
+        ("agents", "openai.yaml"),
+        label="existing generated reference",
+    ):
+        generated_files.pop("agents/openai.yaml", None)
+    _write_relative_files_at(staged_fd, generated_files)
+
+
+def _skill_creator_initializer() -> Path:
+    override = os.environ.get("AUTOMATE_ME_SKILL_CREATOR")
+    candidates = [
+        Path(override) if override else None,
+        Path.home()
+        / ".codex"
+        / "skills"
+        / ".system"
+        / "skill-creator"
+        / "scripts"
+        / "init_skill.py",
+    ]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            info = candidate.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+            return candidate
+    raise ValidationError("skill-creator initializer is not installed")
+
+
+def _run_skill_creator_initializer(stage_parent_fd: int, skill_name: str) -> None:
+    initializer = _skill_creator_initializer().absolute()
+    # subprocess resolves ``cwd`` before pass_fds are installed on macOS. Run
+    # a tiny child-side wrapper instead: the child receives the reserved fd,
+    # fchdirs to it, and then invokes the required initializer by runpy.
+    child_code = (
+        "import os,runpy,sys;"
+        "os.fchdir(int(os.environ['AUTOMATE_ME_STAGE_FD']));"
+        "script=sys.argv[1];sys.argv=sys.argv[1:];"
+        "sys.path.insert(0,os.path.dirname(script));"
+        "runpy.run_path(script,run_name='__main__')"
+    )
+    initializer_args = [
+        str(initializer),
+        skill_name,
+        "--path",
+        ".",
+        "--resources",
+        "references",
+        "--interface",
+        f"short_description={_short_description(skill_name)}",
+    ]
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            child_code,
+            *initializer_args,
+        ],
+        pass_fds=(stage_parent_fd,),
+        env={
+            **os.environ,
+            "AUTOMATE_ME_STAGE_FD": str(stage_parent_fd),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        details = (completed.stderr or completed.stdout or "initializer failed").strip()
+        raise ValidationError(f"skill-creator initializer failed: {details}")
+
+
+def _new_stage(
+    parent_fd: int, target: Path
+) -> tuple[str, int, Path]:
+    """Reserve a stage parent under the already-open target parent."""
+
+    for _ in range(16):
+        stage_parent_name = f".{target.name}.stage-{uuid.uuid4().hex}"
+        try:
+            os.mkdir(stage_parent_name, 0o755, dir_fd=parent_fd)
+        except FileExistsError:
+            continue
+        stage_parent_fd = _open_directory_at(
+            parent_fd, stage_parent_name, label="stage parent"
+        )
+        return stage_parent_name, stage_parent_fd, target.parent / stage_parent_name / target.name
+    raise CollisionError("could not reserve a unique stage directory")
 
 
 def _prepare_recovery_copy(
     target: Path,
+    target_fd: int,
     target_parent_fd: int,
     expected_snapshot: tuple[tuple[object, ...], ...],
-) -> tuple[int, os.stat_result, bool, os.stat_result, Path]:
+) -> tuple[
+    int,
+    os.stat_result,
+    bool,
+    os.stat_result,
+    int,
+    Path,
+    tuple[tuple[object, ...], ...],
+]:
     """Keep a deterministic copy available before an update can be displaced."""
 
     recovery_parent_fd: int | None = None
     recovery_parent_info: os.stat_result | None = None
     recovery_parent_created = False
     recovery_info: os.stat_result | None = None
+    recovery_fd: int | None = None
+    recovery_snapshot: tuple[tuple[object, ...], ...] = ()
     try:
         try:
             os.mkdir(RECOVERY_DIRECTORY_NAME, 0o755, dir_fd=target_parent_fd)
@@ -2408,24 +3139,35 @@ def _prepare_recovery_copy(
             or not stat.S_ISDIR(recovery_info.st_mode)
         ):
             raise ScopeError("recovery output is not a real directory")
+        recovery_fd = _open_directory_at(
+            recovery_parent_fd, target.name, label="recovery output"
+        )
         recovery_path = target.parent / RECOVERY_DIRECTORY_NAME / target.name
-        copied_snapshot = _copy_tree_without_symlinks(target, recovery_path)
+        copied_snapshot = _copy_tree_without_symlinks_at(target_fd, recovery_fd)
         if copied_snapshot != expected_snapshot:
             raise ScopeError(
                 f"update target changed while its recovery copy was prepared: {target}"
             )
+        recovery_snapshot = _capture_tree_snapshot_at(recovery_fd)
         return (
             recovery_parent_fd,
             recovery_parent_info,
             recovery_parent_created,
             recovery_info,
+            recovery_fd,
             recovery_path,
+            recovery_snapshot,
         )
     except BaseException:
+        if recovery_fd is not None:
+            os.close(recovery_fd)
         if recovery_parent_fd is not None:
             if recovery_info is not None:
                 _remove_owned_directory(
-                    recovery_parent_fd, target.name, recovery_info
+                    recovery_parent_fd,
+                    target.name,
+                    recovery_info,
+                    expected_snapshot=recovery_snapshot,
                 )
             os.close(recovery_parent_fd)
         if recovery_parent_created and recovery_parent_info is not None:
@@ -2440,7 +3182,6 @@ def _prepare_recovery_copy(
 def _backup_matches_expected(
     target_parent_fd: int,
     backup_name: str,
-    backup_path: Path,
     expected_info: os.stat_result,
     expected_snapshot: tuple[tuple[object, ...], ...],
 ) -> bool:
@@ -2454,13 +3195,66 @@ def _backup_matches_expected(
         or not _same_file_identity(current_info, expected_info)
     ):
         return False
+    backup_fd: int | None = None
     try:
-        return _capture_tree_snapshot(backup_path) == expected_snapshot
+        backup_fd = _open_directory_at(
+            target_parent_fd, backup_name, label="rollback backup"
+        )
+        opened_info = os.fstat(backup_fd)
+        return (
+            _same_file_identity(opened_info, expected_info)
+            and _capture_tree_snapshot_at(backup_fd) == expected_snapshot
+        )
     except ScopeError:
         return False
+    finally:
+        if backup_fd is not None:
+            os.close(backup_fd)
+
+
+def _recovery_state(
+    recovery_parent_fd: int | None,
+    name: str,
+    expected_info: os.stat_result | None,
+    recovery_path: Path | None,
+    expected_snapshot: tuple[tuple[object, ...], ...],
+) -> tuple[str, Path | None]:
+    """Report only the recovery path that still names the expected state."""
+
+    if recovery_parent_fd is None or expected_info is None:
+        return "removed", None
+    current_info = _stat_at(recovery_parent_fd, name)
+    if current_info is None:
+        return "removed", None
+    if (
+        stat.S_ISLNK(current_info.st_mode)
+        or not stat.S_ISDIR(current_info.st_mode)
+        or not _same_file_identity(current_info, expected_info)
+    ):
+        return "changed", recovery_path
+    recovery_fd: int | None = None
+    try:
+        recovery_fd = _open_directory_at(
+            recovery_parent_fd, name, label="recovery output"
+        )
+        if _snapshot_matches(
+            _capture_tree_snapshot_at(recovery_fd),
+            expected_snapshot,
+            compare_contents=True,
+        ):
+            return "present", recovery_path
+        return "changed", recovery_path
+    except ScopeError:
+        return "changed", recovery_path
+    finally:
+        if recovery_fd is not None:
+            os.close(recovery_fd)
 
 
 def _install_staged_tree(
+    stage_parent_fd: int,
+    stage_name: str,
+    stage_fd: int,
     stage_root: Path,
     target: Path,
     operation: str,
@@ -2470,31 +3264,42 @@ def _install_staged_tree(
     expected_target_snapshot: tuple[tuple[object, ...], ...] | None,
     expected_stage_info: os.stat_result,
     expected_stage_snapshot: tuple[tuple[object, ...], ...],
-    validate_installed: Callable[[], None],
+    validate_installed: Callable[[int], None],
 ) -> None:
     if failure_injector:
         failure_injector("before_install")
-    stage_parent_fd = _open_directory(stage_root.parent, label="stage parent")
-    stage_fd: int | None = None
-    try:
-        stage_fd = _open_directory_at(
-            stage_parent_fd, stage_root.name, label="staged skill output"
-        )
-        stage_info = os.fstat(stage_fd)
-        if not _same_file_identity(stage_info, expected_stage_info):
-            raise ScopeError(f"staged skill output was replaced before install: {stage_root}")
-        if _capture_tree_snapshot(stage_root) != expected_stage_snapshot:
-            raise ScopeError(f"staged skill output changed before install: {stage_root}")
-    except BaseException:
-        if stage_fd is not None:
-            os.close(stage_fd)
-        os.close(stage_parent_fd)
-        raise
-    assert stage_fd is not None
+
+    _assert_directory_descriptor_matches_path(
+        target.parent, target_parent_fd, label="target parent"
+    )
+    _assert_directory_descriptor_matches_path(
+        stage_root.parent, stage_parent_fd, label="stage parent"
+    )
+    stage_info = os.fstat(stage_fd)
+    if (
+        stat.S_ISLNK(stage_info.st_mode)
+        or not stat.S_ISDIR(stage_info.st_mode)
+        or not _same_file_identity(stage_info, expected_stage_info)
+    ):
+        raise ScopeError(f"staged skill output was replaced before install: {stage_root}")
+    live_stage_info = _stat_at(stage_parent_fd, stage_name)
+    if (
+        live_stage_info is None
+        or stat.S_ISLNK(live_stage_info.st_mode)
+        or not stat.S_ISDIR(live_stage_info.st_mode)
+        or not _same_file_identity(live_stage_info, stage_info)
+    ):
+        raise ScopeError(f"staged skill output was replaced before install: {stage_root}")
+    if _capture_tree_snapshot_at(stage_fd) != expected_stage_snapshot:
+        raise ScopeError(f"staged skill output changed before install: {stage_root}")
+
     if operation == "create":
         target_fd: int | None = None
         owned_target_info: os.stat_result | None = None
         try:
+            _assert_directory_descriptor_matches_path(
+                target.parent, target_parent_fd, label="target parent"
+            )
             try:
                 os.mkdir(target.name, 0o755, dir_fd=target_parent_fd)
             except FileExistsError as exc:
@@ -2516,20 +3321,27 @@ def _install_staged_tree(
                         src_dir_fd=stage_fd,
                         dst_dir_fd=target_fd,
                     )
-            validate_installed()
+            if not _snapshot_matches(
+                _capture_tree_snapshot_at(target_fd),
+                expected_stage_snapshot,
+                compare_contents=True,
+            ):
+                raise ScopeError(f"installed skill output changed during publication: {target}")
+            validate_installed(target_fd)
             if failure_injector:
                 failure_injector("after_install")
         except BaseException:
             if owned_target_info is not None:
                 _remove_owned_directory(
-                    target_parent_fd, target.name, owned_target_info
+                    target_parent_fd,
+                    target.name,
+                    owned_target_info,
+                    expected_snapshot=expected_stage_snapshot,
                 )
             raise
         finally:
             if target_fd is not None:
                 os.close(target_fd)
-            os.close(stage_fd)
-            os.close(stage_parent_fd)
         return
 
     if expected_target_info is None or expected_target_snapshot is None:
@@ -2541,8 +3353,12 @@ def _install_staged_tree(
     recovery_parent_info: os.stat_result | None = None
     recovery_parent_created = False
     recovery_info: os.stat_result | None = None
+    recovery_fd: int | None = None
     recovery_path: Path | None = None
+    recovery_snapshot: tuple[tuple[object, ...], ...] = ()
     preserve_recovery = False
+    publication_succeeded = False
+    target_fd: int | None = None
     try:
         current_info = _stat_at(target_parent_fd, target.name)
         if (
@@ -2552,21 +3368,28 @@ def _install_staged_tree(
             or not _same_file_state(current_info, expected_target_info)
         ):
             raise ScopeError(f"update target changed before publication: {target}")
-        if _capture_tree_snapshot(target) != expected_target_snapshot:
+        target_fd = _open_directory_at(target_parent_fd, target.name, label="update target")
+        if _capture_tree_snapshot_at(target_fd) != expected_target_snapshot:
             raise ScopeError(f"update target content changed after preflight: {target}")
         (
             recovery_parent_fd,
             recovery_parent_info,
             recovery_parent_created,
             recovery_info,
+            recovery_fd,
             recovery_path,
+            recovery_snapshot,
         ) = _prepare_recovery_copy(
             target,
+            target_fd,
             target_parent_fd,
             expected_target_snapshot,
         )
-        if _capture_tree_snapshot(target) != expected_target_snapshot:
+        if _capture_tree_snapshot_at(target_fd) != expected_target_snapshot:
             raise ScopeError(f"update target content changed before publication: {target}")
+        _assert_directory_descriptor_matches_path(
+            target.parent, target_parent_fd, label="target parent"
+        )
         os.rename(
             target.name,
             backup_name,
@@ -2581,16 +3404,21 @@ def _install_staged_tree(
             or not _same_file_identity(backup_info, expected_target_info)
         ):
             raise ScopeError(f"update target changed while it was moved: {target}")
-        if (
-            _capture_tree_snapshot(target.with_name(backup_name))
-            != expected_target_snapshot
+        if not _backup_matches_expected(
+            target_parent_fd, backup_name, backup_info, expected_target_snapshot
         ):
             raise ScopeError(f"update target content changed while it was moved: {target}")
         if failure_injector:
             failure_injector("after_backup")
+        _assert_directory_descriptor_matches_path(
+            target.parent, target_parent_fd, label="target parent"
+        )
+        _assert_directory_descriptor_matches_path(
+            stage_root.parent, stage_parent_fd, label="stage parent"
+        )
         if _stat_at(target_parent_fd, target.name) is not None:
             raise CollisionError(f"update target appeared during publication: {target}")
-        staged_info = _stat_at(stage_parent_fd, stage_root.name)
+        staged_info = _stat_at(stage_parent_fd, stage_name)
         if (
             staged_info is None
             or stat.S_ISLNK(staged_info.st_mode)
@@ -2598,10 +3426,10 @@ def _install_staged_tree(
             or not _same_file_identity(staged_info, stage_info)
         ):
             raise ScopeError(f"staged skill output is not a directory: {stage_root}")
-        if _capture_tree_snapshot(stage_root) != expected_stage_snapshot:
+        if _capture_tree_snapshot_at(stage_fd) != expected_stage_snapshot:
             raise ScopeError(f"staged skill output changed before install: {stage_root}")
         os.rename(
-            stage_root.name,
+            stage_name,
             target.name,
             src_dir_fd=stage_parent_fd,
             dst_dir_fd=target_parent_fd,
@@ -2615,10 +3443,13 @@ def _install_staged_tree(
         ):
             raise ScopeError(f"installed target changed during publication: {target}")
         installed_target_info = installed_info
-        validate_installed()
+        validate_installed(stage_fd)
         if failure_injector:
             failure_injector("after_install")
+        publication_succeeded = True
     except BaseException as exc:
+        if publication_succeeded:
+            raise
         current_info = _stat_at(target_parent_fd, target.name)
         if (
             installed_target_info is not None
@@ -2626,14 +3457,16 @@ def _install_staged_tree(
             and _same_file_identity(current_info, installed_target_info)
         ):
             _remove_owned_directory(
-                target_parent_fd, target.name, installed_target_info
+                target_parent_fd,
+                target.name,
+                installed_target_info,
+                expected_snapshot=expected_stage_snapshot,
             )
             current_info = _stat_at(target_parent_fd, target.name)
-        if backup_info is not None and recovery_info is not None and recovery_path is not None:
+        if backup_info is not None and recovery_info is not None:
             backup_valid = _backup_matches_expected(
                 target_parent_fd,
                 backup_name,
-                target.with_name(backup_name),
                 backup_info,
                 expected_target_snapshot,
             )
@@ -2652,38 +3485,82 @@ def _install_staged_tree(
                     backup_info = None
                     restored = True
             if restored:
+                recovery_state, reported_recovery_path = _recovery_state(
+                    recovery_parent_fd,
+                    target.name,
+                    recovery_info,
+                    recovery_path,
+                    expected_target_snapshot,
+                )
+                if recovery_state == "present":
+                    recovery_cleanup = _remove_owned_directory_status(
+                        recovery_parent_fd,
+                        target.name,
+                        recovery_info,
+                        expected_snapshot=recovery_snapshot,
+                        require_snapshot_match=True,
+                    )
+                    if recovery_cleanup in {"removed", "missing"}:
+                        reported_recovery_path = None
+                        recovery_state = "removed"
+                    else:
+                        preserve_recovery = True
+                        recovery_state = "changed"
+                if recovery_state == "removed":
+                    recovery_status = "approved_tree_restored"
+                else:
+                    preserve_recovery = True
+                    recovery_status = "recovery_changed_preserved"
                 raise PublicationRecoveryError(
                     target=target,
-                    recovery_path=recovery_path,
+                    recovery_path=reported_recovery_path,
                     cause=exc,
-                    recovery_status="approved_tree_restored",
+                    recovery_status=recovery_status,
                     cleanup_status="hidden_backup_removed",
                     competitor_preserved=False,
                 ) from exc
 
             preserve_recovery = True
             if current_info is not None:
-                if backup_valid and _remove_owned_directory(
-                    target_parent_fd, backup_name, backup_info
-                ):
+                cleanup_status = "hidden_backup_preserved"
+                if backup_valid and _remove_owned_directory_status(
+                    target_parent_fd,
+                    backup_name,
+                    backup_info,
+                    expected_snapshot=expected_target_snapshot,
+                    require_snapshot_match=True,
+                ) in {"removed", "missing"}:
                     backup_info = None
                     cleanup_status = "hidden_backup_removed"
                     recovery_status = "approved_tree_recovered"
                 else:
-                    cleanup_status = "hidden_backup_preserved"
                     recovery_status = "backup_rejected_recovery_preserved"
+                _, reported_recovery_path = _recovery_state(
+                    recovery_parent_fd,
+                    target.name,
+                    recovery_info,
+                    recovery_path,
+                    expected_target_snapshot,
+                )
                 raise PublicationRecoveryError(
                     target=target,
-                    recovery_path=recovery_path,
+                    recovery_path=reported_recovery_path,
                     cause=exc,
                     recovery_status=recovery_status,
                     cleanup_status=cleanup_status,
                     competitor_preserved=True,
                 ) from exc
 
+            _, reported_recovery_path = _recovery_state(
+                recovery_parent_fd,
+                target.name,
+                recovery_info,
+                recovery_path,
+                expected_target_snapshot,
+            )
             raise PublicationRecoveryError(
                 target=target,
-                recovery_path=recovery_path,
+                recovery_path=reported_recovery_path,
                 cause=exc,
                 recovery_status="backup_rejected_recovery_preserved",
                 cleanup_status="hidden_backup_preserved",
@@ -2691,14 +3568,67 @@ def _install_staged_tree(
             ) from exc
         raise
     else:
+        backup_cleanup = "hidden_backup_removed"
         if backup_info is not None:
-            if _remove_owned_directory(target_parent_fd, backup_name, backup_info):
+            if not _backup_matches_expected(
+                target_parent_fd, backup_name, backup_info, expected_target_snapshot
+            ):
+                backup_cleanup = "hidden_backup_preserved"
+            elif _remove_owned_directory_status(
+                target_parent_fd,
+                backup_name,
+                backup_info,
+                expected_snapshot=expected_target_snapshot,
+                require_snapshot_match=True,
+            ) in {"removed", "missing"}:
                 backup_info = None
+            else:
+                backup_cleanup = "hidden_backup_preserved"
+        recovery_state, reported_recovery_path = _recovery_state(
+            recovery_parent_fd,
+            target.name,
+            recovery_info,
+            recovery_path,
+            expected_target_snapshot,
+        )
+        if backup_cleanup == "hidden_backup_removed" and recovery_state == "present":
+            recovery_cleanup = _remove_owned_directory_status(
+                recovery_parent_fd,
+                target.name,
+                recovery_info,
+                expected_snapshot=recovery_snapshot,
+                require_snapshot_match=True,
+            )
+            if recovery_cleanup in {"removed", "missing"}:
+                recovery_state = "removed"
+                reported_recovery_path = None
+            else:
+                recovery_state = "changed"
+        if backup_cleanup != "hidden_backup_removed" or recovery_state != "removed":
+            preserve_recovery = True
+            if backup_cleanup == "hidden_backup_preserved":
+                recovery_status = "rollback_backup_changed_recovery_preserved"
+            else:
+                recovery_status = "recovery_changed_preserved"
+            raise PublicationRecoveryError(
+                target=target,
+                recovery_path=reported_recovery_path,
+                cause=ScopeError("publication cleanup did not preserve a verified rollback state"),
+                recovery_status=recovery_status,
+                cleanup_status=backup_cleanup,
+                competitor_preserved=False,
+            )
     finally:
+        if recovery_fd is not None:
+            os.close(recovery_fd)
         if recovery_parent_fd is not None:
             if not preserve_recovery and recovery_info is not None:
                 _remove_owned_directory(
-                    recovery_parent_fd, target.name, recovery_info
+                    recovery_parent_fd,
+                    target.name,
+                    recovery_info,
+                    expected_snapshot=recovery_snapshot,
+                    require_snapshot_match=True,
                 )
             os.close(recovery_parent_fd)
         if (
@@ -2711,9 +3641,8 @@ def _install_staged_tree(
                 RECOVERY_DIRECTORY_NAME,
                 recovery_parent_info,
             )
-        if stage_fd is not None:
-            os.close(stage_fd)
-        os.close(stage_parent_fd)
+        if target_fd is not None:
+            os.close(target_fd)
 
 
 def write_generated_skill(
@@ -2760,7 +3689,7 @@ def write_generated_skill(
     if len(draft.evidence) < 2:
         raise ValidationError("durable generation requires at least two history slices")
 
-    with _workspace_write_lock(workspace):
+    with _workspace_write_lock(workspace) as root_fd:
         try:
             live_evidence = _validate_generation_evidence(workspace, draft.evidence)
             draft = replace(draft, evidence=live_evidence)
@@ -2773,9 +3702,11 @@ def write_generated_skill(
         if {signal.casefold() for signal in approval.signals} - confirmed:
             raise ValidationError("approval signals lack positive structured evidence")
         files = render_skill_files(draft)
-        root_fd = _open_directory(workspace, label="workspace root")
         parent_fd: int | None = None
-        stage_parent: Path | None = None
+        existing_fd: int | None = None
+        stage_parent_name: str | None = None
+        stage_parent_fd: int | None = None
+        stage_fd: int | None = None
         stage_root: Path | None = None
         stage_parent_info: os.stat_result | None = None
         expected_stage_info: os.stat_result | None = None
@@ -2786,7 +3717,11 @@ def write_generated_skill(
             parent_fd = _open_directory_chain(
                 root_fd, canonical_target.relative_parts[:-1], create=True
             )
-            existing_info = _stat_at(parent_fd, canonical_target.relative_parts[-1])
+            _assert_directory_descriptor_matches_path(
+                target.parent, parent_fd, label="target parent"
+            )
+            target_name = canonical_target.relative_parts[-1]
+            existing_info = _stat_at(parent_fd, target_name)
             if operation == "create":
                 if existing_info is not None:
                     raise CollisionError(f"create refused existing output: {target}")
@@ -2799,15 +3734,14 @@ def write_generated_skill(
                     raise ScopeError(f"update target is not an existing directory: {target}")
                 expected_target_info = existing_info
                 existing_fd = _open_directory_at(
-                    parent_fd, canonical_target.relative_parts[-1], label="update target"
+                    parent_fd, target_name, label="update target"
                 )
-                try:
-                    current_info = os.fstat(existing_fd)
-                    if not _same_file_state(existing_info, current_info):
-                        raise ScopeError(f"update target changed while it was opened: {target}")
-                finally:
-                    os.close(existing_fd)
-                existing_errors = validate_skill_tree(target, require_provenance=False)
+                current_info = os.fstat(existing_fd)
+                if not _same_file_state(existing_info, current_info):
+                    raise ScopeError(f"update target changed while it was opened: {target}")
+                existing_errors = _validate_skill_tree_at(
+                    existing_fd, target, require_provenance=False
+                )
                 if existing_errors:
                     if any("symlink" in error for error in existing_errors):
                         raise ScopeError("existing skill tree contains a symlink output")
@@ -2815,55 +3749,55 @@ def write_generated_skill(
                         "frontmatter value must be a string: description"
                     }
                     if not (
-                        _is_skill_creator_scaffold(target)
+                        _is_skill_creator_scaffold_at(existing_fd)
                         and set(existing_errors) <= scaffold_errors
                     ):
                         raise ValidationError(
                             "update requires a structurally valid existing skill: "
                             + "; ".join(existing_errors)
                         )
+                expected_target_snapshot = _capture_tree_snapshot_at(existing_fd)
 
-            stage_parent, stage_root = _new_stage(target)
-            stage_parent_info = _stat_at(parent_fd, stage_parent.name)
-            if (
-                stage_parent_info is None
-                or stat.S_ISLNK(stage_parent_info.st_mode)
-                or not stat.S_ISDIR(stage_parent_info.st_mode)
-            ):
-                raise ScopeError(f"stage parent is not an owned directory: {stage_parent}")
-            stage_parent_fd = _open_directory_at(
-                parent_fd, stage_parent.name, label="stage parent"
+            stage_parent_name, stage_parent_fd, stage_root = _new_stage(parent_fd, target)
+            stage_parent_info = os.fstat(stage_parent_fd)
+            _assert_directory_descriptor_matches_path(
+                stage_root.parent, stage_parent_fd, label="stage parent"
             )
-            try:
-                expected_stage_info = _stat_at(stage_parent_fd, stage_root.name)
-                if (
-                    expected_stage_info is None
-                    or stat.S_ISLNK(expected_stage_info.st_mode)
-                    or not stat.S_ISDIR(expected_stage_info.st_mode)
-                ):
-                    raise ScopeError(f"staged skill output is not an owned directory: {stage_root}")
-            finally:
-                os.close(stage_parent_fd)
-            if operation == "update":
-                expected_target_snapshot = _copy_tree_without_symlinks(
-                    target, stage_root
-                )
-                _prepare_update_tree(stage_root, files, draft)
+            if operation == "create":
+                _run_skill_creator_initializer(stage_parent_fd, draft.name)
             else:
-                _write_relative_files(stage_root, files)
-            errors = validate_skill_tree(stage_root)
+                os.mkdir(target_name, 0o755, dir_fd=stage_parent_fd)
+            expected_stage_info = _stat_at(stage_parent_fd, target_name)
+            if (
+                expected_stage_info is None
+                or stat.S_ISLNK(expected_stage_info.st_mode)
+                or not stat.S_ISDIR(expected_stage_info.st_mode)
+            ):
+                raise ScopeError(f"staged skill output is not an owned directory: {stage_root}")
+            stage_fd = _open_directory_at(
+                stage_parent_fd, target_name, label="staged skill output"
+            )
+            opened_stage_info = os.fstat(stage_fd)
+            if not _same_file_identity(expected_stage_info, opened_stage_info):
+                raise ScopeError(f"staged skill output changed while it was opened: {stage_root}")
+            if operation == "update":
+                if existing_fd is None or expected_target_snapshot is None:
+                    raise ScopeError("update staging is missing the reserved target")
+                copied_snapshot = _copy_tree_without_symlinks_at(existing_fd, stage_fd)
+                if copied_snapshot != expected_target_snapshot:
+                    raise ScopeError(f"update target changed while it was copied: {target}")
+                _prepare_update_tree_at(stage_fd, stage_root, files, draft)
+            else:
+                _write_relative_files_at(stage_fd, files)
+            errors = _validate_skill_tree_at(stage_fd, stage_root)
             if errors:
                 raise ValidationError("generated skill failed validation: " + "; ".join(errors))
-            stage_parent_fd = _open_directory_at(
-                parent_fd, stage_parent.name, label="stage parent"
-            )
-            try:
-                expected_stage_snapshot = _capture_tree_snapshot(stage_root)
-            finally:
-                os.close(stage_parent_fd)
+            expected_stage_snapshot = _capture_tree_snapshot_at(stage_fd)
 
-            def validate_installed() -> None:
-                installed_errors = validate_skill_discoverability(target)
+            def validate_installed(installed_fd: int) -> None:
+                installed_errors = _validate_skill_discoverability_at(
+                    installed_fd, target
+                )
                 if installed_errors:
                     raise ValidationError(
                         "installed skill is not directly discoverable: "
@@ -2871,6 +3805,9 @@ def write_generated_skill(
                     )
 
             _install_staged_tree(
+                stage_parent_fd,
+                target_name,
+                stage_fd,
                 stage_root,
                 target,
                 operation,
@@ -2883,21 +3820,46 @@ def write_generated_skill(
                 validate_installed,
             )
         finally:
+            if stage_parent_fd is not None and expected_stage_info is None:
+                candidate_info = _stat_at(stage_parent_fd, target.name)
+                if (
+                    candidate_info is not None
+                    and stat.S_ISDIR(candidate_info.st_mode)
+                    and not stat.S_ISLNK(candidate_info.st_mode)
+                ):
+                    expected_stage_info = candidate_info
+                    candidate_fd: int | None = None
+                    try:
+                        candidate_fd = _open_directory_at(
+                            stage_parent_fd, target.name, label="staged skill output"
+                        )
+                        expected_stage_snapshot = _capture_tree_snapshot_at(candidate_fd)
+                    except ScopeError:
+                        expected_stage_snapshot = ()
+                    finally:
+                        if candidate_fd is not None:
+                            os.close(candidate_fd)
+            if stage_fd is not None:
+                os.close(stage_fd)
+            if existing_fd is not None:
+                os.close(existing_fd)
+            if stage_parent_fd is not None:
+                os.close(stage_parent_fd)
             if (
                 parent_fd is not None
-                and stage_parent is not None
+                and stage_parent_name is not None
                 and stage_parent_info is not None
             ):
                 _cleanup_owned_stage(
                     parent_fd,
-                    stage_parent.name,
+                    stage_parent_name,
                     stage_parent_info,
-                    stage_root.name if stage_root is not None else target.name,
+                    target.name,
                     expected_stage_info,
+                    expected_stage_snapshot or (),
                 )
             if parent_fd is not None:
                 os.close(parent_fd)
-            os.close(root_fd)
     return WriteResult(
         operation=operation,
         target=canonical_target.relative,
