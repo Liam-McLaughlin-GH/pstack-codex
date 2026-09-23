@@ -1,0 +1,7 @@
+interface:
+  display_name: "Recall"
+  short_description: "Rebuild bounded context from explicit artifacts"
+  default_prompt: "Use $recall to rebuild a bounded context brief from explicit artifacts."
+
+policy:
+  allow_implicit_invocation: false
