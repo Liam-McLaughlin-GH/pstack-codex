@@ -1014,7 +1014,8 @@ def _validate_lifecycle_graph_v2(
             if not isinstance(snapshot, Mapping):
                 fail(f"events[{index}].interruption_snapshot must be an object")
             _require_state_fields(snapshot, {"at", "phase", "checkpoint", "reason"}, f"events[{index}].interruption_snapshot")
-            for field in ("at", "phase", "checkpoint", "reason"):
+            _state_timestamp(snapshot["at"], f"events[{index}].interruption_snapshot.at")
+            for field in ("phase", "checkpoint", "reason"):
                 _state_text(snapshot[field], f"events[{index}].interruption_snapshot.{field}")
             if snapshot["phase"] != phase_id or snapshot["checkpoint"] != checkpoint_id or snapshot["reason"] != interruption.get("reason"):
                 fail(f"events[{index}].interruption_snapshot does not match the interruption")

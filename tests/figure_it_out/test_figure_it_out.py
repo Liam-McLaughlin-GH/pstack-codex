@@ -1224,6 +1224,22 @@ class WorkflowBehaviorTests(unittest.TestCase):
             with self.assertRaises(figure_it_out.StateError):
                 figure_it_out.Workflow.load(state_path, workspace_root=root)
 
+    def test_interruption_snapshot_timestamp_must_be_timezone_aware_iso_value(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            workflow.start_phase()
+            workflow.checkpoint("safe stop", ["artifacts/checkpoint.txt"], "resume phase-1")
+            workflow.interrupt("session stopped")
+            state_path = root / "run.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            interruption = next(event for event in state["events"] if event["event"] == "interrupted")
+            interruption["interruption_snapshot"]["at"] = "secret@host"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(state_path, workspace_root=root)
+
     def test_schema_one_refusal_migration_preserves_lifecycle_reason(self):
         def legacy_state(state):
             legacy = deepcopy(state)
