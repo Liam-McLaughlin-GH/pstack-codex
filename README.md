@@ -25,7 +25,7 @@ The following 30 upstream skills are active in this repo without changing their 
 
 These skills carry over the parts of pstack that do not depend on Cursor APIs. They cover design principles, root-cause debugging, behavior-focused verification, plain explanations, TypeScript modeling, and clean writing.
 
-The following 10 skills are present as Codex-native rewrites.
+The following 9 skills are present as Codex-native rewrites.
 
 | Skill | Codex port |
 | --- | --- |
@@ -38,7 +38,6 @@ The following 10 skills are present as Codex-native rewrites.
 | `interrogate` | Runs an adversarial review of a design or diff. |
 | `show-me-your-work` | Keeps an optional append-only decision trail. |
 | `no-comments` | Provides a Codex-compatible review pass for stale or misleading comments. |
-| `python-best-practices` | Applies general Python guidance and source-backed Showpass routing and safety rules. |
 
 The port preserves the names of these workflows where possible. In Codex, invoke them as skills such as `$poteto-mode`, `$how`, `$architect`, or `$tdd`.
 
@@ -89,26 +88,25 @@ This repo is the source tree. It is not linked into Codex automatically.
 Review the port first.
 
 ```sh
-# Run from the repository root.
+cd /Users/liammclaughlin/PycharmProjects/pstack-codex
 python3 scripts/verify_port.py
 git status --short
 ```
 
 When you are ready to activate it, link the skill folders into your local Codex skill directory after checking for name collisions.
 
-The repository remains the source of truth. Entries under the local Codex skill directory are only discoverability links for the runtime.
+The repository remains the source of truth. The entries under `~/.codex/skills` are only discoverability links for the local Codex runtime.
 
 ```sh
-REPO="$(git rev-parse --show-toplevel)"
-CODEX_SKILLS_DIR="${CODEX_HOME:-$HOME/.codex}/skills"
-mkdir -p "$CODEX_SKILLS_DIR"
+REPO=/Users/liammclaughlin/PycharmProjects/pstack-codex
+mkdir -p "$HOME/.codex/skills"
 for skill_dir in "$REPO"/skills/*; do
   skill_name=$(basename "$skill_dir")
-  [ -e "$CODEX_SKILLS_DIR/$skill_name" ] && {
+  [ -e "$HOME/.codex/skills/$skill_name" ] && {
     printf 'Skipping existing skill %s\n' "$skill_name"
     continue
   }
-  ln -s "$skill_dir" "$CODEX_SKILLS_DIR/$skill_name"
+  ln -s "$skill_dir" "$HOME/.codex/skills/$skill_name"
 done
 ```
 
