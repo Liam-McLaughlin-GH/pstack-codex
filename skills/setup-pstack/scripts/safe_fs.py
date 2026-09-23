@@ -23,6 +23,7 @@ class CreatedDirectory:
     parent_fd: int
     name: str
     path: Path
+    metadata: os.stat_result
 
 
 @dataclass
@@ -104,7 +105,12 @@ def open_directory(path: Path, *, create: bool = False) -> DirectoryHandle:
                 except FileExistsError:
                     os.close(parent_for_cleanup)
                 else:
-                    created.append(CreatedDirectory(parent_for_cleanup, component, current_path / component))
+                    try:
+                        metadata = lstat_at(current_fd, component)
+                    except BaseException:
+                        os.close(parent_for_cleanup)
+                        raise
+                    created.append(CreatedDirectory(parent_for_cleanup, component, current_path / component, metadata))
                 child_fd = _open_child_directory(current_fd, component)
             os.close(current_fd)
             current_fd = child_fd
@@ -114,7 +120,7 @@ def open_directory(path: Path, *, create: bool = False) -> DirectoryHandle:
         os.close(current_fd)
         try:
             cleanup_created_directories(created)
-        except OSError:
+        except (OSError, SafeFilesystemError):
             close_created_directories(created)
         raise
 
@@ -132,17 +138,30 @@ def close_created_directories(created: list[CreatedDirectory]) -> None:
 
 
 def cleanup_created_directories(created: list[CreatedDirectory]) -> None:
+    errors: list[str] = []
     for entry in reversed(created):
         try:
+            try:
+                current = lstat_at(entry.parent_fd, entry.name)
+            except FileNotFoundError:
+                continue
+            if not _same_entry(current, entry.metadata):
+                raise SafeFilesystemError(f"created directory identity changed during cleanup: {entry.path}")
+            if not stat.S_ISDIR(current.st_mode):
+                raise SafeFilesystemError(f"created path is no longer a directory during cleanup: {entry.path}")
             os.rmdir(entry.name, dir_fd=entry.parent_fd)
         except OSError as exc:
-            if exc.errno not in {errno.ENOENT, errno.ENOTEMPTY, errno.EEXIST, errno.EBUSY}:
-                raise
+            if exc.errno != errno.ENOENT:
+                errors.append(f"{entry.path}: {exc}")
+        except SafeFilesystemError as exc:
+            errors.append(str(exc))
         finally:
             try:
                 os.close(entry.parent_fd)
             except OSError:
                 pass
+    if errors:
+        raise SafeFilesystemError("created directory cleanup incomplete: " + "; ".join(errors))
 
 
 @contextmanager

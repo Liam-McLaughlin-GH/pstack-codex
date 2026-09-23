@@ -43,8 +43,10 @@ MULTILINE_CURSOR_TASK_IMPORT = re.compile(
     r"\bfrom\s+cursor_tools\s+import\s*\((?P<body>(?=[^)]*\n)[^)]*\bTask\b[^)]*)\)",
     re.IGNORECASE | re.DOTALL,
 )
+EXPLICIT_CONTINUATION = r"\\[ \t]*\r?\n[ \t]*"
 BACKSLASH_CURSOR_TASK_IMPORT = re.compile(
-    r"\bfrom\s+cursor_tools\s+import(?P<body>(?:[^\n]|\\[ \t]*\r?\n[ \t]*)*\bTask\b)",
+    rf"\bfrom\s+cursor_tools(?:(?:[ \t]+{EXPLICIT_CONTINUATION})+|[ \t]+)import"
+    rf"(?P<body>(?:[^\n]|{EXPLICIT_CONTINUATION}|\([^)]*\))*\bTask\b[^\n]*)",
     re.IGNORECASE,
 )
 BOUNDARY_ANNOTATION = re.compile(r"\bUNSUPPORTED[-_ ]SEAM\s*:\s*(?P<detail>[^\n]+)", re.IGNORECASE)
@@ -294,6 +296,8 @@ def _check_boundary_mentions(root: Path, path: Path, text: str, errors: list[str
 
     for import_pattern in (MULTILINE_CURSOR_TASK_IMPORT, BACKSLASH_CURSOR_TASK_IMPORT):
         for match in import_pattern.finditer(text):
+            if import_pattern is BACKSLASH_CURSOR_TASK_IMPORT and "\\" not in match.group(0):
+                continue
             annotations = [
                 annotation.group("detail").casefold()
                 for annotation in BOUNDARY_ANNOTATION.finditer(match.group(0))

@@ -337,76 +337,85 @@ def apply_install(source: Path, destination: Path) -> InstallPlan:
     primary_error: InstallError | None = None
     try:
         with directory_lock(destination_handle.fd):
-            plan = _target_plan(source, destination, destination_handle.fd, snapshot)
-            if plan.status == "unchanged":
+            try:
+                plan = _target_plan(source, destination, destination_handle.fd, snapshot)
+                if plan.status == "unchanged":
+                    completed = True
+                    return plan
+                if plan.status != "create":
+                    raise InstallError(plan.reason or f"cannot install into {plan.target}")
+
+                staging_name, staging_fd = create_unique_directory(destination_handle.fd, ".setup-pstack-install-")
+                staging_metadata = os.fstat(staging_fd)
+                write_snapshot(
+                    staging_fd,
+                    TreeSnapshot(snapshot.directories, snapshot.files, {}),
+                )
+                sync_directory(staging_fd)
+                _destination_target_is_absent(destination_handle.fd, source.name)
+                try:
+                    atomic_rename_noreplace_at(destination_handle.fd, staging_name, source.name)
+                except FileExistsError as exc:
+                    raise InstallError(f"target appeared during install: {source.name}") from exc
+                staging_name = None
+                os.close(staging_fd)
+                staging_fd = None
+                sync_directory(destination_handle.fd)
                 completed = True
                 return plan
-            if plan.status != "create":
-                raise InstallError(plan.reason or f"cannot install into {plan.target}")
-
-            staging_name, staging_fd = create_unique_directory(destination_handle.fd, ".setup-pstack-install-")
-            staging_metadata = os.fstat(staging_fd)
-            write_snapshot(
-                staging_fd,
-                TreeSnapshot(snapshot.directories, snapshot.files, {}),
-            )
-            sync_directory(staging_fd)
-            _destination_target_is_absent(destination_handle.fd, source.name)
-            try:
-                atomic_rename_noreplace_at(destination_handle.fd, staging_name, source.name)
-            except FileExistsError as exc:
-                raise InstallError(f"target appeared during install: {source.name}") from exc
-            staging_name = None
-            os.close(staging_fd)
-            staging_fd = None
-            sync_directory(destination_handle.fd)
-            completed = True
-            return plan
+            except BaseException as exc:
+                if isinstance(exc, InstallError):
+                    primary_error = exc
+                else:
+                    primary_error = InstallError(f"install failed and was rolled back: {exc}")
+                raise
+            finally:
+                cleanup_errors: list[str] = []
+                if staging_fd is not None:
+                    os.close(staging_fd)
+                if staging_name is not None:
+                    try:
+                        remove_tree_at(
+                            destination_handle.fd,
+                            staging_name,
+                            expected_metadata=staging_metadata,
+                        )
+                    except (OSError, SafeFilesystemError) as exc:
+                        cleanup_errors.append(f"staging residue {destination_handle.path / staging_name}: {exc}")
+                if not completed:
+                    try:
+                        cleanup_created_directories(destination_handle.created)
+                    except (OSError, SafeFilesystemError) as exc:
+                        cleanup_errors.append(f"created parent cleanup: {exc}")
+                else:
+                    close_created_directories(destination_handle.created)
+                if cleanup_errors:
+                    detail = "; ".join(cleanup_errors)
+                    residue_text = next(
+                        (
+                            part.split(":", 1)[0].removeprefix("staging residue ")
+                            for part in cleanup_errors
+                            if part.startswith("staging residue ")
+                        ),
+                        None,
+                    )
+                    residue = Path(residue_text) if residue_text else None
+                    retry = _cleanup_retry_hint(residue, staging_metadata) if residue is not None else None
+                    message = f"install rollback cleanup is incomplete (status=cleanup_pending): {detail}"
+                    if residue is not None and retry is not None:
+                        message += f". Retry with {retry}"
+                    raise InstallError(
+                        message,
+                        status="cleanup_pending",
+                        residue=residue,
+                        retry=retry,
+                    ) from primary_error
     except (OSError, SafeFilesystemError) as exc:
-        primary_error = InstallError(f"install failed and was rolled back: {exc}")
+        if primary_error is None:
+            primary_error = InstallError(f"install failed and was rolled back: {exc}")
         raise primary_error from exc
     finally:
-        cleanup_errors: list[str] = []
-        if staging_fd is not None:
-            os.close(staging_fd)
-        if staging_name is not None:
-            try:
-                remove_tree_at(
-                    destination_handle.fd,
-                    staging_name,
-                    expected_metadata=staging_metadata,
-                )
-            except (OSError, SafeFilesystemError) as exc:
-                cleanup_errors.append(f"staging residue {destination_handle.path / staging_name}: {exc}")
-        if not completed:
-            try:
-                cleanup_created_directories(destination_handle.created)
-            except (OSError, SafeFilesystemError) as exc:
-                cleanup_errors.append(f"created parent cleanup: {exc}")
-        else:
-            close_created_directories(destination_handle.created)
         os.close(destination_handle.fd)
-        if cleanup_errors:
-            detail = "; ".join(cleanup_errors)
-            residue_text = next(
-                (
-                    part.split(":", 1)[0].removeprefix("staging residue ")
-                    for part in cleanup_errors
-                    if part.startswith("staging residue ")
-                ),
-                None,
-            )
-            residue = Path(residue_text) if residue_text else None
-            retry = _cleanup_retry_hint(residue, staging_metadata) if residue is not None else None
-            message = f"install rollback cleanup is incomplete (status=cleanup_pending): {detail}"
-            if residue is not None and retry is not None:
-                message += f". Retry with {retry}"
-            raise InstallError(
-                message,
-                status="cleanup_pending",
-                residue=residue,
-                retry=retry,
-            ) from primary_error
 
 
 def _format_result(plan: InstallPlan, as_json: bool) -> str:

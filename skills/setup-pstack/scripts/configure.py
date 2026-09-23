@@ -67,6 +67,27 @@ def _recovery_hint(root: Path, residue: Path) -> str:
 class ConfigurationError(RuntimeError):
     """Raised when a model or configuration cannot be proven safe to write."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: str = "failed",
+        residue: Path | None = None,
+        retry: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.residue = residue
+        self.retry = retry
+
+    def as_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {"status": self.status, "error": str(self)}
+        if self.residue is not None:
+            result["residue"] = str(self.residue)
+        if self.retry is not None:
+            result["retry"] = self.retry
+        return result
+
 
 @dataclass(frozen=True)
 class Model:
@@ -151,6 +172,7 @@ UNCONSUMED_CODEX_ROLES = {
     "reflect-judgment": "no active Codex reflect skill consumes this generated agent",
 }
 NO_INFERRED_DEFAULT = object()
+ALIASES_ARE_DEFAULT = object()
 
 
 def _catalog_entries(payload: object) -> list[dict[str, object]]:
@@ -338,8 +360,8 @@ def _existing_selection(spec: RoleSpec, existing: dict[str, tuple[str | None, st
     return tuple(existing.get(_agent_name(spec, index), (None, None))[0] for index in range(1, spec.fanout + 1))
 
 
-def _inferred_default_model(existing: dict[str, tuple[str | None, str | None]]) -> str | None | object:
-    """Infer the previous default from the generated singleton roles."""
+def _inferred_default_model(existing: dict[str, tuple[str | None, str | None]]) -> str | object:
+    """Infer the previous concrete default without treating aliases as models."""
 
     values = [
         existing[_agent_name(spec, 1)][0]
@@ -350,20 +372,28 @@ def _inferred_default_model(existing: dict[str, tuple[str | None, str | None]]) 
         values = [model for model, _effort in existing.values()]
     if not values:
         return NO_INFERRED_DEFAULT
-    return Counter(values).most_common(1)[0][0]
+    concrete_counts = Counter(model for model in values if model is not None)
+    alias_count = len(values) - sum(concrete_counts.values())
+    if alias_count > len(values) / 2:
+        if not concrete_counts:
+            return ALIASES_ARE_DEFAULT
+        return concrete_counts.most_common(1)[0][0]
+    if concrete_counts:
+        return concrete_counts.most_common(1)[0][0]
+    return ALIASES_ARE_DEFAULT
 
 
 def _preserve_existing_selection(
     spec: RoleSpec,
     existing: dict[str, tuple[str | None, str | None]],
-    inferred_default: str | None | object,
+    inferred_default: str | object,
 ) -> bool:
     if inferred_default is NO_INFERRED_DEFAULT:
         return False
     names = [_agent_name(spec, index) for index in range(1, spec.fanout + 1)]
     if not all(name in existing for name in names):
         return False
-    if inferred_default is None:
+    if inferred_default is ALIASES_ARE_DEFAULT:
         return True
     values = [existing[name][0] for name in names]
     return values[0] != inferred_default if spec.fanout == 1 else any(value != inferred_default for value in values)
@@ -511,6 +541,58 @@ def _same_entry(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
 
 
+def _open_expected_root(
+    parent_fd: int,
+    root_name: str,
+    expected_root: os.stat_result,
+) -> int | None:
+    try:
+        live_root = lstat_at(parent_fd, root_name)
+    except FileNotFoundError:
+        return None
+    if not _same_entry(live_root, expected_root):
+        return None
+    try:
+        root_fd = open_child_directory(parent_fd, root_name)
+        opened_root = os.fstat(root_fd)
+    except (OSError, SafeFilesystemError):
+        if "root_fd" in locals():
+            os.close(root_fd)
+        return None
+    if not _same_entry(opened_root, expected_root):
+        os.close(root_fd)
+        return None
+    return root_fd
+
+
+def _root_descriptor_matches(
+    parent_fd: int,
+    root_name: str,
+    root_fd: int,
+    expected_root: os.stat_result,
+    expected_snapshot: TreeSnapshot | None,
+) -> bool:
+    try:
+        descriptor_before = os.fstat(root_fd)
+        live_before = lstat_at(parent_fd, root_name)
+        if not _same_entry(descriptor_before, expected_root) or not _same_entry(live_before, expected_root):
+            return False
+        if expected_snapshot is not None and snapshot_tree(root_fd) != expected_snapshot:
+            return False
+        descriptor_after = os.fstat(root_fd)
+        live_after = lstat_at(parent_fd, root_name)
+        descriptor_final = os.fstat(root_fd)
+        live_final = lstat_at(parent_fd, root_name)
+    except (OSError, SafeFilesystemError):
+        return False
+    return (
+        _same_entry(descriptor_after, expected_root)
+        and _same_entry(live_after, expected_root)
+        and _same_entry(descriptor_final, expected_root)
+        and _same_entry(live_final, expected_root)
+    )
+
+
 def _restore_backup_if_root_absent(parent_fd: int, root_name: str, backup_name: str) -> bool:
     try:
         lstat_at(parent_fd, root_name)
@@ -538,14 +620,17 @@ def _publication_state(
     except FileNotFoundError:
         live_root = None
     state_matches = live_root is not None and _same_entry(live_root, expected_root)
-    if state_matches and expected_snapshot is not None:
+    if state_matches:
         root_fd: int | None = None
         try:
-            root_fd = open_child_directory(parent_fd, root_name)
-            opened_root = os.fstat(root_fd)
-            state_matches = _same_entry(opened_root, expected_root) and snapshot_tree(root_fd) == expected_snapshot
-            current_root = lstat_at(parent_fd, root_name)
-            state_matches = state_matches and _same_entry(current_root, expected_root)
+            root_fd = _open_expected_root(parent_fd, root_name, expected_root)
+            state_matches = root_fd is not None and _root_descriptor_matches(
+                parent_fd,
+                root_name,
+                root_fd,
+                expected_root,
+                expected_snapshot,
+            )
         except (OSError, SafeFilesystemError):
             state_matches = False
         finally:
@@ -583,77 +668,80 @@ def _cleanup_published_generation(
     """Remove only the old generation still behind the expected live root."""
 
     residue = parent_path / residue_name
-    if expected_snapshot is not None:
-        state = _publication_state(
-            parent_fd,
-            parent_path,
-            root_name,
-            residue_name,
-            expected_root,
-            expected_residue,
-            expected_snapshot,
-        )
-        if state.status != "published_cleanup_pending":
-            return state
-    try:
-        live_root = lstat_at(parent_fd, root_name)
-    except FileNotFoundError:
-        return _publication_state(
-            parent_fd,
-            parent_path,
-            root_name,
-            residue_name,
-            expected_root,
-            expected_residue,
-            expected_snapshot,
-        )
-    if not _same_entry(live_root, expected_root):
-        return _publication_state(
-            parent_fd,
-            parent_path,
-            root_name,
-            residue_name,
-            expected_root,
-            expected_residue,
-            expected_snapshot,
-        )
-
-    try:
-        old_generation = lstat_at(parent_fd, residue_name)
-    except FileNotFoundError:
-        return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
-    if not stat.S_ISDIR(old_generation.st_mode) or stat.S_ISLNK(old_generation.st_mode):
-        return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
-    if not _same_entry(old_generation, expected_residue):
-        return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
-
-    try:
-        remove_tree_at(
-            parent_fd,
-            residue_name,
-            expected_metadata=expected_residue,
-            guard_name=root_name,
-            guard_metadata=expected_root,
-        )
-    except (OSError, SafeFilesystemError):
-        return _publication_state(
-            parent_fd,
-            parent_path,
-            root_name,
-            residue_name,
-            expected_root,
-            expected_residue,
-            expected_snapshot,
-        )
-    return _publication_state(
+    root_fd = _open_expected_root(parent_fd, root_name, expected_root)
+    if root_fd is None or not _root_descriptor_matches(
         parent_fd,
-        parent_path,
         root_name,
-        residue_name,
+        root_fd,
         expected_root,
-        None,
         expected_snapshot,
-    )
+    ):
+        if root_fd is not None:
+            os.close(root_fd)
+        return _publication_state(
+            parent_fd,
+            parent_path,
+            root_name,
+            residue_name,
+            expected_root,
+            expected_residue,
+            expected_snapshot,
+        )
+    try:
+        try:
+            old_generation = lstat_at(parent_fd, residue_name)
+        except FileNotFoundError:
+            return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
+        if not stat.S_ISDIR(old_generation.st_mode) or stat.S_ISLNK(old_generation.st_mode):
+            return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
+        if not _same_entry(old_generation, expected_residue):
+            return TransactionOutcome("publication_recovery_pending", residue, _recovery_hint(parent_path / root_name, residue))
+
+        try:
+            remove_tree_at(
+                parent_fd,
+                residue_name,
+                expected_metadata=expected_residue,
+                guard_name=root_name,
+                guard_metadata=expected_root,
+            )
+        except (OSError, SafeFilesystemError):
+            return _publication_state(
+                parent_fd,
+                parent_path,
+                root_name,
+                residue_name,
+                expected_root,
+                expected_residue,
+                expected_snapshot,
+            )
+        if not _root_descriptor_matches(
+            parent_fd,
+            root_name,
+            root_fd,
+            expected_root,
+            expected_snapshot,
+        ):
+            return _publication_state(
+                parent_fd,
+                parent_path,
+                root_name,
+                residue_name,
+                expected_root,
+                expected_residue,
+                expected_snapshot,
+            )
+        return _publication_state(
+            parent_fd,
+            parent_path,
+            root_name,
+            residue_name,
+            expected_root,
+            None,
+            expected_snapshot,
+        )
+    finally:
+        os.close(root_fd)
 
 
 def _publish_generation_with_recovery(
@@ -848,17 +936,31 @@ def _cleanup_residue(
             if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
                 raise ConfigurationError(f"transaction residue is not a real directory: {residue}")
             if expected_identity is not None and (metadata.st_dev, metadata.st_ino) != expected_identity:
-                raise ConfigurationError(f"cleanup refused; residue identity changed at {residue}")
+                raise ConfigurationError(
+                    f"cleanup refused (status=cleanup_refused); residue identity changed at {residue}. "
+                    "Inspect the replacement before issuing a new cleanup command.",
+                    status="cleanup_refused",
+                    residue=residue,
+                )
             try:
                 remove_tree_at(parent_handle.fd, residue.name, expected_metadata=metadata)
             except SafeFilesystemError as exc:
+                retry = _cleanup_retry_hint(residue, metadata)
                 raise ConfigurationError(
-                    f"cleanup refused; residue identity changed or is unsafe at {residue}. "
-                    f"Retry with {_cleanup_retry_hint(residue, metadata)}: {exc}"
+                    f"cleanup refused (status=cleanup_refused); residue is preserved at {residue}. "
+                    f"Retry with {retry}: {exc}",
+                    status="cleanup_refused",
+                    residue=residue,
+                    retry=retry,
                 ) from exc
             except OSError as exc:
+                retry = _cleanup_retry_hint(residue, metadata)
                 raise ConfigurationError(
-                    f"cleanup failed; residue is preserved at {residue}. Retry with {_cleanup_retry_hint(residue, metadata)}: {exc}"
+                    f"cleanup is incomplete (status=cleanup_pending); residue is preserved at {residue}. "
+                    f"Retry with {retry}: {exc}",
+                    status="cleanup_pending",
+                    residue=residue,
+                    retry=retry,
                 ) from exc
             sync_directory(parent_handle.fd)
             return TransactionOutcome("cleanup_complete")
@@ -888,53 +990,102 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
     published_snapshot: TreeSnapshot | None = None
     try:
         with directory_lock(parent_handle.fd):
-            root_fd, current_snapshot, root_metadata = _open_agents_root_at(parent_handle.fd, agents_root.name)
             try:
-                _validate_agents_snapshot(current_snapshot, agents_root)
-                _validate_plan_snapshot(plan, agents_root, current_snapshot)
-                staging_name, staging_fd = create_unique_directory(parent_handle.fd, ".pstack-agents-")
-                staging_metadata = os.fstat(staging_fd)
-                write_snapshot(staging_fd, current_snapshot)
-                for item in changed:
-                    write_regular_file_at(
-                        staging_fd,
-                        item.path.name,
-                        item.content.encode("utf-8"),
-                        replace=True,
-                    )
-                published_snapshot = snapshot_tree(staging_fd)
-                sync_directory(staging_fd)
-                os.close(staging_fd)
-                staging_fd = None
-                outcome = _publish_generation(
-                    parent_handle.fd,
-                    parent_handle.path,
-                    agents_root.name,
-                    staging_name,
-                    root_metadata,
-                    published_snapshot,
-                )
-                published_residue_name = staging_name
-                staging_name = None
-                sync_directory(parent_handle.fd)
-                if outcome.status == "published":
-                    if staging_metadata is None:
-                        raise ConfigurationError("published generation has no identity")
-                    outcome = _publication_state(
+                root_fd, current_snapshot, root_metadata = _open_agents_root_at(parent_handle.fd, agents_root.name)
+                try:
+                    _validate_agents_snapshot(current_snapshot, agents_root)
+                    _validate_plan_snapshot(plan, agents_root, current_snapshot)
+                    staging_name, staging_fd = create_unique_directory(parent_handle.fd, ".pstack-agents-")
+                    staging_metadata = os.fstat(staging_fd)
+                    write_snapshot(staging_fd, current_snapshot)
+                    for item in changed:
+                        write_regular_file_at(
+                            staging_fd,
+                            item.path.name,
+                            item.content.encode("utf-8"),
+                            replace=True,
+                        )
+                    published_snapshot = snapshot_tree(staging_fd)
+                    sync_directory(staging_fd)
+                    os.close(staging_fd)
+                    staging_fd = None
+                    outcome = _publish_generation(
                         parent_handle.fd,
                         parent_handle.path,
                         agents_root.name,
-                        published_residue_name,
-                        staging_metadata,
+                        staging_name,
                         root_metadata,
                         published_snapshot,
                     )
-                completed = True
-                return outcome
+                    published_residue_name = staging_name
+                    staging_name = None
+                    sync_directory(parent_handle.fd)
+                    if outcome.status == "published":
+                        if staging_metadata is None:
+                            raise ConfigurationError("published generation has no identity")
+                        for _verification in range(2):
+                            outcome = _publication_state(
+                                parent_handle.fd,
+                                parent_handle.path,
+                                agents_root.name,
+                                published_residue_name,
+                                staging_metadata,
+                                root_metadata,
+                                published_snapshot,
+                            )
+                            if outcome.status != "published":
+                                break
+                    completed = True
+                    return outcome
+                finally:
+                    if root_fd is not None:
+                        os.close(root_fd)
+                        root_fd = None
+            except BaseException as exc:
+                primary_error = exc
+                raise
             finally:
-                if root_fd is not None:
-                    os.close(root_fd)
-                    root_fd = None
+                cleanup_errors: list[str] = []
+                if staging_fd is not None:
+                    os.close(staging_fd)
+                if staging_name is not None:
+                    try:
+                        remove_tree_at(
+                            parent_handle.fd,
+                            staging_name,
+                            expected_metadata=staging_metadata,
+                        )
+                    except (OSError, SafeFilesystemError) as exc:
+                        cleanup_errors.append(f"staging residue {parent_handle.path / staging_name}: {exc}")
+                if not completed:
+                    try:
+                        cleanup_created_directories(parent_handle.created)
+                    except (OSError, SafeFilesystemError) as exc:
+                        cleanup_errors.append(f"created parent cleanup: {exc}")
+                        close_created_directories(parent_handle.created)
+                else:
+                    close_created_directories(parent_handle.created)
+                if cleanup_errors:
+                    detail = "; ".join(cleanup_errors)
+                    retry = next(
+                        (
+                            part.split(":", 1)[0].removeprefix("staging residue ")
+                            for part in cleanup_errors
+                            if part.startswith("staging residue ")
+                        ),
+                        None,
+                    )
+                    message = f"configuration cleanup is incomplete (status=cleanup_pending): {detail}"
+                    residue = Path(retry) if retry else None
+                    retry_command = _cleanup_retry_hint(residue, staging_metadata) if residue is not None else None
+                    if retry_command:
+                        message += f". Retry with {retry_command}"
+                    raise ConfigurationError(
+                        message,
+                        status="cleanup_pending",
+                        residue=residue,
+                        retry=retry_command,
+                    ) from primary_error
     except BaseException as exc:
         primary_error = exc
         if isinstance(exc, ConfigurationError):
@@ -943,39 +1094,7 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
             raise ConfigurationError(f"configuration failed and was rolled back: {exc}") from exc
         raise
     finally:
-        cleanup_errors: list[str] = []
-        if staging_fd is not None:
-            os.close(staging_fd)
-        if staging_name is not None:
-            try:
-                remove_tree_at(
-                    parent_handle.fd,
-                    staging_name,
-                    expected_metadata=staging_metadata,
-                )
-            except (OSError, SafeFilesystemError) as exc:
-                cleanup_errors.append(f"staging residue {parent_handle.path / staging_name}: {exc}")
-        if not completed:
-            try:
-                cleanup_created_directories(parent_handle.created)
-            except (OSError, SafeFilesystemError) as exc:
-                cleanup_errors.append(f"created parent cleanup: {exc}")
-                close_created_directories(parent_handle.created)
-        else:
-            close_created_directories(parent_handle.created)
         os.close(parent_handle.fd)
-        if cleanup_errors:
-            detail = "; ".join(cleanup_errors)
-            retry = next(
-                (part.split(":", 1)[0].removeprefix("staging residue ") for part in cleanup_errors if part.startswith("staging residue ")),
-                None,
-            )
-            message = f"configuration cleanup is incomplete: {detail}"
-            if retry:
-                message += f". Retry with {_cleanup_retry_hint(Path(retry), staging_metadata)}"
-            if primary_error is not None:
-                raise ConfigurationError(f"{primary_error}; {message}") from primary_error
-            raise ConfigurationError(message)
 
 
 def _self_test() -> None:
@@ -1081,6 +1200,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2 if args.json else None, sort_keys=True))
         return 0
     except (ConfigurationError, OSError, SafeFilesystemError) as exc:
+        if isinstance(exc, ConfigurationError) and getattr(args, "json", False):
+            print(json.dumps(exc.as_dict(), indent=2, sort_keys=True), file=sys.stderr)
+            return 1
         print(f"setup-pstack configuration failed: {exc}", file=sys.stderr)
         return 1
 

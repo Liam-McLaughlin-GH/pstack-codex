@@ -219,6 +219,40 @@ class SetupPstackBehaviorTests(unittest.TestCase):
                 module.atomic_rename_noreplace_at = original_publish
             self.assertFalse((root / "new-root").exists())
 
+    def test_installer_rollback_reports_a_replaced_created_parent(self) -> None:
+        module = load_module(INSTALLER, "install_for_created_parent_cleanup_test")
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-install-created-parent-cleanup-test-") as temporary:
+            root = Path(temporary)
+            source = root / "source" / "setup-pstack"
+            write_skill(source)
+            destination = root / "new-root" / ".agents" / "skills"
+            original_publish = module.atomic_rename_noreplace_at
+            original_cleanup = module.cleanup_created_directories
+
+            def fail_publication(parent_fd: int, source_name: str, target_name: str) -> None:
+                raise OSError("injected publication failure")
+
+            def replace_created_parent(created: list[object]) -> None:
+                entry = next(item for item in created if getattr(item, "name") == "skills")
+                original_path = entry.path
+                os.rename(original_path, root / "original-skills")
+                original_path.mkdir()
+                (original_path / "operator.txt").write_text("keep me\n", encoding="utf-8")
+                original_cleanup(created)
+
+            module.atomic_rename_noreplace_at = fail_publication
+            module.cleanup_created_directories = replace_created_parent
+            try:
+                with self.assertRaises(module.InstallError) as raised:
+                    module.apply_install(source, destination)
+            finally:
+                module.atomic_rename_noreplace_at = original_publish
+                module.cleanup_created_directories = original_cleanup
+            self.assertEqual(raised.exception.status, "cleanup_pending")
+            self.assertIn("created parent cleanup", str(raised.exception))
+            self.assertEqual((destination / "operator.txt").read_text(encoding="utf-8"), "keep me\n")
+            self.assertTrue((root / "original-skills").is_dir())
+
     def test_installer_rollback_reports_identity_bound_cleanup_receipt(self) -> None:
         module = load_module(INSTALLER, "install_for_cleanup_receipt_test")
         with tempfile.TemporaryDirectory(prefix="setup-pstack-install-cleanup-receipt-test-") as temporary:
@@ -592,6 +626,41 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertEqual((agents / "operator.txt").read_text(encoding="utf-8"), "keep me\n")
             self.assertIn('model_reasoning_effort = "xhigh"', (root / "published-generation" / "pstack-feature.toml").read_text(encoding="utf-8"))
 
+    def test_configuration_does_not_report_published_after_the_final_root_check_is_raced(self) -> None:
+        module = load_module(CONFIGURER, "configure_for_final_root_check_race_test")
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-config-final-root-race-test-") as temporary:
+            root = Path(temporary)
+            models = {"codex-test": module.Model("codex-test", ("low", "medium", "high", "xhigh"))}
+            agents = root / ".codex" / "agents"
+            initial = module.build_plan(models, agents, budget="medium", default_model="codex-test")
+            module.apply_plan(initial, agents)
+            replacement = module.build_plan(models, agents, budget="large")
+            competitor = root / "competitor"
+            competitor.mkdir()
+            (competitor / "operator.txt").write_text("keep me\n", encoding="utf-8")
+            original_state = module._publication_state
+            published_checks = 0
+
+            def swap_after_last_check(*args: object, **kwargs: object):
+                nonlocal published_checks
+                outcome = original_state(*args, **kwargs)
+                if outcome.status == "published":
+                    published_checks += 1
+                    if published_checks == 2:
+                        os.rename(agents, root / "published-generation")
+                        os.rename(competitor, agents)
+                return outcome
+
+            module._publication_state = swap_after_last_check
+            try:
+                outcome = module.apply_plan(replacement, agents, allow_replace=True)
+            finally:
+                module._publication_state = original_state
+            self.assertGreaterEqual(published_checks, 2)
+            self.assertNotEqual(outcome.status, "published")
+            self.assertEqual((agents / "operator.txt").read_text(encoding="utf-8"), "keep me\n")
+            self.assertIn('model_reasoning_effort = "xhigh"', (root / "published-generation" / "pstack-feature.toml").read_text(encoding="utf-8"))
+
     def test_configuration_refuses_a_live_root_state_change_before_reporting_published(self) -> None:
         module = load_module(CONFIGURER, "configure_for_final_state_check_test")
         with tempfile.TemporaryDirectory(prefix="setup-pstack-config-final-state-test-") as temporary:
@@ -859,6 +928,32 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertEqual((residue / "operator.txt").read_text(encoding="utf-8"), "keep me\n")
             self.assertEqual((root / "original-residue" / "expected.txt").read_text(encoding="utf-8"), "expected\n")
 
+    def test_configuration_cleanup_failure_has_status_and_retry_command(self) -> None:
+        module = load_module(CONFIGURER, "configure_for_cleanup_status_test")
+        with tempfile.TemporaryDirectory(prefix="setup-pstack-config-cleanup-status-test-") as temporary:
+            root = Path(temporary)
+            parent = root / "parent"
+            parent.mkdir()
+            residue = parent / ".pstack-agents-old-test"
+            residue.mkdir()
+            (residue / "expected.txt").write_text("expected\n", encoding="utf-8")
+            original_remove = module.remove_tree_at
+
+            def fail_cleanup(parent_fd: int, name: str, **kwargs: object) -> None:
+                raise OSError("injected cleanup failure")
+
+            module.remove_tree_at = fail_cleanup
+            try:
+                with self.assertRaises(module.ConfigurationError) as raised:
+                    module._cleanup_residue(residue)
+            finally:
+                module.remove_tree_at = original_remove
+            self.assertEqual(raised.exception.status, "cleanup_pending")
+            self.assertEqual(raised.exception.residue, module.canonical_path(residue))
+            self.assertIn("configure.py cleanup --residue", raised.exception.retry or "")
+            self.assertIn("--expected-dev", raised.exception.retry or "")
+            self.assertTrue((residue / "expected.txt").is_file())
+
     def test_configuration_updates_budget_and_default_without_losing_reviewed_choices(self) -> None:
         with tempfile.TemporaryDirectory(prefix="setup-pstack-config-cli-test-") as temporary:
             root = Path(temporary)
@@ -1053,6 +1148,59 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertEqual({item["status"] for item in alias_majority_agents}, {"unchanged"})
             self.assertEqual({item["model"] for item in alias_majority_agents}, {None})
             self.assertEqual({item["effort"] for item in alias_majority_agents}, {None})
+
+            majority_agents = root / ".codex" / "majority-agents"
+            majority_role_args: list[str] = []
+            for role in (
+                "feature",
+                "refactoring",
+                "bug-fix",
+                "perf-issue",
+                "hillclimb",
+                "judgment-and-prose",
+                "hardest-tasks",
+                "how-explorer",
+                "how-explainer",
+            ):
+                majority_role_args.extend(("--role", f"{role}=inherit-parent"))
+            majority_apply = run_script(
+                CONFIGURER,
+                "apply",
+                "--catalog",
+                str(catalog),
+                "--agents-root",
+                str(majority_agents),
+                "--budget",
+                "medium",
+                "--default-model",
+                "codex-test",
+                *majority_role_args,
+                "--json",
+            )
+            self.assertEqual(majority_apply.returncode, 0, majority_apply.stderr)
+            majority_default_change = run_script(
+                CONFIGURER,
+                "preview",
+                "--catalog",
+                str(catalog),
+                "--agents-root",
+                str(majority_agents),
+                "--budget",
+                "medium",
+                "--default-model",
+                "codex-new",
+                "--json",
+            )
+            self.assertEqual(majority_default_change.returncode, 0, majority_default_change.stderr)
+            majority_changed_agents = json.loads(majority_default_change.stdout)["agents"]
+            self.assertEqual(
+                {item["model"] for item in majority_changed_agents if item["role"] in {"feature", "refactoring", "bug-fix"}},
+                {None},
+            )
+            self.assertEqual(
+                next(item["model"] for item in majority_changed_agents if item["role"] == "why-investigators"),
+                "codex-new",
+            )
 
             rejected_upstream_role = run_script(
                 CONFIGURER,
@@ -1294,6 +1442,10 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             mjs_helper.write_text("from cursor_tools import Task  // UNSUPPORTED-SEAM: Cursor Task\nTask(prompt)  // UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")
             extensionless_helper.write_text("from cursor_tools import Task  # UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")
             self.assertEqual(module.verify_port(root, run_helpers=False), [])
+
+            helper.write_text("from cursor_tools \\\n    import Task,\n", encoding="utf-8")
+            continued_module_import_errors = module.verify_port(root, run_helpers=False)
+            self.assertTrue(any("Cursor Task call" in error for error in continued_module_import_errors))
 
             helper.write_text("result = Task(prompt, model=\"grok\")  # UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")
             mjs_helper.write_text("from cursor_tools import Task  // UNSUPPORTED-SEAM: Cursor Task\nTask(prompt)  // UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")
