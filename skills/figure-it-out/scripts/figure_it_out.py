@@ -323,19 +323,42 @@ def _scope_action_reason(scope: Mapping[str, Any], action: Any, target: Any) -> 
         if ".." in PurePosixPath(target).parts:
             return "target escapes the declared scope"
 
-    if action in scope["out_of_scope_actions"]:
+    if action in scope.get("out_of_scope_actions", []):
         return f"action {action!r} is explicitly out of scope"
     if action not in scope["allowed_actions"]:
         return f"action {action!r} is not declared in allowed_actions"
     if target_provided and isinstance(target, str):
         normalized = str(PurePosixPath(target))
-        if scope["allowed_paths"] and not any(
+        if scope.get("allowed_paths", []) and not any(
             normalized == prefix[:-1] or normalized.startswith(prefix) for prefix in scope["allowed_paths"]
         ):
             return "target is outside scope.allowed_paths"
-    elif scope["allowed_paths"] and action not in scope.get("logical_actions", []):
+    elif scope.get("allowed_paths", []) and action not in scope.get("logical_actions", []):
         return "a target is required for this action in a path-constrained scope"
     return None
+
+
+def _sanitize_refusal_target(target: Any) -> str | None:
+    """Return only a safe local target representation for refusal records."""
+
+    if target is None:
+        return None
+    if not isinstance(target, str):
+        return "<invalid-target>"
+    if (
+        not target
+        or len(target) > 500
+        or any(unicodedata.category(char) in {"Cc", "Cf"} for char in target)
+        or target != target.strip()
+        or "\\" in target
+        or target.startswith(("/", "~", "//"))
+        or re.match(r"^[A-Za-z]:", target)
+        or URI_SCHEME.match(target)
+        or "@" in target
+        or ".." in PurePosixPath(target).parts
+    ):
+        return "<invalid-target>"
+    return target
 
 
 def _phase_spec(value: Any, index: int) -> dict[str, Any]:
@@ -381,21 +404,21 @@ def validate_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     for action in allowed_actions:
         if not SAFE_ACTION.fullmatch(action):
             raise PlanError(f"scope.allowed_actions contains invalid action {action!r}")
-    allowed_paths = scope.get("allowed_paths", [])
+    allowed_paths = scope["allowed_paths"] if "allowed_paths" in scope else []
     if not isinstance(allowed_paths, list):
         raise PlanError("scope.allowed_paths must be a list")
     normalized_paths: list[str] = []
     for path in allowed_paths:
         path = _relative_path(path, "scope.allowed_paths[]")
         normalized_paths.append(path.rstrip("/") + "/")
-    logical_actions = scope.get("logical_actions", [])
+    logical_actions = scope["logical_actions"] if "logical_actions" in scope else []
     logical_actions = _string_list(logical_actions, "scope.logical_actions", allow_empty=True)
     for action in logical_actions:
         if not SAFE_ACTION.fullmatch(action):
             raise PlanError(f"scope.logical_actions contains invalid action {action!r}")
     if not set(logical_actions).issubset(allowed_actions):
         raise PlanError("scope.logical_actions must be a subset of scope.allowed_actions")
-    out_of_scope_actions = scope.get("out_of_scope_actions") or []
+    out_of_scope_actions = scope["out_of_scope_actions"] if "out_of_scope_actions" in scope else []
     out_of_scope_actions = _string_list(out_of_scope_actions, "scope.out_of_scope_actions", allow_empty=True)
     for action in out_of_scope_actions:
         if not SAFE_ACTION.fullmatch(action):
@@ -596,6 +619,7 @@ def _validate_lifecycle_graph_v2(
     latest_blocker: Mapping[str, Any] | None = None
     last_replacement: dict[str, Mapping[str, Any]] = {}
     seen_replans: list[int] = []
+    replan_event_order: list[int] = []
     run_status = "planned"
     resume_count = 0
     expected_next_action = f"start phase {phase_ids[0]}"
@@ -695,8 +719,11 @@ def _validate_lifecycle_graph_v2(
             expected_overflow = decision_row_positions[sequence] >= validated_plan["limits"]["max_decisions"]
             if overflow != expected_overflow:
                 fail(f"events[{index}] has an invalid decision overflow flag")
-        elif row is not None or not overflow or event_name not in {"action_refused", "blocked"}:
-            fail(f"events[{index}] has an unaccounted embedded decision")
+        else:
+            if row is not None or not overflow or event_name not in {"action_refused", "blocked"}:
+                fail(f"events[{index}] has an unaccounted embedded decision")
+            if len(state["decisions"]) <= validated_plan["limits"]["max_decisions"]:
+                fail(f"events[{index}] claims decision overflow without capacity pressure")
         return decision
 
     for index, event in enumerate(state["events"]):
@@ -732,6 +759,8 @@ def _validate_lifecycle_graph_v2(
                 fail(f"events[{index}] refusal decision does not match the refusal")
             if decision["phase"] != (current_phase() or "run"):
                 fail(f"events[{index}] refusal decision phase does not match the run")
+            if event.get("target") is not None and event["target"] != _sanitize_refusal_target(event["target"]):
+                fail(f"events[{index}] refusal target is not sanitized")
             expected_action = action if SAFE_ACTION.fullmatch(action) else "invalid-action"
             if decision["decision"] != f"refused action {expected_action}":
                 fail(f"events[{index}] refusal decision does not match the action")
@@ -868,6 +897,7 @@ def _validate_lifecycle_graph_v2(
             run_status = "planned"
             last_replacement[phase_id] = replan["replacement"]
             seen_replans.append(number)
+            replan_event_order.append(event["sequence"])
             next_replan_number += 1
             expected_next_action = f"start replanned phase {phase_id}"
             continue
@@ -987,11 +1017,15 @@ def _validate_lifecycle_graph_v2(
         fail("decision rows do not match decision-bearing events in append order")
     if len(checkpoint_event_order) != len(checkpoint_by_id) or set(checkpoint_event_order) != set(checkpoint_by_id):
         fail("checkpoint rows and checkpoint events are not a one-to-one set")
+    if checkpoint_event_order != [checkpoint["id"] for checkpoint in state["checkpoints"]]:
+        fail("checkpoint rows do not match checkpoint events in append order")
     for phase_id in phase_ids:
         expected_refs = [checkpoint_id for checkpoint_id in checkpoint_event_order if checkpoint_by_id[checkpoint_id]["phase"] == phase_id]
         if phase_by_id[phase_id]["checkpoints"] != expected_refs:
             fail(f"phase {phase_id} checkpoint references do not match checkpoint events")
     if seen_replans != [replan["number"] for replan in state["replans"]]:
+        fail("replan rows do not match replan events in append order")
+    if replan_event_order != [replan["event_sequence"] for replan in state["replans"]]:
         fail("replan rows do not match replan events in append order")
 
     if run_status != state["status"]:
@@ -1442,6 +1476,46 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
     _validate_lifecycle_graph_v2(state, validated_plan, phases, checkpoint_by_id)
 
 
+def _migrate_schema_1_evidence(value: Any, field: str) -> list[Any]:
+    if isinstance(value, str):
+        values = [value]
+    elif isinstance(value, list):
+        values = value
+    else:
+        raise StateError(f"invalid state: schema-1 {field} must be a non-empty list")
+    if not values:
+        raise StateError(f"invalid state: schema-1 {field} must be a non-empty list")
+
+    normalized: list[Any] = []
+    for index, item in enumerate(values):
+        if isinstance(item, Mapping):
+            try:
+                normalized.append(_structured_evidence(item, field, index))
+            except (WorkflowError, TypeError, ValueError, KeyError, AttributeError) as exc:
+                raise StateError(f"invalid state: schema-1 {field}[{index}] is invalid: {exc}") from exc
+            continue
+        if not isinstance(item, str) or not item.strip() or len(item.strip()) > MAX_TEXT:
+            raise StateError(f"invalid state: schema-1 {field}[{index}] must be a non-empty string")
+        text = item.strip()
+        if _is_bounded_reference(text):
+            normalized.append(text)
+            continue
+        detail = "".join(
+            char for char in text if unicodedata.category(char) not in {"Cc", "Cf"}
+        )[:1000].strip()
+        normalized.append(
+            {
+                "kind": "reference",
+                "ref": f"legacy-evidence-{index + 1}",
+                "detail": detail or "legacy evidence",
+            }
+        )
+    try:
+        return _evidence(normalized, field)
+    except (WorkflowError, TypeError, ValueError, KeyError, AttributeError) as exc:
+        raise StateError(f"invalid state: schema-1 {field} is invalid: {exc}") from exc
+
+
 def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
     """Upgrade a schema-1 artifact into the explicitly bound schema-2 form."""
 
@@ -1463,8 +1537,8 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
     if not isinstance(events, list):
         raise StateError("invalid state: schema-1 events must be a list")
     phases = migrated.get("phases")
-    if not isinstance(phases, list):
-        raise StateError("invalid state: schema-1 phases must be a list")
+    if not isinstance(phases, list) or not phases:
+        raise StateError("invalid state: schema-1 phases must be a non-empty list")
     checkpoints = migrated.get("checkpoints")
     if not isinstance(checkpoints, list):
         raise StateError("invalid state: schema-1 checkpoints must be a list")
@@ -1477,21 +1551,105 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
     if any(not isinstance(item, Mapping) for item in legacy_decisions):
         raise StateError("invalid state: schema-1 decision must be an object")
     legacy_decisions = [deepcopy(dict(item)) for item in legacy_decisions]
-    checkpoint_by_id = {
-        checkpoint.get("id"): checkpoint
-        for checkpoint in checkpoints
-        if isinstance(checkpoint, Mapping) and checkpoint.get("id")
-    }
-    replan_by_number = {
-        replan.get("number"): replan
-        for replan in replans
-        if isinstance(replan, Mapping) and replan.get("number")
-    }
-    phase_by_id = {
-        phase.get("id"): phase
-        for phase in phases
-        if isinstance(phase, Mapping) and phase.get("id")
-    }
+
+    phase_by_id: dict[str, dict[str, Any]] = {}
+    for index, phase in enumerate(phases):
+        if not isinstance(phase, Mapping):
+            raise StateError(f"invalid state: schema-1 phases[{index}] must be an object")
+        phase_id = phase.get("id")
+        if not isinstance(phase_id, str) or not phase_id:
+            raise StateError(f"invalid state: schema-1 phases[{index}].id must be a string")
+        if phase_id in phase_by_id:
+            raise StateError(f"invalid state: schema-1 phases[{index}].id is duplicated")
+        if not isinstance(phase.get("checkpoints"), list):
+            raise StateError(f"invalid state: schema-1 phases[{index}].checkpoints must be a list")
+        phase_by_id[phase_id] = phase  # type: ignore[assignment]
+        for nested_field in ("verification_result", "failure"):
+            nested = phase.get(nested_field)
+            if isinstance(nested, dict) and "evidence" in nested:
+                nested["evidence"] = _migrate_schema_1_evidence(
+                    nested["evidence"], f"phases[{index}].{nested_field}.evidence"
+                )
+
+    checkpoint_by_id: dict[str, dict[str, Any]] = {}
+    for index, checkpoint in enumerate(checkpoints):
+        if not isinstance(checkpoint, Mapping):
+            raise StateError(f"invalid state: schema-1 checkpoints[{index}] must be an object")
+        checkpoint_id = checkpoint.get("id")
+        checkpoint_phase = checkpoint.get("phase")
+        if not isinstance(checkpoint_id, str) or not checkpoint_id:
+            raise StateError(f"invalid state: schema-1 checkpoints[{index}].id must be a string")
+        if checkpoint_id in checkpoint_by_id:
+            raise StateError(f"invalid state: schema-1 checkpoints[{index}].id is duplicated")
+        if not isinstance(checkpoint_phase, str) or checkpoint_phase not in phase_by_id:
+            raise StateError(f"invalid state: schema-1 checkpoints[{index}].phase is invalid")
+        if "evidence" in checkpoint:
+            checkpoint["evidence"] = _migrate_schema_1_evidence(
+                checkpoint["evidence"], f"checkpoints[{index}].evidence"
+            )
+        checkpoint_by_id[checkpoint_id] = checkpoint  # type: ignore[assignment]
+
+    replan_by_number: dict[int, dict[str, Any]] = {}
+    for index, replan in enumerate(replans):
+        if not isinstance(replan, Mapping):
+            raise StateError(f"invalid state: schema-1 replans[{index}] must be an object")
+        number = replan.get("number")
+        phase_id = replan.get("phase")
+        if isinstance(number, bool) or not isinstance(number, int) or number < 1:
+            raise StateError(f"invalid state: schema-1 replans[{index}].number must be positive")
+        if number in replan_by_number:
+            raise StateError(f"invalid state: schema-1 replans[{index}].number is duplicated")
+        if not isinstance(phase_id, str) or phase_id not in phase_by_id:
+            raise StateError(f"invalid state: schema-1 replans[{index}].phase is invalid")
+        if "evidence" in replan:
+            replan["evidence"] = _migrate_schema_1_evidence(
+                replan["evidence"], f"replans[{index}].evidence"
+            )
+        replan_by_number[number] = replan  # type: ignore[assignment]
+
+    predicate_results = migrated.get("predicate_results")
+    if not isinstance(predicate_results, Mapping):
+        raise StateError("invalid state: schema-1 predicate_results must be an object")
+    migrated["predicate_results"] = deepcopy(dict(predicate_results))
+    for check_id, result in migrated["predicate_results"].items():
+        if not isinstance(check_id, str):
+            raise StateError("invalid state: schema-1 predicate result ids must be strings")
+        if result is None:
+            continue
+        if not isinstance(result, Mapping):
+            raise StateError(f"invalid state: schema-1 predicate_results[{check_id}] must be an object")
+        result = deepcopy(dict(result))
+        if "evidence" in result:
+            result["evidence"] = _migrate_schema_1_evidence(
+                result["evidence"], f"predicate_results[{check_id}].evidence"
+            )
+        if "status" not in result and isinstance(result.get("passed"), bool):
+            result["status"] = "verified" if result["passed"] else "failed"
+        migrated["predicate_results"][check_id] = result
+
+    for index, decision in enumerate(legacy_decisions):
+        if "evidence" in decision:
+            decision["evidence"] = _migrate_schema_1_evidence(
+                decision["evidence"], f"decisions[{index}].evidence"
+            )
+
+    blocker = migrated.get("blocker")
+    if blocker is not None and not isinstance(blocker, Mapping):
+        raise StateError("invalid state: schema-1 blocker must be an object or null")
+    if isinstance(blocker, dict) and "evidence" in blocker:
+        blocker["evidence"] = _migrate_schema_1_evidence(blocker["evidence"], "blocker.evidence")
+    terminal = migrated.get("terminal")
+    if terminal is not None and not isinstance(terminal, Mapping):
+        raise StateError("invalid state: schema-1 terminal must be an object or null")
+    if isinstance(terminal, dict) and isinstance(terminal.get("checks"), Mapping):
+        terminal["checks"] = deepcopy(dict(terminal["checks"]))
+        for check_id, result in terminal["checks"].items():
+            if isinstance(result, dict) and "evidence" in result:
+                result["evidence"] = _migrate_schema_1_evidence(
+                    result["evidence"], f"terminal.checks[{check_id}].evidence"
+                )
+            if isinstance(result, dict) and "status" not in result and isinstance(result.get("passed"), bool):
+                result["status"] = "verified" if result["passed"] else "failed"
 
     # Schema 1 could omit reverse phase checkpoint references after a replan.
     # Restore those references from the authoritative global rows before the
@@ -1502,6 +1660,24 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
         phase = phase_by_id.get(checkpoint.get("phase"))
         if isinstance(phase, dict) and checkpoint.get("id") not in phase.setdefault("checkpoints", []):
             phase["checkpoints"].append(checkpoint["id"])
+
+    for index, replan in enumerate(replans):
+        replacement = replan.get("replacement")
+        if not isinstance(replacement, Mapping):
+            raise StateError(f"invalid state: schema-1 replans[{index}].replacement must be an object")
+        try:
+            replacement_spec = _phase_spec(replacement, index)
+        except (WorkflowError, TypeError, ValueError, KeyError, AttributeError) as exc:
+            phase = phase_by_id[replan["phase"]]
+            if set(replacement) != {"id", "method"} or replacement.get("id") != phase.get("verification", {}).get("id"):
+                raise StateError(f"invalid state: schema-1 replans[{index}].replacement is invalid: {exc}") from exc
+            try:
+                replacement_spec = _phase_spec(phase, index)
+            except (WorkflowError, TypeError, ValueError, KeyError, AttributeError) as phase_exc:
+                raise StateError(f"invalid state: schema-1 replans[{index}].replacement is invalid: {phase_exc}") from phase_exc
+        if replacement_spec["id"] != replan["phase"]:
+            raise StateError(f"invalid state: schema-1 replans[{index}].replacement id does not match the phase")
+        replan["replacement"] = replacement_spec
 
     def make_decision(
         phase: str,
@@ -1514,6 +1690,7 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
         reason: str | None = None,
         next_action: str | None = None,
     ) -> dict[str, Any]:
+        evidence = _migrate_schema_1_evidence(evidence, "decision.evidence")
         record: dict[str, Any] = {
             "at": _now(),
             "phase": phase,
@@ -1544,8 +1721,25 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                 return decision, index
             if event_name == "predicate_recorded" and decision.get("phase") == "run" and decision.get("decision") == f"terminal check {event.get('check_id')}":
                 return decision, index
+            if event_name == "blocked" and decision.get("decision") == f"blocked: {event.get('reason')}" and decision.get("result") == "blocked":
+                blocker_decision = deepcopy(decision)
+                blocker_decision["status"] = "blocked"
+                blocker_decision["reason"] = event.get("reason", "legacy blocker")
+                blocker_decision["next_action"] = event.get("next_action", "resolve the recorded blocker")
+                return blocker_decision, index
             if event_name == "blocked" and decision.get("status") == "blocked" and decision.get("phase") == phase:
                 return decision, index
+            if event_name == "action_refused":
+                action = event.get("action", "invalid-action")
+                action_reference = action if isinstance(action, str) and SAFE_ACTION.fullmatch(action) else "invalid-action"
+                if decision.get("decision") == f"refused action {action_reference}" and decision.get("result") == "blocked":
+                    refusal = deepcopy(decision)
+                    refusal["status"] = "refused"
+                    refusal["reason"] = event.get("reason", "legacy refusal")
+                    refusal["next_action"] = event.get(
+                        "next_action", "choose a declared local action or replan with owner approval"
+                    )
+                    return refusal, index
             if event_name == "action_refused" and decision.get("status") == "refused" and decision.get("phase") == phase:
                 return decision, index
             if event_name == "action_refused" and decision.get("status") == "refused":
@@ -1560,7 +1754,10 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
     def event_decision(event: dict[str, Any], used: set[int]) -> tuple[dict[str, Any], bool]:
         event_name = event.get("event")
         if isinstance(event.get("decision"), Mapping):
-            return deepcopy(dict(event["decision"])), False
+            record = deepcopy(dict(event["decision"]))
+            if "evidence" in record:
+                record["evidence"] = _migrate_schema_1_evidence(record["evidence"], "event.decision.evidence")
+            return record, False
         record, index = matching_decision(event, used)
         if record is not None and index is not None:
             used.add(index)
@@ -1601,34 +1798,104 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             raise StateError("invalid state: schema-1 event must be an object")
         event = deepcopy(dict(original))
         event_name = event.get("event")
+        if event_name is None and event.get("status") == "refused" and "action" in event:
+            event_name = "action_refused"
+            event["event"] = event_name
+        if not isinstance(event_name, str) or event_name not in LIFECYCLE_EVENTS | AUDIT_EVENTS | DECISION_EVENTS:
+            raise StateError(f"invalid state: schema-1 event has an unsupported event {event_name!r}")
+        if "decision" in event and not isinstance(event["decision"], Mapping):
+            raise StateError("invalid state: schema-1 event decision must be an object")
+        for snapshot_field in (
+            "checkpoint_snapshot",
+            "verification_snapshot",
+            "failure_snapshot",
+            "interruption_snapshot",
+            "blocker_snapshot",
+            "result_snapshot",
+            "terminal_snapshot",
+        ):
+            snapshot = event.get(snapshot_field)
+            if snapshot is not None and not isinstance(snapshot, Mapping):
+                raise StateError(f"invalid state: schema-1 {snapshot_field} must be an object or null")
+            if isinstance(snapshot, dict) and "evidence" in snapshot:
+                snapshot["evidence"] = _migrate_schema_1_evidence(
+                    snapshot["evidence"], f"event.{snapshot_field}.evidence"
+                )
+            if snapshot_field == "terminal_snapshot" and isinstance(snapshot, dict) and isinstance(snapshot.get("checks"), Mapping):
+                snapshot["checks"] = deepcopy(dict(snapshot["checks"]))
+                for check_id, result in snapshot["checks"].items():
+                    if isinstance(result, dict) and "evidence" in result:
+                        result["evidence"] = _migrate_schema_1_evidence(
+                            result["evidence"], f"event.terminal_snapshot.checks[{check_id}].evidence"
+                        )
+        if event_name == "action_refused":
+            event["target"] = _sanitize_refusal_target(event.get("target"))
         if event_name == "checkpoint":
-            checkpoint = checkpoint_by_id.get(event.get("checkpoint"))
+            checkpoint_id = event.get("checkpoint")
+            if not isinstance(checkpoint_id, str):
+                raise StateError("invalid state: schema-1 checkpoint event has an invalid checkpoint id")
+            checkpoint = checkpoint_by_id.get(checkpoint_id)
             if checkpoint is None:
                 raise StateError("invalid state: schema-1 checkpoint event has no checkpoint row")
             event.setdefault("checkpoint_snapshot", deepcopy(checkpoint))
         elif event_name == "phase_passed":
-            phase = phase_by_id.get(event.get("phase"), {})
+            phase_id = event.get("phase")
+            if not isinstance(phase_id, str) or phase_id not in phase_by_id:
+                raise StateError("invalid state: schema-1 phase_passed event has an invalid phase")
+            phase = phase_by_id[phase_id]
             event.setdefault("output_snapshot", deepcopy(phase.get("output_value")))
             event.setdefault("verification_snapshot", deepcopy(phase.get("verification_result")))
         elif event_name == "phase_failed":
-            phase = phase_by_id.get(event.get("phase"), {})
-            event.setdefault("failure_snapshot", deepcopy(phase.get("failure")))
+            phase_id = event.get("phase")
+            if not isinstance(phase_id, str) or phase_id not in phase_by_id:
+                raise StateError("invalid state: schema-1 phase_failed event has an invalid phase")
+            phase = phase_by_id[phase_id]
+            if event.get("failure_snapshot") is None:
+                failure = phase.get("failure")
+                if failure is None:
+                    legacy_failure = next(
+                        (
+                            decision
+                            for decision in legacy_decisions
+                            if decision.get("phase") == phase_id
+                            and decision.get("decision") == f"failed: {event.get('reason')}"
+                        ),
+                        {},
+                    )
+                    event["failure_snapshot"] = {
+                        "reason": event.get("reason", "legacy phase failure"),
+                        "evidence": deepcopy(legacy_failure.get("evidence", ["check:legacy-phase-failure"])),
+                        "next_action": legacy_failure.get("next_action", f"replan phase {phase_id}"),
+                        "at": event.get("at", _now()),
+                    }
+                else:
+                    event["failure_snapshot"] = deepcopy(failure)
         elif event_name == "replanned":
-            replan = replan_by_number.get(event.get("number"))
+            number = event.get("number")
+            if isinstance(number, bool) or not isinstance(number, int):
+                raise StateError("invalid state: schema-1 replan event has an invalid number")
+            replan = replan_by_number.get(number)
             if replan is None:
                 raise StateError("invalid state: schema-1 replan event has no replan row")
             event.setdefault("replacement", deepcopy(replan.get("replacement")))
             event.setdefault("replan_snapshot", deepcopy(replan))
         elif event_name == "interrupted":
-            interruption = migrated.get("interruption") or {}
+            interruption = migrated.get("interruption")
+            if not isinstance(interruption, Mapping):
+                raise StateError("invalid state: schema-1 interruption must be an object")
             event.setdefault("reason", interruption.get("reason", "legacy interruption"))
             event.setdefault("interruption_snapshot", deepcopy(interruption))
         elif event_name == "blocked":
-            blocker = migrated.get("blocker") or {}
+            blocker = migrated.get("blocker")
+            if not isinstance(blocker, Mapping):
+                raise StateError("invalid state: schema-1 blocker must be an object")
             event.setdefault("next_action", blocker.get("next_action", "resolve the recorded blocker"))
             event.setdefault("blocker_snapshot", deepcopy(blocker))
         elif event_name == "predicate_recorded":
-            result = migrated.get("predicate_results", {}).get(event.get("check_id"))
+            check_id = event.get("check_id")
+            if not isinstance(check_id, str):
+                raise StateError("invalid state: schema-1 predicate event has an invalid check id")
+            result = migrated["predicate_results"].get(check_id)
             if isinstance(result, Mapping):
                 event.setdefault("result_snapshot", deepcopy(result))
         elif event_name == "completed":
@@ -1636,6 +1903,8 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
 
         if event_name in DECISION_EVENTS:
             record, listed = event_decision(event, used_legacy_decisions)
+            if event_name == "action_refused" and "phase" not in event:
+                event["phase"] = record.get("phase", "run")
             event["__migration_decision"] = record
             event["__migration_listed"] = listed
         normalized_events.append(event)
@@ -1701,6 +1970,11 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
     for check_id, result in migrated.get("predicate_results", {}).items():
         if isinstance(result, dict) and check_id in latest_predicate_events:
             result["event_sequence"] = latest_predicate_events[check_id]["event_sequence"]
+    if isinstance(terminal, dict) and isinstance(terminal.get("checks"), Mapping):
+        terminal["checks"] = deepcopy(migrated["predicate_results"])
+        for event in normalized_events:
+            if event.get("event") == "completed":
+                event["terminal_snapshot"] = deepcopy(terminal)
     migrated["events"] = normalized_events
     return migrated
 
@@ -1802,7 +2076,10 @@ class Workflow:
         if not isinstance(state, dict):
             raise StateError("state root must be an object")
         if state.get("schema_version") == LEGACY_SCHEMA_VERSION:
-            state = _migrate_schema_1_state(state)
+            try:
+                state = _migrate_schema_1_state(state)
+            except (WorkflowError, TypeError, ValueError, KeyError, AttributeError) as exc:
+                raise StateError(f"invalid state: schema-1 migration failed: {exc}") from exc
             workflow = cls(path, root, state)
             workflow._persist()
             return workflow
@@ -1990,7 +2267,13 @@ class Workflow:
         if phase["attempt"] >= limit:
             self._block_and_persist(
                 "phase attempt limit reached",
-                [f"phase:{phase['id']}:attempts={phase['attempt']}"],
+                [
+                    {
+                        "kind": "reference",
+                        "ref": f"phase:{phase['id']}",
+                        "detail": f"attempts exhausted at {phase['attempt']}",
+                    }
+                ],
                 f"replan phase {phase['id']} with an explicit new approach",
             )
             raise StateError("phase attempt limit reached; run is blocked")
@@ -2502,6 +2785,7 @@ class Workflow:
 
     def _refuse_action(self, action: str, target: str | None, reason: str) -> None:
         next_action = "choose a declared local action or replan with owner approval"
+        target = _sanitize_refusal_target(target)
         refusal = {
             "at": _now(),
             "status": "refused",
@@ -2541,13 +2825,7 @@ class Workflow:
             and not any(unicodedata.category(char) in {"Cc", "Cf"} for char in action)
             else "<invalid-action>"
         )
-        target_display: str | None
-        if not isinstance(target, str):
-            target_display = None if target is None else "<invalid-target>"
-        elif len(target) > 500 or any(unicodedata.category(char) in {"Cc", "Cf"} for char in target):
-            target_display = "<invalid-target>"
-        else:
-            target_display = target
+        target_display = _sanitize_refusal_target(target)
 
         if self.state["status"] in ACTION_REFUSAL_STATUSES:
             lifecycle_reasons = {
@@ -2558,7 +2836,7 @@ class Workflow:
             }
             self._refuse_action(action_value, target_display, lifecycle_reasons[self.state["status"]])
 
-        target_display = target if isinstance(target, str) else None
+        target_display = _sanitize_refusal_target(target)
         if target is not None and (
             not isinstance(target, str)
             or not target

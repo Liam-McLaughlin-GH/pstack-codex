@@ -26,7 +26,13 @@ sys.modules[spec.name] = figure_it_out
 spec.loader.exec_module(figure_it_out)
 
 
-def make_plan(*, phase_count: int = 2, max_checkpoints: int = 8, max_decisions: int = 32) -> dict:
+def make_plan(
+    *,
+    phase_count: int = 2,
+    max_attempts_per_phase: int = 2,
+    max_checkpoints: int = 8,
+    max_decisions: int = 32,
+) -> dict:
     phases = []
     for index in range(phase_count):
         phase_id = f"phase-{index + 1}"
@@ -58,7 +64,7 @@ def make_plan(*, phase_count: int = 2, max_checkpoints: int = 8, max_decisions: 
             "checks": ["focused-tests", "artifact-inspection"],
         },
         "limits": {
-            "max_attempts_per_phase": 2,
+            "max_attempts_per_phase": max_attempts_per_phase,
             "max_checkpoints": max_checkpoints,
             "max_replans": 2,
             "max_decisions": max_decisions,
@@ -73,6 +79,7 @@ class WorkflowBehaviorTests(unittest.TestCase):
         root: Path,
         *,
         phase_count: int = 2,
+        max_attempts_per_phase: int = 2,
         max_checkpoints: int = 8,
         max_decisions: int = 32,
     ):
@@ -80,6 +87,7 @@ class WorkflowBehaviorTests(unittest.TestCase):
             root / "run.json",
             make_plan(
                 phase_count=phase_count,
+                max_attempts_per_phase=max_attempts_per_phase,
                 max_checkpoints=max_checkpoints,
                 max_decisions=max_decisions,
             ),
@@ -230,6 +238,32 @@ class WorkflowBehaviorTests(unittest.TestCase):
             audit = workflow.export_audit(root / "checkpoint-audit.tsv").read_text(encoding="utf-8")
             self.assertIn("checkpoint limit reached", audit)
 
+    def test_attempt_budget_persists_a_valid_blocked_lifecycle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1, max_attempts_per_phase=1)
+            workflow.start_phase()
+            workflow.fail_phase("check disagreed", ["tests/failure.txt"], "replan the phase")
+            workflow.replan("change the bounded approach", ["tests/replan.txt"], "retry phase-1")
+
+            with self.assertRaises(figure_it_out.StateError):
+                workflow.start_phase()
+
+            persisted = figure_it_out.Workflow.load(root / "run.json", workspace_root=root)
+            self.assertEqual(persisted.state["status"], "blocked")
+            self.assertEqual(persisted.state["phases"][0]["status"], "blocked")
+            self.assertEqual(persisted.state["events"][-1]["event"], "blocked")
+            self.assertEqual(
+                persisted.state["blocker"]["evidence"],
+                [
+                    {
+                        "kind": "reference",
+                        "ref": "phase:phase-1",
+                        "detail": "attempts exhausted at 1",
+                    }
+                ],
+            )
+
     def test_out_of_scope_action_is_refused_and_recorded(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -330,6 +364,23 @@ class WorkflowBehaviorTests(unittest.TestCase):
                             for event in persisted.state["events"]
                         )
                     )
+
+    def test_stopped_refusal_sanitizes_unsafe_targets_before_persistence(self):
+        unsafe_targets = ["token@host", "https://example.test/result", "src/../outside.py"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            workflow.block("fixture unavailable", ["fixtures/missing.json"], "obtain the fixture")
+
+            for target in unsafe_targets:
+                with self.assertRaises(figure_it_out.ScopeRefusal) as context:
+                    workflow.guard_action("write", target)
+                self.assertEqual(context.exception.refusal["target"], "<invalid-target>")
+
+            persisted = figure_it_out.Workflow.load(root / "run.json", workspace_root=root)
+            refusal_events = [event for event in persisted.state["events"] if event["event"] == "action_refused"]
+            self.assertEqual([event["target"] for event in refusal_events], ["<invalid-target>"] * len(unsafe_targets))
+            self.assertTrue(all("@" not in json.dumps(event) for event in refusal_events))
 
     def test_completed_run_cannot_mutate_terminal_results(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -587,6 +638,26 @@ class WorkflowBehaviorTests(unittest.TestCase):
             self.assertEqual(workflow.guard_action("run-tests")["status"], "allowed")
             with self.assertRaises(figure_it_out.ScopeRefusal):
                 workflow.guard_action("write")
+
+    def test_optional_scope_fields_are_normalized_or_rejected_before_guard(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            scope = workflow.state["plan"]["scope"]
+            scope.pop("logical_actions")
+            scope.pop("out_of_scope_actions")
+            scope.pop("allowed_paths")
+            self.assertEqual(workflow.guard_action("write", "src/file.py")["status"], "allowed")
+
+            malformed = self.workflow(root / "malformed", phase_count=1)
+            malformed.state["plan"]["scope"]["out_of_scope_actions"] = {}
+            with self.assertRaises(figure_it_out.StateError):
+                malformed.guard_action("read", "src/file.py")
+
+            malformed.state["plan"]["scope"]["out_of_scope_actions"] = []
+            malformed.state["plan"]["scope"]["logical_actions"] = {"run-tests": True}
+            with self.assertRaises(figure_it_out.StateError):
+                malformed.guard_action("read", "src/file.py")
 
     def test_evidence_rejects_placeholders_and_terminal_nonpassing_states(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1021,6 +1092,13 @@ class WorkflowBehaviorTests(unittest.TestCase):
             self.assertEqual(audit_rows[2][2], "checkpoint: after decision")
             refusals = [row for row in audit_rows if row[2] == "refused action deploy"]
             self.assertEqual(len(refusals), 2)
+            expected_audit_decisions = []
+            for event in workflow.state["events"]:
+                if event["event"] == "checkpoint":
+                    expected_audit_decisions.append(f"checkpoint: {event['checkpoint_snapshot']['label']}")
+                elif event["event"] in figure_it_out.DECISION_EVENTS:
+                    expected_audit_decisions.append(event["decision"]["decision"])
+            self.assertEqual([row[2] for row in audit_rows[1:]], expected_audit_decisions)
             self.assertEqual(workflow.state["events"][-1]["decision_in_list"], False)
             self.assertEqual(
                 len([event for event in workflow.state["events"] if event["event"] == "action_refused"]),
@@ -1032,6 +1110,33 @@ class WorkflowBehaviorTests(unittest.TestCase):
             (root / "run.json").write_text(json.dumps(forged), encoding="utf-8")
             with self.assertRaises(figure_it_out.StateError):
                 figure_it_out.Workflow.load(root / "run.json", workspace_root=root)
+
+    def test_overflow_and_checkpoint_order_forgery_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            overflow = self.workflow(root / "overflow", phase_count=1, max_decisions=2)
+            with self.assertRaises(figure_it_out.ScopeRefusal):
+                overflow.guard_action("deploy", "production")
+            overflow_state_path = root / "overflow" / "run.json"
+            overflow_state = json.loads(overflow_state_path.read_text(encoding="utf-8"))
+            refusal_event = next(event for event in overflow_state["events"] if event["event"] == "action_refused")
+            overflow_state["decisions"] = []
+            refusal_event["decision_in_list"] = False
+            refusal_event["decision_overflow"] = True
+            overflow_state_path.write_text(json.dumps(overflow_state), encoding="utf-8")
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(overflow_state_path, workspace_root=root / "overflow")
+
+            checkpoints = self.workflow(root / "checkpoints", phase_count=1)
+            checkpoints.start_phase()
+            checkpoints.checkpoint("first", ["artifacts/first.txt"], "continue")
+            checkpoints.checkpoint("second", ["artifacts/second.txt"], "continue")
+            checkpoint_state_path = root / "checkpoints" / "run.json"
+            checkpoint_state = json.loads(checkpoint_state_path.read_text(encoding="utf-8"))
+            checkpoint_state["checkpoints"].reverse()
+            checkpoint_state_path.write_text(json.dumps(checkpoint_state), encoding="utf-8")
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(checkpoint_state_path, workspace_root=root / "checkpoints")
 
     def test_schema_one_state_is_explicitly_migrated_to_schema_two(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1066,6 +1171,111 @@ class WorkflowBehaviorTests(unittest.TestCase):
             self.assertEqual(persisted["schema_version"], 2)
             self.assertTrue(all("sequence" in event for event in persisted["events"]))
             self.assertTrue(all("event_sequence" in decision for decision in persisted["decisions"]))
+
+    def test_original_schema_one_shapes_migrate_and_malformed_nested_shapes_use_cli_errors(self):
+        def legacy_state(state):
+            legacy = deepcopy(state)
+            legacy["schema_version"] = 1
+            legacy["plan"]["schema_version"] = 1
+            legacy["plan"]["scope"].pop("logical_actions", None)
+            for event in legacy["events"]:
+                event.pop("sequence", None)
+                event.pop("decision", None)
+                event.pop("decision_in_list", None)
+                event.pop("decision_overflow", None)
+                for field in (
+                    "checkpoint_snapshot",
+                    "output_snapshot",
+                    "verification_snapshot",
+                    "failure_snapshot",
+                    "interruption_snapshot",
+                    "blocker_snapshot",
+                    "result_snapshot",
+                    "terminal_snapshot",
+                ):
+                    event.pop(field, None)
+            for decision in legacy["decisions"]:
+                decision.pop("event_sequence", None)
+                decision.pop("status", None)
+                decision.pop("reason", None)
+                decision.pop("next_action", None)
+            for result in legacy["predicate_results"].values():
+                if result is not None:
+                    result.pop("status", None)
+                    result.pop("event_sequence", None)
+            return legacy
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            replanned = self.workflow(root / "replanned", phase_count=1)
+            replanned.start_phase()
+            replanned.fail_phase("check disagreed", ["tests/failure.txt"], "retry the phase")
+            replanned.replan("change the bounded approach", ["tests/replan.txt"], "start again")
+            replan_state_path = root / "replanned" / "run.json"
+            replan_legacy = legacy_state(json.loads(replan_state_path.read_text(encoding="utf-8")))
+            replan_legacy["replans"][0]["replacement"] = replan_legacy["phases"][0]["verification"]
+            replan_state_path.write_text(json.dumps(replan_legacy), encoding="utf-8")
+            migrated_replan = figure_it_out.Workflow.load(replan_state_path, workspace_root=root / "replanned")
+            self.assertEqual(migrated_replan.state["status"], "planned")
+            self.assertEqual(
+                migrated_replan.state["replans"][0]["replacement"],
+                migrated_replan.state["plan"]["phases"][0],
+            )
+
+            refused = self.workflow(root / "refused", phase_count=1)
+            with self.assertRaises(figure_it_out.ScopeRefusal):
+                refused.guard_action("deploy", "token@host")
+            refusal_state_path = root / "refused" / "run.json"
+            refusal_legacy = legacy_state(json.loads(refusal_state_path.read_text(encoding="utf-8")))
+            refusal_event = refusal_legacy["events"][0]
+            refusal_event.pop("event", None)
+            refusal_event["target"] = "token@host"
+            refusal_decision = refusal_legacy["decisions"][0]
+            refusal_decision["evidence"] = ["scope:deploy", "target:token@host"]
+            refusal_legacy["decisions"] = [refusal_decision]
+            refusal_state_path.write_text(json.dumps(refusal_legacy), encoding="utf-8")
+            migrated_refusal = figure_it_out.Workflow.load(refusal_state_path, workspace_root=root / "refused")
+            self.assertEqual(migrated_refusal.state["events"][0]["event"], "action_refused")
+            self.assertEqual(migrated_refusal.state["events"][0]["target"], "<invalid-target>")
+            self.assertEqual(len(migrated_refusal.state["decisions"]), 1)
+
+            malformed_cases = {
+                "predicate-results": lambda state: state.update(predicate_results=[]),
+                "phase-checkpoints": lambda state: state["phases"][0].update(checkpoints={}),
+                "checkpoint-id": lambda state: state["events"].__setitem__(
+                    0, {"event": "checkpoint", "checkpoint": []}
+                ),
+            }
+            for name, mutate in malformed_cases.items():
+                with self.subTest(case=name):
+                    malformed = deepcopy(refusal_legacy)
+                    mutate(malformed)
+                    malformed_path = root / f"malformed-{name}.json"
+                    malformed_path.write_text(json.dumps(malformed), encoding="utf-8")
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            str(SCRIPT),
+                            "guard-action",
+                            "--state",
+                            str(malformed_path),
+                            "--workspace-root",
+                            str(root),
+                            "--action",
+                            "write",
+                            "--target",
+                            "src/file.py",
+                        ],
+                        cwd=ROOT,
+                        text=True,
+                        capture_output=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 2)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertTrue(json.loads(result.stderr)["error"])
+                    self.assertEqual(result.stdout, "")
 
     def test_persisted_allowed_actions_must_match_lifecycle_status(self):
         def failed(workflow):
