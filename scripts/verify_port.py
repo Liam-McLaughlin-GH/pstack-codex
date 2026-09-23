@@ -331,14 +331,23 @@ def parse_frontmatter(text: str) -> Frontmatter:
     return Frontmatter(fields, closing + 1)
 
 
-def required_frontmatter_errors(metadata: str) -> list[str]:
-    """Keep the small validation helper importable for skill-level tests."""
+_FRONTMATTER_HELPER = None
 
-    try:
-        parse_frontmatter(f"---\n{metadata.rstrip()}\n---\n")
-    except ValidationError as exc:
-        return [str(exc)]
-    return []
+
+def required_frontmatter_errors(metadata: str) -> list[str]:
+    """Keep the repository frontmatter helper importable for skill-level tests."""
+
+    global _FRONTMATTER_HELPER
+    if _FRONTMATTER_HELPER is None:
+        helper_path = ROOT / "scripts" / "skill_frontmatter.py"
+        helper_spec = importlib.util.spec_from_file_location("pstack_frontmatter_helper", helper_path)
+        if helper_spec is None or helper_spec.loader is None:
+            raise RuntimeError("could not load the shared frontmatter helper")
+        helper = importlib.util.module_from_spec(helper_spec)
+        sys.modules[helper_spec.name] = helper
+        helper_spec.loader.exec_module(helper)
+        _FRONTMATTER_HELPER = helper
+    return _FRONTMATTER_HELPER.required_frontmatter_errors(metadata)
 
 
 def _reference_label(label: str) -> str:
