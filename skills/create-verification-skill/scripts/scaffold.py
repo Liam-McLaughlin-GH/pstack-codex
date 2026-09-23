@@ -871,7 +871,7 @@ def _feature_markdown(feature: dict[str, Any], harness: str) -> str:
     return "\n".join(lines)
 
 
-def _write_file_at(parent_fd: int, name: str, text: str) -> None:
+def _write_file_at(parent_fd: int, name: str, text: str) -> tuple[int, int]:
     flags = (
         os.O_WRONLY
         | os.O_CREAT
@@ -888,8 +888,41 @@ def _write_file_at(parent_fd: int, name: str, text: str) -> None:
             if written <= 0:
                 raise OSError(errno.EIO, "short write")
             offset += written
+        identity = os.fstat(descriptor)
+        if not stat.S_ISREG(identity.st_mode):
+            raise ScaffoldError(f"generated file is not regular: {name}")
+        return identity.st_dev, identity.st_ino
+    except BaseException:
+        try:
+            os.unlink(name, dir_fd=parent_fd)
+        except OSError:
+            pass
+        raise
     finally:
         os.close(descriptor)
+
+
+def _record_created_file(
+    parent_fd: int,
+    name: str,
+    identity: tuple[int, int],
+    reservations: list[PublishedEntry] | None,
+) -> None:
+    """Retain an identity-bound reservation for a generated file."""
+
+    if reservations is None:
+        return
+    try:
+        reservation_parent_fd = os.dup(parent_fd)
+    except BaseException:
+        _native_unlink_at(
+            parent_fd,
+            name,
+            is_directory=False,
+            expected_identity=identity,
+        )
+        raise
+    reservations.append((reservation_parent_fd, name, identity[0], identity[1], False))
 
 
 def _write_tree(
@@ -908,20 +941,27 @@ def _write_tree(
     features_fd: int | None = None
     features_reservation: PublishedEntry | None = None
     try:
-        _write_file_at(root_fd, "SKILL.md", _skill_markdown(spec))
+        identity = _write_file_at(root_fd, "SKILL.md", _skill_markdown(spec))
+        _record_created_file(root_fd, "SKILL.md", identity, reservations)
         features_fd, _, features_reservation = _create_new_directory_with_reservation(
             root_fd,
             "features",
             "generated features directory",
             mode=0o700,
         )
-        _write_file_at(features_fd, "README.md", _index_markdown(spec))
+        if features_reservation is not None and reservations is not None:
+            reservations.append(features_reservation)
+            features_reservation = None
+        identity = _write_file_at(features_fd, "README.md", _index_markdown(spec))
+        _record_created_file(features_fd, "README.md", identity, reservations)
         for feature in spec["features"]:
-            _write_file_at(
+            feature_name = f"{feature['id']}.md"
+            identity = _write_file_at(
                 features_fd,
-                f"{feature['id']}.md",
+                feature_name,
                 _feature_markdown(feature, app["harness"]),
             )
+            _record_created_file(features_fd, feature_name, identity, reservations)
     finally:
         if features_reservation is not None:
             if reservations is not None:
@@ -1860,6 +1900,8 @@ def _bind_created_directory(
         identity = _descriptor_identity(descriptor, label, is_directory=True)
         if path_stat_error is not None:
             raise ScaffoldError(f"{label} identity could not be captured") from path_stat_error
+        if path_identity is None or identity != path_identity:
+            raise CollisionError(f"{label} changed before descriptor binding")
         reservation = (reservation_parent_fd, name, identity[0], identity[1], True)
         observed = _published_identity(
             parent_fd,
@@ -2113,6 +2155,12 @@ class _PrivateDirectory:
         # focused tests and callers while retaining the bound identity.
         yield self.name
         yield self.descriptor
+
+    def __len__(self) -> int:
+        return 2
+
+    def __getitem__(self, index: int) -> str | int:
+        return (self.name, self.descriptor)[index]
 
 
 def _create_private_directory(parent_fd: int) -> _PrivateDirectory:
@@ -2494,6 +2542,24 @@ def _remove_reserved_directory_tree(entry: PublishedEntry) -> bool:
             pass
 
 
+def _remove_reserved_empty_directory(entry: PublishedEntry) -> bool:
+    """Remove a reserved directory only after recorded children are gone."""
+
+    parent_fd, name, device, inode, is_directory = entry
+    try:
+        if not is_directory or device is None or inode is None:
+            return False
+        _remove_owned_empty_directory(parent_fd, name, device, inode)
+        return True
+    except (FileNotFoundError, NotADirectoryError, OSError, ScaffoldError):
+        return False
+    finally:
+        try:
+            os.close(parent_fd)
+        except OSError:
+            pass
+
+
 def _open_regular_descriptor(
     name: Path | str,
     label: str,
@@ -2528,6 +2594,7 @@ def _publish_entry_no_replace(
     destination_dir_fd: int,
     source_dir_fd: int | None = None,
     source_name: str | None = None,
+    source_metadata: os.stat_result | None = None,
     reservation_sink: list[PublishedEntry] | None = None,
 ) -> list[PublishedEntry]:
     """Publish one staged entry through a reserved directory descriptor."""
@@ -2548,14 +2615,17 @@ def _publish_entry_no_replace(
 
     if source_dir_fd is None:
         source_name = source.name
-        source_stat = os.lstat(source)
+        source_stat = source_metadata or os.lstat(source)
     else:
         if source_name is None:
             raise ScaffoldError(f"staging source name is missing: {source}")
-        try:
-            source_stat = os.stat(source_name, dir_fd=source_dir_fd, follow_symlinks=False)
-        except OSError as exc:
-            raise ScaffoldError(f"staging source cannot be inspected: {source}") from exc
+        if source_metadata is None:
+            try:
+                source_stat = os.stat(source_name, dir_fd=source_dir_fd, follow_symlinks=False)
+            except OSError as exc:
+                raise ScaffoldError(f"staging source cannot be inspected: {source}") from exc
+        else:
+            source_stat = source_metadata
     source_mode = source_stat.st_mode
     source_descriptor: int | None = None
     try:
@@ -2609,17 +2679,16 @@ def _publish_entry_no_replace(
     published: list[PublishedEntry] = []
 
     def record(entry: PublishedEntry) -> None:
-        published.append(entry)
         if reservation_sink is not None:
-            reservation_sink.append(
-                (
-                    os.dup(entry[0]),
-                    entry[1],
-                    entry[2],
-                    entry[3],
-                    entry[4],
-                )
+            outer_entry = (
+                os.dup(entry[0]),
+                entry[1],
+                entry[2],
+                entry[3],
+                entry[4],
             )
+            reservation_sink.append(outer_entry)
+        published.append(entry)
 
     if stat.S_ISDIR(source_mode):
         child_fd: int | None = None
@@ -2640,11 +2709,17 @@ def _publish_entry_no_replace(
         if child_fd is None or child_reservation is None:
             os.close(source_descriptor)
             raise ScaffoldError(f"published directory reservation is unavailable: {destination}")
-        record(child_reservation)
         try:
+            record(child_reservation)
             with os.scandir(source_descriptor) as entries:
-                child_names = sorted(entry.name for entry in entries)
-            for child_name in child_names:
+                child_entries = sorted(
+                    (
+                        entry.name,
+                        entry.stat(follow_symlinks=False),
+                    )
+                    for entry in entries
+                )
+            for child_name, child_metadata in child_entries:
                 child = source / child_name
                 published.extend(
                     _publish_entry_no_replace(
@@ -2653,6 +2728,7 @@ def _publish_entry_no_replace(
                         destination_dir_fd=child_fd,
                         source_dir_fd=source_descriptor,
                         source_name=child_name,
+                        source_metadata=child_metadata,
                         reservation_sink=reservation_sink,
                     )
                 )
@@ -2661,6 +2737,21 @@ def _publish_entry_no_replace(
             return published
         except Exception:
             _rollback_published(published)
+            if child_reservation is not None and child_reservation not in published:
+                try:
+                    _remove_owned_empty_directory(
+                        child_reservation[0],
+                        child_reservation[1],
+                        child_reservation[2],
+                        child_reservation[3],
+                    )
+                except (OSError, ScaffoldError):
+                    pass
+                finally:
+                    try:
+                        os.close(child_reservation[0])
+                    except OSError:
+                        pass
             raise
         finally:
             if child_fd is not None:
@@ -2674,18 +2765,22 @@ def _publish_entry_no_replace(
                 pass
     try:
         reservation_parent_fd = os.dup(destination_dir_fd)
+        temporary_name = _unique_private_name(destination_dir_fd, ".verify-publish-")
+        destination_reservation = (
+            reservation_parent_fd,
+            temporary_name,
+            source_identity[0],
+            source_identity[1],
+            False,
+        )
+        record(destination_reservation)
     except BaseException:
+        try:
+            os.close(reservation_parent_fd)
+        except OSError:
+            pass
         os.close(source_descriptor)
         raise
-    temporary_name = _unique_private_name(destination_dir_fd, ".verify-publish-")
-    destination_reservation = (
-        reservation_parent_fd,
-        temporary_name,
-        source_identity[0],
-        source_identity[1],
-        False,
-    )
-    record(destination_reservation)
 
     temporary_descriptor: int | None = None
     try:
@@ -2911,8 +3006,14 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
             raise ScaffoldError("staging directory descriptor is unavailable")
         _assert_path_matches_descriptor(staging, staging_fd, "staging directory")
         with os.scandir(staging_fd) as entries:
-            child_names = sorted(entry.name for entry in entries)
-        for child_name in child_names:
+            child_entries = sorted(
+                (
+                    entry.name,
+                    entry.stat(follow_symlinks=False),
+                )
+                for entry in entries
+            )
+        for child_name, child_metadata in child_entries:
             _assert_reserved_target_identity(
                 skills_parent_fd,
                 target.name,
@@ -2928,6 +3029,7 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
                 destination_dir_fd=target_fd,
                 source_dir_fd=staging_fd,
                 source_name=child_name,
+                source_metadata=child_metadata,
                 reservation_sink=published_entries,
             )
             _assert_reserved_target_identity(
@@ -2962,21 +3064,39 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
         created_parent_entries = []
         return target
     except Exception:
-        staging_cleanup_succeeded = True
+        staging_name_still_bound = False
         if staging_reservation is not None:
-            staging_cleanup_succeeded = _remove_reserved_directory_tree(staging_reservation)
-            staging_reservation = None
+            try:
+                current_staging = os.stat(
+                    staging_reservation[1],
+                    dir_fd=staging_reservation[0],
+                    follow_symlinks=False,
+                )
+                staging_name_still_bound = (
+                    (current_staging.st_dev, current_staging.st_ino)
+                    == (staging_reservation[2], staging_reservation[3])
+                )
+            except OSError:
+                staging_name_still_bound = False
         if staging_child_reservations:
-            if staging_cleanup_succeeded:
-                _rollback_published(staging_child_reservations)
+            # Remove only entries created by this run before attempting the
+            # staging root. Unknown competitors remain and make root cleanup
+            # fail closed.
+            if staging_name_still_bound:
+                _rollback_published(staging_child_reservations, recursive=False)
             else:
-                # The staging root moved away, so its child reservations refer
-                # to the detached owned tree. Close those handles without
-                # reacquiring names under the replacement root.
+                # The original staging root was moved away; preserve that
+                # detached tree and never reacquire the replacement by name.
                 _close_published(staging_child_reservations)
             staging_child_reservations = []
+        if staging_reservation is not None:
+            if staging_name_still_bound:
+                _remove_reserved_empty_directory(staging_reservation)
+            else:
+                _close_published([staging_reservation])
+            staging_reservation = None
         if target_reserved:
-            _rollback_published(published_entries)
+            _rollback_published(published_entries, recursive=False)
             if target_reservation is not None:
                 _remove_reserved_target(
                     target_reservation[0],

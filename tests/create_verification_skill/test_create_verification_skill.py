@@ -1200,6 +1200,111 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
                     self.assertFalse(target.exists())
                     self.assertFalse((project / ".agents").exists())
 
+    def test_new_directory_binding_rejects_a_replacement_after_path_stat(self) -> None:
+        for phase in ("staging", "target"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory(
+                prefix=f"create-verification-bind-race-{phase}-"
+            ) as temporary:
+                root = Path(temporary)
+                project = root / "project"
+                project.mkdir()
+                copy_fixture(project)
+                detached = root / f"detached-{phase}"
+                injected = False
+                original_open = scaffold_module._open_directory_descriptor
+
+                def replace_before_open(
+                    name: Path | str,
+                    label: str,
+                    *,
+                    dir_fd: int | None = None,
+                    collision: bool = False,
+                ) -> int:
+                    nonlocal injected
+                    if not injected and (
+                        (phase == "staging" and label == "staging directory")
+                        or (phase == "target" and label == "reserved target")
+                    ):
+                        injected = True
+                        live = project / ".agents" / "skills" / os.fspath(name)
+                        live.rename(detached)
+                        live.mkdir()
+                        (live / "competitor.txt").write_text("keep\n", encoding="utf-8")
+                    return original_open(name, label, dir_fd=dir_fd, collision=collision)
+
+                with mock.patch.object(
+                    scaffold_module,
+                    "_open_directory_descriptor",
+                    side_effect=replace_before_open,
+                ):
+                    with self.assertRaises(ScaffoldError):
+                        scaffold_module.scaffold(spec_for(), project)
+
+                self.assertTrue(injected)
+                live = project / ".agents" / "skills"
+                entry = next(live.glob(".verify-tiny-fixture.staging-*")) if phase == "staging" else live / "verify-tiny-fixture"
+                self.assertEqual((entry / "competitor.txt").read_text(encoding="utf-8"), "keep\n")
+                self.assertTrue(detached.is_dir())
+
+    def test_source_replacement_after_enumeration_is_not_published(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-source-enumeration-") as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            copy_fixture(project)
+            detached = root / "detached-source"
+            injected = False
+            original_publish = scaffold_module._publish_entry_no_replace
+
+            def replace_before_publish(*args: object, **kwargs: object) -> list[scaffold_module.PublishedEntry]:
+                nonlocal injected
+                source_name = kwargs.get("source_name")
+                if source_name == "SKILL.md" and not injected:
+                    injected = True
+                    staging = next((project / ".agents" / "skills").glob(".verify-tiny-fixture.staging-*"))
+                    source = staging / "SKILL.md"
+                    source.rename(detached)
+                    source.write_text("competitor\n", encoding="utf-8")
+                return original_publish(*args, **kwargs)
+
+            with mock.patch.object(
+                scaffold_module,
+                "_publish_entry_no_replace",
+                side_effect=replace_before_publish,
+            ):
+                with self.assertRaises(ScaffoldError):
+                    scaffold_module.scaffold(spec_for(), project)
+
+            self.assertTrue(injected)
+            self.assertFalse((project / ".agents" / "skills" / "verify-tiny-fixture").exists())
+            self.assertTrue(detached.is_file())
+
+    def test_staging_rollback_preserves_an_unrecorded_entry(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-staging-manifest-") as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            copy_fixture(project)
+            outside = root / "outside.txt"
+            outside.write_text("competitor\n", encoding="utf-8")
+            injected = False
+
+            def fail_validation(skill_root: Path, **_: object) -> tuple[str]:
+                nonlocal injected
+                if not injected:
+                    injected = True
+                    os.link(outside, skill_root / "unexpected.txt")
+                return ("forced validation failure",)
+
+            with mock.patch.object(scaffold_module, "validate_generated_skill", side_effect=fail_validation):
+                with self.assertRaises(ScaffoldError):
+                    scaffold_module.scaffold(spec_for(), project)
+
+            self.assertTrue(injected)
+            staging = next((project / ".agents" / "skills").glob(".verify-tiny-fixture.staging-*"))
+            self.assertEqual((staging / "unexpected.txt").read_text(encoding="utf-8"), "competitor\n")
+            self.assertEqual(outside.stat().st_nlink, 2)
+
     def test_post_link_identity_failure_rolls_back_the_child(self) -> None:
         with tempfile.TemporaryDirectory(prefix="create-verification-post-link-identity-") as temporary:
             root = Path(temporary)
