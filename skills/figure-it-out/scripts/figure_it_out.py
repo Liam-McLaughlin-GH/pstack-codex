@@ -2052,14 +2052,22 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                 # both matched and mislabeled refusal events.
                 event.pop("private", None)
                 if event_name == "action_refused":
+                    action = event.get("action", "invalid-action")
+                    event["action"] = action if isinstance(action, str) and SAFE_ACTION.fullmatch(action) else "invalid-action"
                     event["target"] = _sanitize_refusal_target(event.get("target"))
                     event["reason"] = "legacy refusal"
                     event["next_action"] = "choose a declared local action or replan with owner approval"
+                    event.pop("evidence", None)
+                    event.pop("why", None)
+                    event.pop("result", None)
                 else:
-                    event.pop("target", None)
-                    event.pop("reason", None)
-                    event.pop("next_action", None)
-                    event.pop("private", None)
+                    safe_fields = {
+                        field: event[field]
+                        for field in ("at", "event", "phase")
+                        if field in event
+                    }
+                    event.clear()
+                    event.update(safe_fields)
             event["__migration_decision"] = record
             event["__migration_listed"] = listed
         normalized_events.append(event)

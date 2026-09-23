@@ -1291,6 +1291,9 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 "target": "token@host",
                 "reason": "target token@host was out of scope",
                 "next_action": "next target token@host",
+                "action": "deploy token@host",
+                "evidence": ["target:token@host"],
+                "why": "why token@host",
                 "private": {"target": "token@host"},
             }]
             mislabeled_decision = mislabeled_legacy["decisions"][0]
