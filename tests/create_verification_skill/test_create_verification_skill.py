@@ -821,7 +821,10 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
                 created_in_detached: Path | None = None
                 replaced = False
 
-                def race_create(parent_fd: int, prefix: str) -> tuple[str, int]:
+                def race_create(
+                    parent_fd: int,
+                    prefix: str,
+                ) -> tuple[str, int, scaffold_module.PublishedEntry]:
                     nonlocal created_in_detached, replaced
                     agents = project / ".agents"
                     agents.rename(detached)
@@ -848,6 +851,116 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
                     else (project / ".agents").is_dir()
                 )
                 self.assertFalse((outside / "skills").exists())
+
+    def test_staging_descriptor_failure_cleans_own_reservation_and_preserves_competitor(self) -> None:
+        for preserve_competing in (False, True):
+            with self.subTest(preserve_competing=preserve_competing), tempfile.TemporaryDirectory(
+                prefix="create-verification-staging-descriptor-failure-"
+            ) as temporary:
+                root = Path(temporary)
+                project = root / "project"
+                project.mkdir()
+                copy_fixture(project)
+                target = project / ".agents" / "skills" / "verify-tiny-fixture"
+                staging_detached = root / "detached-staging"
+                staging_sentinel = root / "staging-competitor.txt"
+                staging_sentinel.write_text("preserve\n", encoding="utf-8")
+                injected = False
+                original_open = scaffold_module._open_directory_descriptor
+
+                def fail_staging_descriptor(
+                    name: Path | str,
+                    label: str,
+                    *,
+                    dir_fd: int | None = None,
+                    collision: bool = False,
+                ) -> int:
+                    nonlocal injected
+                    if label == "staging directory" and not injected:
+                        injected = True
+                        staging = project / ".agents" / "skills" / str(name)
+                        if preserve_competing:
+                            staging.rename(staging_detached)
+                            staging.mkdir()
+                            (staging / "sentinel.txt").write_text(
+                                staging_sentinel.read_text(encoding="utf-8"),
+                                encoding="utf-8",
+                            )
+                        raise ScaffoldError("forced staging descriptor failure")
+                    return original_open(name, label, dir_fd=dir_fd, collision=collision)
+
+                with mock.patch.object(
+                    scaffold_module,
+                    "_open_directory_descriptor",
+                    side_effect=fail_staging_descriptor,
+                ):
+                    with self.assertRaises(ScaffoldError):
+                        scaffold_module.scaffold(spec_for(), project)
+
+                self.assertTrue(injected)
+                self.assertFalse(target.exists())
+                if preserve_competing:
+                    competing = project / ".agents" / "skills"
+                    competing_staging = next(competing.glob(".verify-tiny-fixture.staging-*"))
+                    self.assertEqual(
+                        (competing_staging / "sentinel.txt").read_text(
+                            encoding="utf-8"
+                        ),
+                        "preserve\n",
+                    )
+                    self.assertTrue(staging_detached.is_dir())
+                else:
+                    self.assertFalse((project / ".agents").exists())
+
+    def test_reserved_target_descriptor_failure_cleans_own_reservation_and_preserves_competitor(self) -> None:
+        for preserve_competing in (False, True):
+            with self.subTest(preserve_competing=preserve_competing), tempfile.TemporaryDirectory(
+                prefix="create-verification-target-descriptor-failure-"
+            ) as temporary:
+                root = Path(temporary)
+                project = root / "project"
+                project.mkdir()
+                target = project / ".agents" / "skills" / "verify-tiny-fixture"
+                target_detached = root / "detached-target"
+                injected = False
+                original_open = scaffold_module._open_directory_descriptor
+
+                def fail_target_descriptor(
+                    name: Path | str,
+                    label: str,
+                    *,
+                    dir_fd: int | None = None,
+                    collision: bool = False,
+                ) -> int:
+                    nonlocal injected
+                    if label == "reserved target" and not injected:
+                        injected = True
+                        if preserve_competing:
+                            target.rename(target_detached)
+                            target.mkdir()
+                            (target / "sentinel.txt").write_text("preserve\n", encoding="utf-8")
+                        raise ScaffoldError("forced target descriptor failure")
+                    return original_open(name, label, dir_fd=dir_fd, collision=collision)
+
+                with mock.patch.object(
+                    scaffold_module,
+                    "_open_directory_descriptor",
+                    side_effect=fail_target_descriptor,
+                ):
+                    with self.assertRaises(ScaffoldError):
+                        scaffold_module.scaffold(spec_for(), project)
+
+                self.assertTrue(injected)
+                if preserve_competing:
+                    self.assertEqual(
+                        (target / "sentinel.txt").read_text(encoding="utf-8"),
+                        "preserve\n",
+                    )
+                    self.assertFalse((target / "SKILL.md").exists())
+                    self.assertTrue(target_detached.is_dir())
+                else:
+                    self.assertFalse(target.exists())
+                    self.assertFalse((project / ".agents").exists())
 
     def test_existing_tree_revalidates_all_emitted_command_contracts(self) -> None:
         with tempfile.TemporaryDirectory(prefix="create-verification-command-validation-") as temporary:

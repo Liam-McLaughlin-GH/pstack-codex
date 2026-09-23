@@ -1711,7 +1711,7 @@ def _published_identity(
     return os.dup(parent_fd), name, device, inode, is_directory
 
 
-def _create_staging_directory(parent_fd: int, prefix: str) -> tuple[str, int]:
+def _create_staging_directory(parent_fd: int, prefix: str) -> tuple[str, int, PublishedEntry]:
     """Create a private staging directory relative to an already-open parent."""
 
     candidates = tempfile._get_candidate_names()
@@ -1723,25 +1723,40 @@ def _create_staging_directory(parent_fd: int, prefix: str) -> tuple[str, int]:
             continue
 
         descriptor: int | None = None
+        reservation: PublishedEntry | None = None
         try:
+            reservation = _published_identity(
+                parent_fd,
+                name,
+                is_directory=True,
+            )
             descriptor = _open_directory_descriptor(
                 name,
                 "staging directory",
                 dir_fd=parent_fd,
                 collision=True,
             )
-            reservation = _published_identity(
-                parent_fd,
-                name,
+            if _descriptor_identity(
+                descriptor,
+                f"staging directory {name}",
                 is_directory=True,
-                entry_fd=descriptor,
-            )
-            os.close(reservation[0])
-            return name, descriptor
+            ) != (reservation[2], reservation[3]):
+                raise CollisionError(f"staging directory changed during reservation: {name}")
+            return name, descriptor, reservation
         except Exception:
             if descriptor is not None:
                 try:
                     os.close(descriptor)
+                except OSError:
+                    pass
+            if reservation is not None:
+                _remove_reserved_target(
+                    reservation[0],
+                    reservation[1],
+                    (reservation[2], reservation[3]),
+                )
+                try:
+                    os.close(reservation[0])
                 except OSError:
                     pass
             raise
@@ -2059,6 +2074,7 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
     staging_fd: int | None = None
     staging_reservation: PublishedEntry | None = None
     target_reserved = False
+    target_reservation: PublishedEntry | None = None
     published_entries: list[PublishedEntry] = []
     skills_parent_fd: int | None = None
     target_fd: int | None = None
@@ -2094,17 +2110,11 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
                 )
             )
         _assert_path_matches_descriptor(skills_parent, skills_parent_fd, "output parent")
-        staging_name, staging_fd = _create_staging_directory(
+        staging_name, staging_fd, staging_reservation = _create_staging_directory(
             skills_parent_fd,
             f".verify-{spec['app']['name']}.staging-",
         )
         staging = skills_parent / staging_name
-        staging_reservation = _published_identity(
-            skills_parent_fd,
-            staging_name,
-            is_directory=True,
-            entry_fd=staging_fd,
-        )
         _assert_path_matches_descriptor(staging, staging_fd, "staging directory")
         _write_tree(spec, staging)
         _assert_path_matches_descriptor(skills_parent, skills_parent_fd, "output parent")
@@ -2126,14 +2136,24 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
         except FileExistsError as exc:
             raise CollisionError(f"output appeared during generation: {target}") from exc
         target_reserved = True
+        target_reservation = _published_identity(
+            skills_parent_fd,
+            target.name,
+            is_directory=True,
+        )
+        target_identity = (target_reservation[2], target_reservation[3])
         target_fd = _open_directory_descriptor(
             target.name,
             "reserved target",
             dir_fd=skills_parent_fd,
             collision=True,
         )
-        target_stat = os.fstat(target_fd)
-        target_identity = (target_stat.st_dev, target_stat.st_ino)
+        if _descriptor_identity(
+            target_fd,
+            "reserved target",
+            is_directory=True,
+        ) != target_identity:
+            raise CollisionError(f"target changed during reservation: {target}")
         _assert_reserved_target_identity(
             skills_parent_fd,
             target.name,
@@ -2186,6 +2206,9 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
             raise CollisionError(f"staging directory changed during publication: {staging}")
         staging_reservation = None
         staging = None
+        if target_reservation is not None:
+            _close_published([target_reservation])
+            target_reservation = None
         _close_published(published_entries)
         published_entries = []
         _close_published(created_parent_entries)
@@ -2197,7 +2220,18 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
             staging_reservation = None
         if target_reserved:
             _rollback_published(published_entries)
-            if skills_parent_fd is not None and target_identity is not None:
+            if target_reservation is not None:
+                _remove_reserved_target(
+                    target_reservation[0],
+                    target_reservation[1],
+                    (target_reservation[2], target_reservation[3]),
+                )
+                try:
+                    os.close(target_reservation[0])
+                except OSError:
+                    pass
+                target_reservation = None
+            elif skills_parent_fd is not None and target_identity is not None:
                 _remove_reserved_target(skills_parent_fd, target.name, target_identity)
         _rollback_published(created_parent_entries)
         created_parent_entries = []
