@@ -38,6 +38,7 @@ The following 10 skills are present as Codex-native rewrites.
 | `interrogate` | Runs an adversarial review of a design or diff. |
 | `show-me-your-work` | Keeps an optional append-only decision trail. |
 | `no-comments` | Provides a Codex-compatible review pass for stale or misleading comments. |
+| `reflect` | Reviews one explicit transcript through three bounded lenses, records source evidence and uncertainty, compares proposals, and uses a manifest-driven delegation contract with sequential fallback. |
 | `make-bot-ui` | Builds and verifies a UI relay with explicit local and remote boundaries. |
 
 The port preserves the names of these workflows where possible. In Codex, invoke them as skills such as `$poteto-mode`, `$how`, `$architect`, or `$tdd`.
@@ -51,7 +52,6 @@ The following 7 upstream skills are not active in the port.
 - `figure-it-out`. Its playbook routing and subagent instructions need a Codex-specific rewrite.
 - `maintain-verification-skill`. It assumes the same Cursor verification-skill layout.
 - `recall`. It reads Cursor agent transcripts.
-- `reflect`. Its multi-model transcript review needs a Codex transcript and delegation adapter.
 - `setup-pstack`. It writes Cursor model configuration to `~/.cursor/rules/pstack-models.mdc`.
 
 The upstream `poteto-mode` playbooks are not copied into the active port. The missing playbook files are:
@@ -77,7 +77,12 @@ The port uses Codex skill folders with a `SKILL.md` file. It does not copy Curso
 
 The port does not hard-code a model name. Codex model selection belongs to the Codex session or project configuration, not to this skill package.
 
-The port treats delegation as optional. The workflow still requires independent reasoning for design reviews and parallel work, but it does not require a Cursor `Task` call or a particular model family.
+The port treats delegation as a capability. `reflect` accepts a bounded Codex
+delegation manifest with reviewer and synthesizer identity when exposed. It
+uses a fixed sequential fallback when parallel reviewer delegation is not
+available, and records unavailable or inconclusive lanes instead of treating
+them as successful empty results. It does not require a Cursor `Task` call,
+Cursor transcript path, or a particular model family.
 
 The port keeps user-facing workflow names stable where that helps muscle memory. The instructions behind those names are rewritten when the upstream behavior depended on Cursor.
 
@@ -95,18 +100,22 @@ git status --short
 
 When you are ready to activate it, link the skill folders into your local Codex skill directory after checking for name collisions.
 
-The repository remains the source of truth. The entries under `~/.codex/skills` are only discoverability links for the local Codex runtime.
+The repository remains the source of truth. The entries under
+`$CODEX_HOME/skills` are only discoverability links for the local Codex
+runtime.
 
 ```sh
-REPO=/Users/liammclaughlin/PycharmProjects/pstack-codex
-mkdir -p "$HOME/.codex/skills"
+REPO="${PSTACK_CODEX_REPO:-$(pwd)}"
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+CODEX_SKILLS_DIR="$CODEX_HOME/skills"
+mkdir -p "$CODEX_SKILLS_DIR"
 for skill_dir in "$REPO"/skills/*; do
   skill_name=$(basename "$skill_dir")
-  [ -e "$HOME/.codex/skills/$skill_name" ] && {
+  [ -e "$CODEX_SKILLS_DIR/$skill_name" ] && {
     printf 'Skipping existing skill %s\n' "$skill_name"
     continue
   }
-  ln -s "$skill_dir" "$HOME/.codex/skills/$skill_name"
+  ln -s "$skill_dir" "$CODEX_SKILLS_DIR/$skill_name"
 done
 ```
 
