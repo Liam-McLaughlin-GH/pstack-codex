@@ -1465,6 +1465,81 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
             self.assertTrue(injected)
             self.assertEqual(source_path.read_text(encoding="utf-8"), "competitor\n")
             self.assertEqual(competitor.stat().st_nlink, 2)
+
+    def test_private_link_collision_preserves_an_unrecorded_competitor(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-private-link-collision-") as temporary:
+            root = Path(temporary)
+            source_dir = root / "source"
+            destination_dir = root / "destination"
+            source_dir.mkdir()
+            destination_dir.mkdir()
+            source = source_dir / "source.txt"
+            source.write_text("owned\n", encoding="utf-8")
+            source_fd = os.open(source_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            destination_fd = os.open(destination_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            original_link = scaffold_module.os.link
+            injected = False
+            competitor: Path | None = None
+
+            def collide_once(*args: object, **kwargs: object) -> object:
+                nonlocal injected, competitor
+                if not injected:
+                    injected = True
+                    private_name = str(args[1])
+                    competitor = destination_dir / private_name
+                    competitor.write_text("competitor\n", encoding="utf-8")
+                return original_link(*args, **kwargs)
+
+            try:
+                with mock.patch.object(scaffold_module.os, "link", side_effect=collide_once):
+                    with self.assertRaises(scaffold_module.CollisionError):
+                        scaffold_module._publish_entry_no_replace(
+                            source,
+                            destination_dir / "published.txt",
+                            destination_dir_fd=destination_fd,
+                            source_dir_fd=source_fd,
+                            source_name="source.txt",
+                        )
+            finally:
+                os.close(source_fd)
+                os.close(destination_fd)
+
+            self.assertTrue(injected)
+            self.assertIsNotNone(competitor)
+            assert competitor is not None
+            self.assertEqual(competitor.read_text(encoding="utf-8"), "competitor\n")
+
+    def test_private_link_reservation_dup_failure_preserves_original_error(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-private-link-dup-") as temporary:
+            root = Path(temporary)
+            source_dir = root / "source"
+            destination_dir = root / "destination"
+            source_dir.mkdir()
+            destination_dir.mkdir()
+            source = source_dir / "source.txt"
+            source.write_text("owned\n", encoding="utf-8")
+            source_fd = os.open(source_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            destination_fd = os.open(destination_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            original_dup = scaffold_module.os.dup
+
+            def fail_destination_dup(fd: int) -> int:
+                if fd == destination_fd:
+                    raise OSError("forced reservation dup failure")
+                return original_dup(fd)
+
+            try:
+                with mock.patch.object(scaffold_module.os, "dup", side_effect=fail_destination_dup):
+                    with self.assertRaisesRegex(OSError, "forced reservation dup failure"):
+                        scaffold_module._publish_entry_no_replace(
+                            source,
+                            destination_dir / "published.txt",
+                            destination_dir_fd=destination_fd,
+                            source_dir_fd=source_fd,
+                            source_name="source.txt",
+                        )
+            finally:
+                os.close(source_fd)
+                os.close(destination_fd)
             self.assertEqual(list(destination_dir.iterdir()), [])
 
     def test_publication_swap_after_identity_observation_rolls_back(self) -> None:

@@ -2771,22 +2771,20 @@ def _publish_entry_no_replace(
                 os.close(source_descriptor)
             except OSError:
                 pass
+    reservation_parent_fd: int | None = None
+    temporary_name: str | None = None
+    destination_reservation: PublishedEntry | None = None
+    private_link_created = False
+    temporary_identity: tuple[int, int] | None = None
     try:
         reservation_parent_fd = os.dup(destination_dir_fd)
         temporary_name = _unique_private_name(destination_dir_fd, ".verify-publish-")
-        destination_reservation = (
-            reservation_parent_fd,
-            temporary_name,
-            source_identity[0],
-            source_identity[1],
-            False,
-        )
-        record(destination_reservation)
     except BaseException:
-        try:
-            os.close(reservation_parent_fd)
-        except OSError:
-            pass
+        if reservation_parent_fd is not None:
+            try:
+                os.close(reservation_parent_fd)
+            except OSError:
+                pass
         os.close(source_descriptor)
         raise
 
@@ -2812,13 +2810,23 @@ def _publish_entry_no_replace(
                 )
         except FileExistsError as exc:
             raise CollisionError(f"target changed during publication: {destination}") from exc
+        private_link_created = True
 
-        temporary_stat = os.stat(
+        temporary_descriptor = _open_regular_descriptor(
             temporary_name,
+            "published file",
             dir_fd=destination_dir_fd,
-            follow_symlinks=False,
         )
+        temporary_stat = os.fstat(temporary_descriptor)
         temporary_identity = (temporary_stat.st_dev, temporary_stat.st_ino)
+        destination_reservation = (
+            reservation_parent_fd,
+            temporary_name,
+            temporary_identity[0],
+            temporary_identity[1],
+            False,
+        )
+        record(destination_reservation)
         # The private name was created by this call even when the source path
         # changed between validation and os.link(). Bind rollback to the
         # identity actually created so a failed race cannot strand our private
@@ -2844,11 +2852,6 @@ def _publish_entry_no_replace(
         # Keep the original source identity in the rollback reservation until
         # the temporary entry has passed the source check. A raced replacement
         # must never become the object rollback is authorized to remove.
-        temporary_descriptor = _open_regular_descriptor(
-            temporary_name,
-            "published file",
-            dir_fd=destination_dir_fd,
-        )
         if _descriptor_identity(
             temporary_descriptor,
             f"published file {destination}",
@@ -2900,6 +2903,23 @@ def _publish_entry_no_replace(
         )
         _close_published([observed])
     except Exception:
+        if destination_reservation is None and private_link_created and temporary_identity is not None:
+            _rollback_published(
+                [
+                    (
+                        reservation_parent_fd,
+                        temporary_name,
+                        temporary_identity[0],
+                        temporary_identity[1],
+                        False,
+                    )
+                ]
+            )
+        elif destination_reservation is None and reservation_parent_fd is not None:
+            try:
+                os.close(reservation_parent_fd)
+            except OSError:
+                pass
         _rollback_published(published)
         raise
     finally:
