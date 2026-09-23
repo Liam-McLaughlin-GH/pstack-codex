@@ -94,13 +94,25 @@ EXPLANATORY_PREFIX_RE = re.compile(
     re.IGNORECASE,
 )
 EXPLANATORY_LEAD_RE = re.compile(
-    r"^(?:please\s+)?(?:tell\s+me|show\s+me|walk\s+me\s+through|"
+    r"^(?:please\s+)?(?:tell(?:\s+|-)me|show(?:\s+|-)me|"
+    r"walk(?:\s+|-)me(?:\s+|-)through|"
     r"help\s+me\s+understand)\b",
     re.IGNORECASE,
 )
 EXPLANATORY_PHRASE_RE = re.compile(
-    r"\b(?:explain|describe|define|clarify|tell\s+me|show\s+me|"
-    r"walk\s+me\s+through|help\s+me\s+understand)\b",
+    r"\b(?:explain|describe|define|clarify|tell(?:\s+|-)me|"
+    r"show(?:\s+|-)me|walk(?:\s+|-)me(?:\s+|-)through|"
+    r"help\s+me\s+understand)\b",
+    re.IGNORECASE,
+)
+DECISION_PREFIX_RE = re.compile(
+    r"^(?:review|assess|evaluate|decide|recommend|advise|should|whether|"
+    r"choose|select|which|what|how|why|when|where)\b",
+    re.IGNORECASE,
+)
+DECISION_PHRASE_RE = re.compile(
+    r"\b(?:review|assess|evaluate|decide|recommend|advise|"
+    r"choose|select|help\s+me\s+decide|which\s+should|whether\s+to)\b",
     re.IGNORECASE,
 )
 NOFOLLOW_FLAGS = getattr(os, "O_NOFOLLOW", 0)
@@ -151,7 +163,7 @@ class PublicationRecoveryError(OSError):
         self.competitor_preserved = competitor_preserved
         self.cause = cause
         super().__init__(
-            "update publication stopped; recovery_status="
+            "skill publication stopped; recovery_status="
             f"{recovery_status} cleanup_status={cleanup_status} "
             f"competitor_preserved={str(competitor_preserved).lower()} "
             f"approved_tree={recovery_path if recovery_path is not None else '<removed>'}"
@@ -551,12 +563,19 @@ def _operation_for(text: str) -> str:
 
 
 def _is_explanatory_request(text: str) -> bool:
-    """Recognize questions or explanations that mention an artifact action."""
+    """Recognize questions or decisions that must not authorize a writer."""
 
     clean = _without_quoted_text(text).strip()
     if not clean:
         return False
-    if EXPLANATORY_PREFIX_RE.match(clean) or EXPLANATORY_LEAD_RE.match(clean):
+    concession = re.search(r"\b(?:but|however)\b", clean, re.IGNORECASE)
+    if concession and _has_positive_action(clean[concession.end() :]):
+        clean = clean[concession.end() :].strip()
+    if (
+        EXPLANATORY_PREFIX_RE.match(clean)
+        or EXPLANATORY_LEAD_RE.match(clean)
+        or DECISION_PREFIX_RE.match(clean)
+    ):
         return True
 
     first_action = re.search(
@@ -565,9 +584,17 @@ def _is_explanatory_request(text: str) -> bool:
         re.IGNORECASE,
     )
     leading_text = clean if first_action is None else clean[: first_action.start()]
-    if EXPLANATORY_PHRASE_RE.search(leading_text):
+    if EXPLANATORY_PHRASE_RE.search(leading_text) or DECISION_PHRASE_RE.search(
+        leading_text
+    ):
         return True
-    return bool(re.match(r"^(?:do|does|did|is|are)\b", clean, re.IGNORECASE))
+    return bool(
+        re.match(
+            r"^(?:do|does|did|is|are|should|would)\b",
+            clean,
+            re.IGNORECASE,
+        )
+    )
 
 
 def _no_artifact_route(reason: str) -> RouteDecision:
@@ -634,6 +661,10 @@ def route_request(request: str) -> RouteDecision:
     if _has_negated_artifact_intent(text):
         return _no_artifact_route(
             "negated artifact intent is not a request to create or update"
+        )
+    if _is_explanatory_request(unquoted_text):
+        return _no_artifact_route(
+            "explanatory or decision requests do not authorize an artifact writer"
         )
 
     script_signal = _has_any(unquoted_text, ("script", "helper", "command")) and (
@@ -1230,6 +1261,75 @@ def _remove_owned_directory(
     ) in {"removed", "missing"}
 
 
+def _remove_owned_tree_identity_status(
+    parent_fd: int, name: str, expected_info: os.stat_result
+) -> str:
+    """Remove a stage tree by its reserved identity when no content snapshot exists."""
+
+    current_info = _stat_at(parent_fd, name)
+    if current_info is None:
+        return "missing"
+    if (
+        stat.S_ISLNK(current_info.st_mode)
+        or not stat.S_ISDIR(current_info.st_mode)
+        or not _same_file_identity(current_info, expected_info)
+    ):
+        return "changed"
+    try:
+        directory_fd = _open_directory_at(parent_fd, name, label="owned stage directory")
+    except ScopeError:
+        return "changed"
+    cleanup_safe = True
+    try:
+        opened_info = os.fstat(directory_fd)
+        if not _same_file_identity(opened_info, expected_info):
+            return "changed"
+        try:
+            entries = list(os.scandir(directory_fd))
+        except OSError:
+            return "preserved"
+        for entry in entries:
+            try:
+                entry_info = entry.stat(follow_symlinks=False)
+            except OSError:
+                cleanup_safe = False
+                continue
+            current_entry = _stat_at(directory_fd, entry.name)
+            if (
+                current_entry is None
+                or not _same_file_identity(entry_info, current_entry)
+            ):
+                cleanup_safe = False
+                continue
+            if stat.S_ISDIR(entry_info.st_mode):
+                child_status = _remove_owned_tree_identity_status(
+                    directory_fd, entry.name, entry_info
+                )
+                if child_status not in {"removed", "missing"}:
+                    cleanup_safe = False
+                continue
+            if stat.S_ISLNK(entry_info.st_mode) or stat.S_ISREG(entry_info.st_mode):
+                try:
+                    os.unlink(entry.name, dir_fd=directory_fd)
+                except OSError:
+                    cleanup_safe = False
+                continue
+            cleanup_safe = False
+        current_info = _stat_at(parent_fd, name)
+        if (
+            current_info is None
+            or not _same_file_identity(current_info, expected_info)
+        ):
+            return "changed"
+        try:
+            os.rmdir(name, dir_fd=parent_fd)
+        except OSError:
+            return "preserved"
+        return "removed" if cleanup_safe else "preserved"
+    finally:
+        os.close(directory_fd)
+
+
 def _remove_empty_owned_directory(
     parent_fd: int, name: str, expected_info: os.stat_result
 ) -> bool:
@@ -1274,12 +1374,17 @@ def _cleanup_owned_stage(
             parent_fd, stage_parent_name, label="owned stage parent"
         )
         if expected_stage_info is not None:
-            _remove_owned_directory(
-                stage_parent_fd,
-                stage_name,
-                expected_stage_info,
-                expected_snapshot=expected_stage_snapshot,
-            )
+            if expected_stage_snapshot:
+                _remove_owned_directory(
+                    stage_parent_fd,
+                    stage_name,
+                    expected_stage_info,
+                    expected_snapshot=expected_stage_snapshot,
+                )
+            else:
+                _remove_owned_tree_identity_status(
+                    stage_parent_fd, stage_name, expected_stage_info
+                )
     finally:
         if stage_parent_fd is not None:
             os.close(stage_parent_fd)
@@ -2136,6 +2241,8 @@ def _markdown_bracket_pairs(text: str) -> dict[int, int]:
 def _parse_markdown_destination(
     text: str, start: int, *, require_end: bool = True
 ) -> tuple[str, int] | None:
+    """Parse one inline or reference-definition destination strictly."""
+
     index = start
     while index < len(text) and text[index].isspace():
         index += 1
@@ -2144,17 +2251,25 @@ def _parse_markdown_destination(
     if text[index] == "<":
         destination_start = index + 1
         index = destination_start
+        closed_angle = False
         while index < len(text):
-            if text[index] == ">" and not _escaped_at(text, index):
+            if _escaped_at(text, index):
+                index += 1
+                continue
+            if text[index] == "<":
+                raise ValidationError("malformed Markdown link has nested angle bracket")
+            if text[index] == ">":
                 destination = text[destination_start:index]
                 index += 1
+                closed_angle = True
                 break
             index += 1
-        else:
-            return None
+        if not closed_angle:
+            raise ValidationError("malformed Markdown link has an unmatched angle bracket")
     else:
         destination_start = index
         depth = 0
+        closed_inline = False
         while index < len(text):
             if _escaped_at(text, index):
                 index += 1
@@ -2164,7 +2279,12 @@ def _parse_markdown_destination(
                 depth += 1
             elif character == ")":
                 if depth == 0:
+                    if not require_end:
+                        raise ValidationError(
+                            "malformed Markdown reference definition has trailing delimiter"
+                        )
                     destination = text[destination_start:index].rstrip()
+                    closed_inline = True
                     return destination, index + 1
                 depth -= 1
             elif character.isspace() and depth == 0:
@@ -2172,31 +2292,45 @@ def _parse_markdown_destination(
                 break
             index += 1
         else:
+            if depth:
+                raise ValidationError(
+                    "malformed Markdown link has an unmatched destination delimiter"
+                )
             destination = text[destination_start:index].rstrip()
-        if not destination:
-            return None
+        if not destination and not closed_inline:
+            raise ValidationError("malformed Markdown link has an empty destination")
 
     while index < len(text) and text[index].isspace():
         index += 1
-    if index < len(text) and text[index] not in ")":
+    if index < len(text) and (require_end and text[index] == ")"):
+        return destination, index + 1
+    if index < len(text):
         title_open = text[index]
         title_close = {"\"": "\"", "'": "'", "(": ")"}.get(title_open)
         if title_close is None:
-            return None
-        index += 1
-        while index < len(text):
-            if text[index] == title_close and not _escaped_at(text, index):
-                index += 1
-                break
-            index += 1
+            raise ValidationError("malformed Markdown link has trailing tokens")
+        if title_open == "(":
+            title_end = _matching_markdown_delimiter(text, index, "(", ")")
+            if title_end is None:
+                raise ValidationError("malformed Markdown link has an unmatched title delimiter")
+            index = title_end + 1
         else:
-            return None
+            index += 1
+            while index < len(text):
+                if text[index] == title_close and not _escaped_at(text, index):
+                    index += 1
+                    break
+                index += 1
+            else:
+                raise ValidationError("malformed Markdown link has an unmatched title delimiter")
         while index < len(text) and text[index].isspace():
             index += 1
     if require_end:
         if index >= len(text) or text[index] != ")":
-            return None
+            raise ValidationError("malformed Markdown link has trailing tokens or no closing delimiter")
         return destination, index + 1
+    if index != len(text):
+        raise ValidationError("malformed Markdown reference definition has trailing tokens")
     return destination, index
 
 
@@ -2216,13 +2350,21 @@ def _markdown_reference_definitions(text: str) -> dict[str, str]:
         if not content.startswith("["):
             continue
         close = _matching_markdown_delimiter(content, 0, "[", "]")
-        if close is None or close + 1 >= len(content) or content[close + 1] != ":":
+        if close is None:
+            if ":" in content:
+                raise ValidationError(
+                    "malformed Markdown reference definition has an unmatched label delimiter"
+                )
+            continue
+        if close + 1 >= len(content) or content[close + 1] != ":":
             continue
         parsed = _parse_markdown_destination(content, close + 2, require_end=False)
-        if parsed is not None:
-            destination, end = parsed
-            if not content[end:].strip():
-                definitions[_reference_label(content[1:close])] = destination
+        if parsed is None:
+            raise ValidationError("malformed Markdown reference definition has no destination")
+        destination, end = parsed
+        if content[end:].strip():
+            raise ValidationError("malformed Markdown reference definition has trailing tokens")
+        definitions[_reference_label(content[1:close])] = destination
     return definitions
 
 
@@ -2247,16 +2389,20 @@ def _markdown_link_targets(text: str) -> Iterator[str]:
         after = close + 1
         if after < len(masked) and masked[after] == "(":
             parsed = _parse_markdown_destination(masked, after + 1)
-            if parsed is not None:
-                destination, index = parsed
-                yield destination
-                continue
+            if parsed is None:
+                raise ValidationError("malformed Markdown inline link has no destination")
+            destination, index = parsed
+            yield destination
+            continue
         reference: str | None = None
         if after + 1 < len(masked) and masked[after] == "[":
             reference_close = bracket_pairs.get(after)
-            if reference_close is not None:
-                reference = masked[after + 1 : reference_close] or masked[index + 1 : close]
-                index = reference_close + 1
+            if reference_close is None:
+                raise ValidationError(
+                    "malformed Markdown reference link has an unmatched label delimiter"
+                )
+            reference = masked[after + 1 : reference_close] or masked[index + 1 : close]
+            index = reference_close + 1
         else:
             reference = masked[index + 1 : close]
             index = close + 1
@@ -2475,25 +2621,29 @@ def _validate_skill_tree_at(
 
     for source_relative, source_text in markdown_text.items():
         source_dir = root / PurePosixPath(*source_relative).parent
-        for raw_target in _markdown_link_targets(source_text):
-            try:
-                target = _relative_link_target(root, raw_target, source_dir)
-            except ValidationError as exc:
-                errors.append(str(exc))
-                continue
-            if target is None:
-                continue
-            try:
-                target_path = _canonical_path(root, target)
-                _read_relative_text_at(
-                    root_fd,
-                    target_path.relative_parts,
-                    max_bytes=MAX_ARTIFACT_BYTES,
-                    label="reference link target",
-                )
-            except (ScopeError, ValidationError) as exc:
-                errors.append(f"invalid reference link {raw_target}: {exc}")
-                continue
+        try:
+            link_targets = _markdown_link_targets(source_text)
+            for raw_target in link_targets:
+                try:
+                    target = _relative_link_target(root, raw_target, source_dir)
+                except ValidationError as exc:
+                    errors.append(str(exc))
+                    continue
+                if target is None:
+                    continue
+                try:
+                    target_path = _canonical_path(root, target)
+                    _read_relative_text_at(
+                        root_fd,
+                        target_path.relative_parts,
+                        max_bytes=MAX_ARTIFACT_BYTES,
+                        label="reference link target",
+                    )
+                except (ScopeError, ValidationError) as exc:
+                    errors.append(f"invalid reference link {raw_target}: {exc}")
+                    continue
+        except ValidationError as exc:
+            errors.append(f"invalid Markdown link syntax: {exc}")
 
     if require_provenance:
         provenance_text = "\n".join(markdown_text.values())
@@ -3196,9 +3346,21 @@ def _new_stage(
             os.mkdir(stage_parent_name, 0o755, dir_fd=parent_fd)
         except FileExistsError:
             continue
-        stage_parent_fd = _open_directory_at(
-            parent_fd, stage_parent_name, label="stage parent"
-        )
+        stage_parent_info = _stat_at(parent_fd, stage_parent_name)
+        try:
+            stage_parent_fd = _open_directory_at(
+                parent_fd, stage_parent_name, label="stage parent"
+            )
+        except BaseException:
+            if (
+                stage_parent_info is not None
+                and stat.S_ISDIR(stage_parent_info.st_mode)
+                and not stat.S_ISLNK(stage_parent_info.st_mode)
+            ):
+                _remove_empty_owned_directory(
+                    parent_fd, stage_parent_name, stage_parent_info
+                )
+            raise
         return stage_parent_name, stage_parent_fd, target.parent / stage_parent_name / target.name
     raise CollisionError("could not reserve a unique stage directory")
 
@@ -3441,14 +3603,38 @@ def _install_staged_tree(
             validate_installed(target_fd)
             if failure_injector:
                 failure_injector("after_install")
-        except BaseException:
+        except BaseException as exc:
             if owned_target_info is not None:
-                _remove_owned_directory(
+                cleanup_status = _remove_owned_directory_status(
                     target_parent_fd,
                     target.name,
                     owned_target_info,
                     expected_snapshot=expected_stage_snapshot,
+                    require_snapshot_match=True,
+                    compare_snapshot_contents=True,
                 )
+                if cleanup_status not in {"removed", "missing"}:
+                    current_info = _stat_at(target_parent_fd, target.name)
+                    same_owned_tree = (
+                        current_info is not None
+                        and _same_file_identity(current_info, owned_target_info)
+                    )
+                    raise PublicationRecoveryError(
+                        target=target,
+                        recovery_path=target if same_owned_tree else None,
+                        cause=exc,
+                        recovery_status=(
+                            "installed_tree_changed_preserved"
+                            if same_owned_tree
+                            else "installed_tree_replaced_preserved"
+                        ),
+                        cleanup_status=(
+                            "installed_tree_preserved"
+                            if same_owned_tree
+                            else "owned_tree_not_removed"
+                        ),
+                        competitor_preserved=not same_owned_tree,
+                    ) from exc
             raise
         finally:
             if target_fd is not None:
@@ -3470,6 +3656,7 @@ def _install_staged_tree(
     preserve_recovery = False
     publication_succeeded = False
     target_fd: int | None = None
+    installed_cleanup_status: str | None = None
     try:
         current_info = _stat_at(target_parent_fd, target.name)
         if (
@@ -3567,11 +3754,13 @@ def _install_staged_tree(
             and current_info is not None
             and _same_file_identity(current_info, installed_target_info)
         ):
-            _remove_owned_directory(
+            installed_cleanup_status = _remove_owned_directory_status(
                 target_parent_fd,
                 target.name,
                 installed_target_info,
                 expected_snapshot=expected_stage_snapshot,
+                require_snapshot_match=True,
+                compare_snapshot_contents=True,
             )
             current_info = _stat_at(target_parent_fd, target.name)
         if backup_info is not None and recovery_info is not None:
@@ -3646,6 +3835,13 @@ def _install_staged_tree(
                     recovery_status = "approved_tree_recovered"
                 else:
                     recovery_status = "backup_rejected_recovery_preserved"
+                same_installed_tree = (
+                    installed_target_info is not None
+                    and installed_cleanup_status in {"changed", "preserved"}
+                    and _same_file_identity(current_info, installed_target_info)
+                )
+                if same_installed_tree:
+                    recovery_status = "installed_tree_changed_recovery_preserved"
                 _, reported_recovery_path = _recovery_state(
                     recovery_parent_fd,
                     target.name,
@@ -3659,7 +3855,7 @@ def _install_staged_tree(
                     cause=exc,
                     recovery_status=recovery_status,
                     cleanup_status=cleanup_status,
-                    competitor_preserved=True,
+                    competitor_preserved=not same_installed_tree,
                 ) from exc
 
             _, reported_recovery_path = _recovery_state(
@@ -3875,7 +4071,33 @@ def write_generated_skill(
                 stage_root.parent, stage_parent_fd, label="stage parent"
             )
             if operation == "create":
-                _run_skill_creator_initializer(stage_parent_fd, draft.name)
+                try:
+                    _run_skill_creator_initializer(stage_parent_fd, draft.name)
+                except BaseException:
+                    # The initializer can create the skill directory before a
+                    # later scaffold write fails. Bind that directory only
+                    # after confirming it appeared below our reserved stage
+                    # parent; never adopt a target discovered during final
+                    # cleanup after ownership was lost.
+                    candidate_info = _stat_at(stage_parent_fd, target_name)
+                    if (
+                        candidate_info is not None
+                        and stat.S_ISDIR(candidate_info.st_mode)
+                        and not stat.S_ISLNK(candidate_info.st_mode)
+                    ):
+                        candidate_fd = _open_directory_at(
+                            stage_parent_fd,
+                            target_name,
+                            label="staged skill output",
+                        )
+                        if not _same_file_identity(
+                            candidate_info, os.fstat(candidate_fd)
+                        ):
+                            os.close(candidate_fd)
+                        else:
+                            expected_stage_info = candidate_info
+                            stage_fd = candidate_fd
+                    raise
             else:
                 os.mkdir(target_name, 0o755, dir_fd=stage_parent_fd)
             expected_stage_info = _stat_at(stage_parent_fd, target_name)
@@ -3931,25 +4153,24 @@ def write_generated_skill(
                 validate_installed,
             )
         finally:
-            if stage_parent_fd is not None and expected_stage_info is None:
-                candidate_info = _stat_at(stage_parent_fd, target.name)
+            if (
+                stage_parent_fd is not None
+                and stage_fd is not None
+                and expected_stage_info is not None
+                and expected_stage_snapshot is None
+            ):
+                live_stage_info = _stat_at(stage_parent_fd, target.name)
                 if (
-                    candidate_info is not None
-                    and stat.S_ISDIR(candidate_info.st_mode)
-                    and not stat.S_ISLNK(candidate_info.st_mode)
+                    live_stage_info is not None
+                    and _same_file_identity(live_stage_info, expected_stage_info)
                 ):
-                    expected_stage_info = candidate_info
-                    candidate_fd: int | None = None
                     try:
-                        candidate_fd = _open_directory_at(
-                            stage_parent_fd, target.name, label="staged skill output"
-                        )
-                        expected_stage_snapshot = _capture_tree_snapshot_at(candidate_fd)
+                        expected_stage_snapshot = _capture_tree_snapshot_at(stage_fd)
                     except ScopeError:
+                        # The final cleanup remains identity-bound; an
+                        # unbounded or malformed partial tree is not adopted
+                        # as a different operation's output.
                         expected_stage_snapshot = ()
-                    finally:
-                        if candidate_fd is not None:
-                            os.close(candidate_fd)
             if stage_fd is not None:
                 os.close(stage_fd)
             if existing_fd is not None:

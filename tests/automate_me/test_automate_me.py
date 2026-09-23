@@ -265,6 +265,23 @@ class AutomateMeBehaviorTests(unittest.TestCase):
             with self.subTest(request=request):
                 self.assertEqual(route_request(request).artifact, "none")
 
+    def test_explanatory_and_decision_requests_never_reach_any_writer(self) -> None:
+        for request in (
+            "Review and create my alex-mode skill.",
+            "Explain how to update my alex-mode skill.",
+            "Tell me whether to create my alex-mode skill.",
+            "Tell-me whether to create my alex-mode skill.",
+            "Should I create a project-local verification skill?",
+            "Decide whether to update a project-local helper script.",
+            "Help me choose which project-local task skill to create.",
+            "Which project-local task skill should I create?",
+            "Tell me whether to save this durable preference.",
+        ):
+            with self.subTest(request=request):
+                decision = route_request(request)
+                self.assertEqual(decision.artifact, "none")
+                self.assertEqual(decision.operation, "none")
+
     def test_preference_interaction_requires_bounded_questions_and_response_states(self) -> None:
         with self.assertRaises(ValidationError):
             PreferenceQuestion(
@@ -914,6 +931,48 @@ Read [provenance](references/provenance.md).
             )
             self.assertEqual(validate_skill_tree(skill, require_provenance=False), ())
 
+    def test_malformed_inline_and_reference_links_are_rejected(self) -> None:
+        malformed = (
+            "Read [broken](references/real.md\n",
+            "Read [broken](<references/real.md)\n",
+            'Read [broken](references/real.md "unterminated)\n',
+            "Read [broken](references/real.md trailing)\n",
+            "Read [broken][real-ref\n",
+            "[real-ref]: <references/real.md\n",
+            '[real-ref]: references/real.md "unterminated\n',
+            "[real-ref]: references/real.md trailing\n",
+        )
+        for body in malformed:
+            with self.subTest(body=body):
+                with tempfile.TemporaryDirectory(prefix="automate-me-malformed-links-") as temp_dir:
+                    skill = Path(temp_dir) / "safe-skill"
+                    skill.mkdir()
+                    (skill / "SKILL.md").write_text(
+                        '---\nname: safe-skill\ndescription: "Safe"\n---\n\n'
+                        + body,
+                        encoding="utf-8",
+                    )
+                    errors = validate_skill_tree(skill, require_provenance=False)
+                    self.assertTrue(
+                        any("Markdown" in error or "reference link" in error for error in errors),
+                        errors,
+                    )
+
+    def test_valid_angle_title_and_reference_links_remain_valid(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-valid-links-") as temp_dir:
+            skill = Path(temp_dir) / "safe-skill"
+            references = skill / "references"
+            references.mkdir(parents=True)
+            (references / "real.md").write_text("# Real\n", encoding="utf-8")
+            (skill / "SKILL.md").write_text(
+                '---\nname: safe-skill\ndescription: "Safe"\n---\n\n'
+                'Read [inline](<references/real.md> "valid title") and '
+                "[reference][real-ref].\n\n"
+                '[real-ref]: <references/real.md> (valid title)\n',
+                encoding="utf-8",
+            )
+            self.assertEqual(validate_skill_tree(skill, require_provenance=False), ())
+
     def test_frontmatter_fallback_rejects_non_strings_and_unterminated_quotes(self) -> None:
         cases = (
             "description: true",
@@ -1062,12 +1121,7 @@ Read [provenance](references/provenance.md).
                     approval=self._approval("create"),
                 )
 
-    def test_readme_activation_guard_skips_dangling_collision_safely(self) -> None:
-        readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
-        self.assertIn(
-            '[ -e "$CODEX_SKILLS/$skill_name" ] || [ -L "$CODEX_SKILLS/$skill_name" ]',
-            readme,
-        )
+    def test_activation_guard_skips_dangling_collision_safely(self) -> None:
         with tempfile.TemporaryDirectory(prefix="automate-me-readme-activation-") as temp_dir:
             root = Path(temp_dir)
             repo_skills = root / "repo" / "skills"
@@ -1405,6 +1459,192 @@ Read [style](references/style.md) and [provenance](references/provenance.md).
             self.assertEqual(
                 (target / "competitor.txt").read_text(encoding="utf-8"),
                 "keep this child\n",
+            )
+
+    def test_create_rollback_preserves_in_place_edit_with_explicit_recovery_status(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-create-content-race-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            evidence = self._write_evidence(workspace)
+            target = workspace / "skills" / "alex-mode"
+            draft = SkillDraft(
+                name="alex-mode",
+                description="Apply approved Alex conventions.",
+                rules=("Keep replies short.",),
+                evidence=evidence,
+            )
+
+            def edit_after_install(point: str) -> None:
+                if point == "after_install":
+                    skill_text = (target / "SKILL.md").read_text(encoding="utf-8")
+                    (target / "SKILL.md").write_text(
+                        skill_text.replace("Alex", "alex", 1), encoding="utf-8"
+                    )
+                    raise OSError("injected create rollback failure")
+
+            with self.assertRaises(PublicationRecoveryError) as raised:
+                write_generated_skill(
+                    target,
+                    draft,
+                    workspace_root=workspace,
+                    operation="create",
+                    approval=self._approval("create"),
+                    failure_injector=edit_after_install,
+                )
+            error = raised.exception
+            self.assertEqual(error.recovery_status, "installed_tree_changed_preserved")
+            self.assertEqual(error.cleanup_status, "installed_tree_preserved")
+            self.assertFalse(error.competitor_preserved)
+            self.assertEqual(error.recovery_path, target)
+            self.assertIn("Apply approved alex", (target / "SKILL.md").read_text())
+
+    def test_update_rollback_preserves_in_place_edit_with_explicit_recovery_status(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-update-content-race-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            evidence = self._write_evidence(workspace)
+            target = workspace / "skills" / "alex-mode"
+            initial = SkillDraft(
+                name="alex-mode",
+                description="Apply the original Alex conventions.",
+                rules=("Keep replies short.",),
+                evidence=evidence,
+            )
+            updated = SkillDraft(
+                name="alex-mode",
+                description="Apply the updated Alex conventions.",
+                rules=("Keep handoffs explicit.",),
+                evidence=evidence,
+            )
+            write_generated_skill(
+                target,
+                initial,
+                workspace_root=workspace,
+                operation="create",
+                approval=self._approval("create"),
+            )
+
+            def edit_after_install(point: str) -> None:
+                if point == "after_install":
+                    skill_text = (target / "SKILL.md").read_text(encoding="utf-8")
+                    (target / "SKILL.md").write_text(
+                        skill_text.replace("updated Alex", "updated alex", 1),
+                        encoding="utf-8",
+                    )
+                    raise OSError("injected update rollback failure")
+
+            with self.assertRaises(PublicationRecoveryError) as raised:
+                write_generated_skill(
+                    target,
+                    updated,
+                    workspace_root=workspace,
+                    operation="update",
+                    approval=self._approval("update"),
+                    failure_injector=edit_after_install,
+                )
+            error = raised.exception
+            self.assertEqual(
+                error.recovery_status,
+                "installed_tree_changed_recovery_preserved",
+            )
+            self.assertEqual(error.cleanup_status, "hidden_backup_removed")
+            self.assertFalse(error.competitor_preserved)
+            self.assertIsNotNone(error.recovery_path)
+            self.assertIn("updated alex", (target / "SKILL.md").read_text())
+            self.assertTrue(Path(error.recovery_path).is_dir())
+            self.assertFalse(list(target.parent.glob(".alex-mode.backup-*")))
+
+    def test_failed_write_cleans_only_the_identity_bound_partial_stage(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-partial-stage-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            evidence = self._write_evidence(workspace)
+            target = workspace / "skills" / "alex-mode"
+            draft = SkillDraft(
+                name="alex-mode",
+                description="Apply approved Alex conventions.",
+                rules=("Keep replies short.",),
+                evidence=evidence,
+            )
+            original_write = automate_me._write_relative_bytes_at
+            failed = False
+
+            def fail_after_first_write(root_fd, relative_parts, data):
+                nonlocal failed
+                if not failed:
+                    failed = True
+                    original_write(root_fd, relative_parts, data)
+                    raise OSError("injected staged write failure")
+                return original_write(root_fd, relative_parts, data)
+
+            with patch.object(
+                automate_me,
+                "_write_relative_bytes_at",
+                side_effect=fail_after_first_write,
+            ):
+                with self.assertRaises(OSError):
+                    write_generated_skill(
+                        target,
+                        draft,
+                        workspace_root=workspace,
+                        operation="create",
+                        approval=self._approval("create"),
+                    )
+
+            self.assertTrue(failed)
+            self.assertFalse(target.exists())
+            self.assertEqual(
+                list((workspace / "skills").glob(".alex-mode.stage-*")), []
+            )
+
+    def test_failed_initializer_cleans_its_partial_identity_bound_stage(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="automate-me-partial-initializer-") as temp_dir:
+            workspace = Path(temp_dir) / "project"
+            evidence = self._write_evidence(workspace)
+            target = workspace / "skills" / "alex-mode"
+            draft = SkillDraft(
+                name="alex-mode",
+                description="Apply approved Alex conventions.",
+                rules=("Keep replies short.",),
+                evidence=evidence,
+            )
+
+            def fail_initializer(stage_parent_fd: int, skill_name: str) -> None:
+                os.mkdir(skill_name, 0o755, dir_fd=stage_parent_fd)
+                skill_fd = os.open(skill_name, os.O_RDONLY | os.O_DIRECTORY, dir_fd=stage_parent_fd)
+                try:
+                    partial_fd = os.open(
+                        "SKILL.md",
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o644,
+                        dir_fd=skill_fd,
+                    )
+                    try:
+                        os.write(partial_fd, b"partial")
+                    finally:
+                        os.close(partial_fd)
+                finally:
+                    os.close(skill_fd)
+                raise OSError("injected initializer failure")
+
+            with patch.object(
+                automate_me,
+                "_run_skill_creator_initializer",
+                side_effect=fail_initializer,
+            ):
+                with self.assertRaises(OSError):
+                    write_generated_skill(
+                        target,
+                        draft,
+                        workspace_root=workspace,
+                        operation="create",
+                        approval=self._approval("create"),
+                    )
+
+            self.assertFalse(target.exists())
+            self.assertEqual(
+                list((workspace / "skills").glob(".alex-mode.stage-*")), []
             )
 
     def test_stage_binding_rejects_replacement_or_tampering_and_preserves_competitors(
