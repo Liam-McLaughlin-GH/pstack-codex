@@ -1448,6 +1448,56 @@ class WorkflowBehaviorTests(unittest.TestCase):
             self.assertEqual(migrated.state["resume_count"], 2)
             self.assertEqual(migrated.state["status"], "completed")
 
+    def test_schema_one_orphaned_refusal_uses_sanitized_event_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            with self.assertRaises(figure_it_out.ScopeRefusal):
+                workflow.guard_action("deploy", "production")
+            state_path = root / "run.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["schema_version"] = 1
+            state["plan"]["schema_version"] = 1
+            for event in state["events"]:
+                event.pop("sequence", None)
+                event.pop("decision", None)
+                event.pop("decision_in_list", None)
+                event.pop("decision_overflow", None)
+            for decision in state["decisions"]:
+                decision.pop("event_sequence", None)
+            refusal = state["decisions"][0]
+            refusal["at"] = "orphaned-secret@host"
+            refusal["phase"] = "orphaned-secret-phase"
+            state["events"] = [
+                event for event in state["events"] if event["event"] != "action_refused"
+            ]
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            migrated = figure_it_out.Workflow.load(state_path, workspace_root=root)
+            synthetic = next(
+                event for event in migrated.state["events"] if event["event"] == "decision_recorded"
+            )
+            self.assertNotEqual(synthetic["at"], "orphaned-secret@host")
+            self.assertEqual(synthetic["phase"], "run")
+            self.assertEqual(synthetic["phase"], synthetic["decision"]["phase"])
+
+    def test_schema_two_refusal_rejects_untrusted_action_and_extra_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            with self.assertRaises(figure_it_out.ScopeRefusal):
+                workflow.guard_action("deploy", "production")
+            state_path = root / "run.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            refusal = next(event for event in state["events"] if event["event"] == "action_refused")
+            refusal["action"] = "deploy token@host"
+            refusal["private"] = "secret"
+            refusal["evidence"] = ["https://example.invalid/leak"]
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(state_path, workspace_root=root)
+
     def test_persisted_allowed_actions_must_match_lifecycle_status(self):
         def failed(workflow):
             workflow.start_phase()

@@ -768,9 +768,27 @@ def _validate_lifecycle_graph_v2(
             continue
 
         if event_name == "action_refused":
+            expected_fields = {
+                "sequence",
+                "at",
+                "event",
+                "status",
+                "action",
+                "target",
+                "reason",
+                "next_action",
+                "decision",
+                "decision_in_list",
+                "decision_overflow",
+            }
+            unexpected_fields = set(event) - expected_fields
+            if unexpected_fields:
+                fail(f"events[{index}].action_refused has unsupported fields: {sorted(unexpected_fields)}")
             if event.get("status") != "refused":
                 fail(f"events[{index}].action_refused must have refused status")
             action = event_text(event, index, "action", max_length=100)
+            if SAFE_ACTION.fullmatch(action) is None:
+                fail(f"events[{index}].action_refused action is not normalized")
             reason = event_text(event, index, "reason", max_length=1000)
             next_action = event_text(event, index, "next_action", max_length=1000)
             if event.get("target") is not None:
@@ -2069,6 +2087,7 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
                     event.pop("evidence", None)
                     event.pop("why", None)
                     event.pop("result", None)
+                    event.pop("phase", None)
                 else:
                     safe_fields = {
                         "at": record.get("at", _now()),
@@ -2087,9 +2106,9 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             continue
         migrated_decision = sanitize_orphaned_decision(decision)
         event = {
-            "at": decision.get("at", _now()),
+            "at": migrated_decision["at"],
             "event": "decision_recorded",
-            "phase": decision.get("phase", "run"),
+            "phase": migrated_decision["phase"],
             "__migration_decision": migrated_decision,
             "__migration_listed": True,
         }
