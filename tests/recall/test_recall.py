@@ -750,6 +750,153 @@ visible after close
                     ["visible after close"],
                 )
 
+    def test_four_space_and_tab_indented_openers_do_not_start_fences(self) -> None:
+        cases = (
+            ("backtick-four-space", "`", "    "),
+            ("backtick-tab", "`", "\t"),
+            ("tilde-four-space", "~", "    "),
+            ("tilde-tab", "~", "\t"),
+        )
+
+        for name, delimiter, indentation in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                artifact = workspace / "fence.md"
+                artifact.write_text(
+                    f"{indentation}{delimiter * 3}text\n"
+                    "Codex-Recall-Export: 1\n"
+                    "ID: indented-opener\n"
+                    "Modified at: 2026-01-14T11:00:00Z\n"
+                    "Status: [open PR #123]\n"
+                    "Summary: must remain visible\n"
+                    "Next: must remain visible\n"
+                    f"{delimiter * 3}\n",
+                    encoding="utf-8",
+                )
+                result = run_helper(
+                    workspace,
+                    "--topic",
+                    "payments",
+                    "--as-of",
+                    "2026-01-15T12:00:00Z",
+                    "--artifact",
+                    str(artifact),
+                    "--artifact-origin",
+                    "user",
+                    "--artifact-provenance",
+                    "authorized-history-export",
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("1 structured record(s) match the scope", result.stdout)
+                self.assertIn("[open PR #123]", result.stdout)
+                self.assertIn("must remain visible", result.stdout)
+
+    def test_four_space_and_tab_indented_closers_do_not_end_fences(self) -> None:
+        cases = (
+            ("backtick-four-space", "`", "    "),
+            ("backtick-tab", "`", "\t"),
+            ("tilde-four-space", "~", "    "),
+            ("tilde-tab", "~", "\t"),
+        )
+
+        for name, delimiter, indentation in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                workspace = Path(directory)
+                artifact = workspace / "fence.md"
+                artifact.write_text(
+                    f"{delimiter * 3}text\n"
+                    f"{indentation}{delimiter * 3}\n"
+                    "Codex-Recall-Export: 1\n"
+                    "ID: indented-closer\n"
+                    "Modified at: 2026-01-14T11:00:00Z\n"
+                    "Status: [open PR #124]\n"
+                    "Summary: must remain hidden\n"
+                    "Next: must remain hidden\n"
+                    f"{delimiter * 3}\n",
+                    encoding="utf-8",
+                )
+                result = run_helper(
+                    workspace,
+                    "--topic",
+                    "payments",
+                    "--as-of",
+                    "2026-01-15T12:00:00Z",
+                    "--artifact",
+                    str(artifact),
+                    "--artifact-origin",
+                    "user",
+                    "--artifact-provenance",
+                    "authorized-history-export",
+                )
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("opaque document bodies read: 1", result.stdout)
+                self.assertIn("No structured record matched", result.stdout)
+                self.assertIn(
+                    "UNKNOWN: ChatGPT/general conversation history is unavailable",
+                    result.stdout,
+                )
+                self.assertNotIn("[open PR #124]", result.stdout)
+                self.assertNotIn("must remain hidden", result.stdout)
+
+    def test_unicode_and_control_separators_cannot_close_fences_end_to_end(self) -> None:
+        delimiters = (
+            ("backtick", "`"),
+            ("tilde", "~"),
+        )
+        separators = (
+            ("U+2028", "\u2028"),
+            ("U+2029", "\u2029"),
+            ("U+0085", "\u0085"),
+            ("U+000B", "\u000b"),
+            ("U+000C", "\u000c"),
+        )
+
+        for delimiter_name, delimiter in delimiters:
+            for separator_name, separator in separators:
+                with (
+                    self.subTest(delimiter=delimiter_name, separator=separator_name),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    workspace = Path(directory)
+                    artifact = workspace / "separator-closer.md"
+                    artifact.write_text(
+                        f"{delimiter * 3}text\n"
+                        f"{delimiter * 3}{separator}\n"
+                        "Codex-Recall-Export: 1\n"
+                        "ID: separator-forged\n"
+                        "Modified at: 2026-01-14T11:00:00Z\n"
+                        "Status: [open PR #125]\n"
+                        "Summary: must remain hidden\n"
+                        "Next: must remain hidden\n"
+                        f"{delimiter * 3}\n",
+                        encoding="utf-8",
+                    )
+                    result = run_helper(
+                        workspace,
+                        "--topic",
+                        "payments",
+                        "--as-of",
+                        "2026-01-15T12:00:00Z",
+                        "--artifact",
+                        str(artifact),
+                        "--artifact-origin",
+                        "user",
+                        "--artifact-provenance",
+                        "authorized-history-export",
+                    )
+
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("opaque document bodies read: 1", result.stdout)
+                    self.assertIn("No structured record matched", result.stdout)
+                    self.assertIn(
+                        "UNKNOWN: ChatGPT/general conversation history is unavailable",
+                        result.stdout,
+                    )
+                    self.assertNotIn("separator-forged", result.stdout)
+                    self.assertNotIn("[open PR #125]", result.stdout)
+
     def test_malformed_fence_closers_do_not_expose_structured_records(self) -> None:
         cases = (
             (

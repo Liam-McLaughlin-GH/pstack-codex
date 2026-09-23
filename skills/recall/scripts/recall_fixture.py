@@ -48,6 +48,7 @@ ROLE_PREFIX_PATTERN = re.compile(
     flags=re.IGNORECASE,
 )
 MARKDOWN_PREFIX_PATTERN = re.compile(r"^(?:[-*+]\s+|#{1,6}\s+)")
+MARKDOWN_LINE_END_PATTERN = re.compile(r"\r\n?|\n")
 TEXT_FIELD_PATTERN = re.compile(
     r"(?i)^"
     r"(?P<label>codex[- _]?recall[- _]?export|"
@@ -726,14 +727,24 @@ def extract_text_field(line: str) -> tuple[str, str] | None:
     return normalize_label(match.group("label")), value
 
 
+def _iter_markdown_lines(text: str) -> Iterable[str]:
+    line_start = 0
+    for line_match in MARKDOWN_LINE_END_PATTERN.finditer(text):
+        yield text[line_start : line_match.start()]
+        line_start = line_match.end()
+    if line_start < len(text):
+        yield text[line_start:]
+
+
 def iter_text_lines(text: str) -> Iterable[str]:
     fence_character: str | None = None
     fence_length = 0
-    for line in text.splitlines():
-        stripped = line.lstrip()
-        if stripped and stripped[0] in {"`", "~"}:
-            character = stripped[0]
-            delimiter_length = len(stripped) - len(stripped.lstrip(character))
+    for line in _iter_markdown_lines(text):
+        indentation_length = len(line) - len(line.lstrip(" "))
+        candidate = line[indentation_length:] if indentation_length <= 3 else ""
+        if candidate and candidate[0] in {"`", "~"}:
+            character = candidate[0]
+            delimiter_length = len(candidate) - len(candidate.lstrip(character))
             if delimiter_length >= 3:
                 if fence_character is None:
                     fence_character = character
@@ -741,7 +752,7 @@ def iter_text_lines(text: str) -> Iterable[str]:
                 elif (
                     character == fence_character
                     and delimiter_length >= fence_length
-                    and all(char in " \t" for char in stripped[delimiter_length:])
+                    and all(char in " \t" for char in candidate[delimiter_length:])
                 ):
                     fence_character = None
                     fence_length = 0
