@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import subprocess
 import sys
 import tomllib
+import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -142,23 +144,19 @@ def parse_role_file(path: Path) -> RoleDefinition:
                 f"{path}: Comment Sicko is missing required report-only instructions: "
                 + "; ".join(missing)
             )
-        unsafe_lines = [
-            line
-            for line in instruction_lines
-            if any(
-                phrase in line.casefold().replace("do not write application code.", "")
-                for phrase in (
-                    "write application code",
-                    "edit application code",
-                    "write files",
-                    "edit files",
-                )
-            )
-        ]
-        if unsafe_lines:
+        normalized_instructions = " ".join(instruction_lines).replace(
+            "Do not write application code.", ""
+        )
+        unsafe_match = re.search(
+            r"\b(?:may|can|should|must|please|will)\b.{0,120}"
+            r"\b(?:write|edit|modify|create|delete|remove|change|mutate|apply)\b",
+            normalized_instructions,
+            re.IGNORECASE,
+        )
+        if unsafe_match:
             raise AdapterError(
                 f"{path}: Comment Sicko contains write-capable instructions: "
-                + "; ".join(unsafe_lines)
+                + unsafe_match.group(0)
             )
     return role
 
@@ -390,7 +388,10 @@ def validate_comment_sicko_report(output: str) -> dict[str, str]:
                     sections[field] = f"{sections[field]}\n{value}"
                 else:
                     sections[field] = value
-                if not value:
+                if not value or not any(
+                    not character.isspace() and unicodedata.category(character) != "Cf"
+                    for character in value
+                ):
                     raise ReportContractError(f"Comment Sicko report leaves {field!r} empty")
                 break
     missing = [field for field in COMMENT_SICKO_REPORT_FIELDS if field not in sections]

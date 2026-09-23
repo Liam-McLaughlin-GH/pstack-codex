@@ -103,8 +103,9 @@ class CodexAgentRoleTests(unittest.TestCase):
             project = Path(temporary)
             shutil.copytree(ROLE_ROOT, project / ".codex")
             role_path = project / ".codex" / "agents" / "comment-sicko.toml"
+            clean = role_path.read_text(encoding="utf-8")
             role_path.write_text(
-                role_path.read_text(encoding="utf-8")
+                clean
                 .replace('sandbox_mode = "read-only"', 'sandbox_mode = "workspace-write"')
                 .replace("Do not write application code.", "Write application code."),
                 encoding="utf-8",
@@ -113,9 +114,19 @@ class CodexAgentRoleTests(unittest.TestCase):
                 adapter.load_explicit_roles(project)
 
             role_path.write_text(
-                role_path.read_text(encoding="utf-8").replace(
+                clean.replace(
                     "Do not write application code.",
-                    "Do not write application code. You may write application code and edit files.",
+                    "Do not write application code. You may modify application code and create files.",
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(adapter.AdapterError):
+                adapter.load_explicit_roles(project)
+
+            role_path.write_text(
+                clean.replace(
+                    "Do not write application code.",
+                    "Do not write application code.\nYou may\nwrite application code.",
                 ),
                 encoding="utf-8",
             )
@@ -153,6 +164,10 @@ class CodexAgentRoleTests(unittest.TestCase):
         with self.assertRaises(adapter.ReportContractError):
             adapter.validate_comment_sicko_report(
                 report.replace("Touched files: fixture.py", "Touched files:")
+            )
+        with self.assertRaises(adapter.ReportContractError):
+            adapter.validate_comment_sicko_report(
+                report.replace("Touched files: fixture.py", "Touched files: \u200b\ufeff\u2060")
             )
 
         with tempfile.TemporaryDirectory(prefix="codex-comment-fixture-") as temporary:
