@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+from dataclasses import dataclass, field
 import errno
 import json
 import os
@@ -153,6 +154,101 @@ class ScaffoldError(ValueError):
 
 class CollisionError(ScaffoldError):
     """Raised when the requested output already exists, including as a link."""
+
+
+@dataclass(frozen=True)
+class CleanupFailure:
+    """One cleanup operation that could not be completed during rollback."""
+
+    operation: str
+    entry: str
+    error_type: str
+    message: str
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "operation": self.operation,
+            "entry": self.entry,
+            "error_type": self.error_type,
+            "message": self.message,
+        }
+
+
+@dataclass
+class RollbackReceipt:
+    """Structured accounting for publication cleanup attempts."""
+
+    attempted: int = 0
+    cleaned: int = 0
+    failures: list[CleanupFailure] = field(default_factory=list)
+    _attempted_entries: set[tuple[tuple[int, int], str, int | None, int | None, bool]] = field(
+        default_factory=set,
+        repr=False,
+    )
+
+    def _entry_key(self, entry: PublishedEntry) -> tuple[tuple[int, int], str, int | None, int | None, bool]:
+        parent_fd, name, device, inode, is_directory = entry
+        try:
+            parent = os.fstat(parent_fd)
+            parent_identity = (parent.st_dev, parent.st_ino)
+        except OSError:
+            parent_identity = (-1, parent_fd)
+        return parent_identity, name, device, inode, is_directory
+
+    def begin(self, entry: PublishedEntry) -> bool:
+        key = self._entry_key(entry)
+        if key in self._attempted_entries:
+            return False
+        self._attempted_entries.add(key)
+        self.attempted += 1
+        return True
+
+    def record_failure(self, operation: str, entry: str, error: BaseException) -> None:
+        self.failures.append(
+            CleanupFailure(
+                operation=operation,
+                entry=entry,
+                error_type=type(error).__name__,
+                message=str(error),
+            )
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "attempted": self.attempted,
+            "cleaned": self.cleaned,
+            "failures": [failure.as_dict() for failure in self.failures],
+        }
+
+
+class RollbackError(CollisionError):
+    """Raised when the original operation failed and rollback was incomplete."""
+
+    def __init__(self, cause: BaseException, receipt: RollbackReceipt) -> None:
+        self.cause = cause
+        self.receipt = receipt
+        details = "; ".join(
+            f"{failure.operation} {failure.entry}: {failure.message}"
+            for failure in receipt.failures
+        )
+        super().__init__(f"{cause}; rollback incomplete: {details}")
+
+
+def _record_cleanup_failure(
+    receipt: RollbackReceipt | None,
+    operation: str,
+    entry: str,
+    error: BaseException,
+) -> None:
+    if receipt is not None:
+        receipt.record_failure(operation, entry, error)
+
+
+def _raise_if_rollback_incomplete(cause: BaseException, receipt: RollbackReceipt) -> None:
+    if receipt.failures:
+        if isinstance(cause, RollbackError):
+            raise cause
+        raise RollbackError(cause, receipt) from cause
 
 
 def _require_mapping(value: Any, label: str) -> dict[str, Any]:
@@ -2024,12 +2120,16 @@ def _assert_path_matches_descriptor(path: Path, descriptor: int, label: str) -> 
         raise CollisionError(f"{label} changed during publication: {path}")
 
 
-def _close_published(entries: list[PublishedEntry]) -> None:
-    for parent_fd, _, _, _, _ in entries:
+def _close_published(
+    entries: list[PublishedEntry],
+    *,
+    receipt: RollbackReceipt | None = None,
+) -> None:
+    for parent_fd, name, _, _, _ in entries:
         try:
             os.close(parent_fd)
-        except OSError:
-            pass
+        except OSError as exc:
+            _record_cleanup_failure(receipt, "close rollback descriptor", name, exc)
 
 
 def _same_identity(left: os.stat_result, right: tuple[int, int]) -> bool:
@@ -2218,13 +2318,15 @@ def _move_owned_entry_to_quarantine(
     name: str,
     device: int,
     inode: int,
+    *,
+    prefix: str = ".verify-cleanup-",
 ) -> str:
     """Claim an identity-checked entry before any destructive operation."""
 
     current = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     if not _same_identity(current, (device, inode)):
         raise CollisionError(f"entry changed during cleanup: {name}")
-    private_name = _unique_private_name(parent_fd)
+    private_name = _unique_private_name(parent_fd, prefix)
     try:
         _atomic_rename_noreplace(parent_fd, name, parent_fd, private_name)
     except FileNotFoundError as exc:
@@ -2472,8 +2574,21 @@ def _remove_tree_at(
     _remove_owned_entry(parent_fd, name, device, inode, is_directory=False)
 
 
-def _rollback_published(entries: list[PublishedEntry], *, recursive: bool = True) -> None:
+def _rollback_published(
+    entries: list[PublishedEntry],
+    *,
+    recursive: bool = True,
+    receipt: RollbackReceipt | None = None,
+) -> RollbackReceipt:
+    receipt = receipt or RollbackReceipt()
     for parent_fd, name, device, inode, is_directory in reversed(entries):
+        entry = (parent_fd, name, device, inode, is_directory)
+        if not receipt.begin(entry):
+            try:
+                os.close(parent_fd)
+            except OSError as exc:
+                receipt.record_failure("close rollback descriptor", name, exc)
+            continue
         try:
             if device is None or inode is None:
                 continue
@@ -2484,13 +2599,15 @@ def _rollback_published(entries: list[PublishedEntry], *, recursive: bool = True
                     _remove_owned_empty_directory(parent_fd, name, device, inode)
             else:
                 _remove_owned_entry(parent_fd, name, device, inode, is_directory=False)
-        except (OSError, ScaffoldError):
-            pass
+            receipt.cleaned += 1
+        except (OSError, ScaffoldError) as exc:
+            receipt.record_failure("rollback entry", name, exc)
         finally:
             try:
                 os.close(parent_fd)
-            except OSError:
-                pass
+            except OSError as exc:
+                receipt.record_failure("close rollback descriptor", name, exc)
+    return receipt
 
 
 def _assert_reserved_target_identity(
@@ -2624,6 +2741,8 @@ def _remove_reserved_target(
     parent_fd: int,
     target_name: str,
     identity: tuple[int, int] | None,
+    *,
+    receipt: RollbackReceipt | None = None,
 ) -> None:
     """Remove a reserved directory through the same quarantine path as rollback."""
 
@@ -2631,11 +2750,19 @@ def _remove_reserved_target(
         return
     try:
         _remove_owned_empty_directory(parent_fd, target_name, identity[0], identity[1])
-    except (OSError, ScaffoldError):
-        pass
+    except FileNotFoundError:
+        return
+    except (OSError, ScaffoldError) as exc:
+        _record_cleanup_failure(receipt, "remove reserved target", target_name, exc)
+        if receipt is None:
+            raise ScaffoldError(f"reserved target cleanup incomplete: {target_name}: {exc}") from exc
 
 
-def _remove_reserved_directory_tree(entry: PublishedEntry) -> bool:
+def _remove_reserved_directory_tree(
+    entry: PublishedEntry,
+    *,
+    receipt: RollbackReceipt | None = None,
+) -> bool:
     """Remove a reserved directory tree only through identity-bound quarantine."""
 
     parent_fd, name, device, inode, is_directory = entry
@@ -2646,7 +2773,8 @@ def _remove_reserved_directory_tree(entry: PublishedEntry) -> bool:
         return True
     except (FileNotFoundError, NotADirectoryError):
         return False
-    except (NotImplementedError, OSError, ScaffoldError):
+    except (NotImplementedError, OSError, ScaffoldError) as exc:
+        _record_cleanup_failure(receipt, "remove reserved directory tree", name, exc)
         return False
     finally:
         try:
@@ -2655,7 +2783,11 @@ def _remove_reserved_directory_tree(entry: PublishedEntry) -> bool:
             pass
 
 
-def _remove_reserved_empty_directory(entry: PublishedEntry) -> bool:
+def _remove_reserved_empty_directory(
+    entry: PublishedEntry,
+    *,
+    receipt: RollbackReceipt | None = None,
+) -> bool:
     """Remove a reserved directory only after recorded children are gone."""
 
     parent_fd, name, device, inode, is_directory = entry
@@ -2664,7 +2796,8 @@ def _remove_reserved_empty_directory(entry: PublishedEntry) -> bool:
             return False
         _remove_owned_empty_directory(parent_fd, name, device, inode)
         return True
-    except (FileNotFoundError, NotADirectoryError, OSError, ScaffoldError):
+    except (FileNotFoundError, NotADirectoryError, OSError, ScaffoldError) as exc:
+        _record_cleanup_failure(receipt, "remove reserved empty directory", name, exc)
         return False
     finally:
         try:
@@ -2709,6 +2842,7 @@ def _publish_entry_no_replace(
     source_name: str | None = None,
     source_metadata: os.stat_result | None = None,
     reservation_sink: list[PublishedEntry] | None = None,
+    rollback_receipt: RollbackReceipt | None = None,
 ) -> list[PublishedEntry]:
     """Publish one staged entry through a reserved directory descriptor."""
 
@@ -2856,28 +2990,43 @@ def _publish_entry_no_replace(
                         source_name=child_name,
                         source_metadata=child_metadata,
                         reservation_sink=reservation_sink,
+                        rollback_receipt=rollback_receipt,
                     )
                 )
             # Keep the staged source intact until the top-level reservation is
             # removed through its descriptor-bound cleanup path.
             return published
-        except Exception:
-            _rollback_published(published)
+        except Exception as original_error:
+            receipt = _rollback_published(published, receipt=rollback_receipt)
             if child_reservation is not None and child_reservation not in published:
-                try:
-                    _remove_owned_empty_directory(
-                        child_reservation[0],
-                        child_reservation[1],
-                        child_reservation[2],
-                        child_reservation[3],
-                    )
-                except (OSError, ScaffoldError):
-                    pass
-                finally:
+                if receipt.begin(child_reservation):
                     try:
-                        os.close(child_reservation[0])
-                    except OSError:
-                        pass
+                        _remove_owned_empty_directory(
+                            child_reservation[0],
+                            child_reservation[1],
+                            child_reservation[2],
+                            child_reservation[3],
+                        )
+                        receipt.cleaned += 1
+                    except (OSError, ScaffoldError) as exc:
+                        receipt.record_failure(
+                            "rollback child directory",
+                            child_reservation[1],
+                            exc,
+                        )
+                    finally:
+                        try:
+                            os.close(child_reservation[0])
+                        except OSError as exc:
+                            receipt.record_failure(
+                                "close rollback descriptor",
+                                child_reservation[1],
+                                exc,
+                            )
+            if receipt.failures:
+                if isinstance(original_error, RollbackError):
+                    raise
+                raise RollbackError(original_error, receipt) from original_error
             raise
         finally:
             if child_fd is not None:
@@ -3022,7 +3171,8 @@ def _publish_entry_no_replace(
             entry_fd=temporary_descriptor,
         )
         _close_published([observed])
-    except Exception:
+    except Exception as original_error:
+        receipt = rollback_receipt or RollbackReceipt()
         if not reservation_recorded and private_link_created and temporary_identity is not None:
             _rollback_published(
                 [
@@ -3033,14 +3183,19 @@ def _publish_entry_no_replace(
                         temporary_identity[1],
                         False,
                     )
-                ]
+                ],
+                receipt=receipt,
             )
         elif destination_reservation is None and reservation_parent_fd is not None:
             try:
                 os.close(reservation_parent_fd)
-            except OSError:
-                pass
-        _rollback_published(published)
+            except OSError as exc:
+                receipt.record_failure("close rollback descriptor", temporary_name or destination, exc)
+        _rollback_published(published, receipt=receipt)
+        if receipt.failures:
+            if isinstance(original_error, RollbackError):
+                raise
+            raise RollbackError(original_error, receipt) from original_error
         raise
     finally:
         if temporary_descriptor is not None:
@@ -3089,6 +3244,7 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
     skills_parent_fd: int | None = None
     target_fd: int | None = None
     target_identity: tuple[int, int] | None = None
+    rollback_receipt = RollbackReceipt()
     try:
         project_fd = _open_directory_descriptor(project_root, "project root")
         opened_project = os.fstat(project_fd)
@@ -3192,6 +3348,7 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
                 source_name=child_name,
                 source_metadata=child_metadata,
                 reservation_sink=published_entries,
+                rollback_receipt=rollback_receipt,
             )
             _assert_reserved_target_identity(
                 skills_parent_fd,
@@ -3212,9 +3369,20 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
         if staging_reservation is None:
             staging_reservation = None
             raise CollisionError(f"staging directory changed during publication: {staging}")
-        _rollback_published(staging_child_reservations, recursive=False)
+        _rollback_published(
+            staging_child_reservations,
+            recursive=False,
+            receipt=rollback_receipt,
+        )
         staging_child_reservations = []
-        if not _remove_reserved_empty_directory(staging_reservation):
+        _raise_if_rollback_incomplete(
+            ScaffoldError("staging child cleanup failed"),
+            rollback_receipt,
+        )
+        if not _remove_reserved_empty_directory(
+            staging_reservation,
+            receipt=rollback_receipt,
+        ):
             staging_reservation = None
             raise CollisionError(f"staging directory changed during publication: {staging}")
         staging_reservation = None
@@ -3227,6 +3395,55 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
             target_identity,
             published_entries,
         )
+        if skills_parent_fd is None or target_identity is None or target_reservation is None:
+            raise ScaffoldError("reserved target publication state is unavailable")
+        # Keep the incremental descriptor-bound publication path, but make the
+        # final commit atomic. The authoritative manifest walk happens while
+        # the reserved root has no public target name, so a subtree swap from
+        # the public path cannot turn into a successful publication.
+        sealed_target_name = _move_owned_entry_to_quarantine(
+            skills_parent_fd,
+            target.name,
+            target_identity[0],
+            target_identity[1],
+            prefix=".verify-target-",
+        )
+        target_reservation = (
+            target_reservation[0],
+            sealed_target_name,
+            target_reservation[2],
+            target_reservation[3],
+            target_reservation[4],
+        )
+        sealed_target = skills_parent / sealed_target_name
+        _assert_reserved_target_contents(
+            skills_parent_fd,
+            sealed_target_name,
+            sealed_target,
+            target_fd,
+            target_identity,
+            published_entries,
+        )
+        _atomic_rename_noreplace(
+            skills_parent_fd,
+            sealed_target_name,
+            skills_parent_fd,
+            target.name,
+        )
+        target_reservation = (
+            target_reservation[0],
+            target.name,
+            target_reservation[2],
+            target_reservation[3],
+            target_reservation[4],
+        )
+        _assert_reserved_target_identity(
+            skills_parent_fd,
+            target.name,
+            target,
+            target_fd,
+            target_identity,
+        )
         if target_reservation is not None:
             _close_published([target_reservation])
             target_reservation = None
@@ -3235,7 +3452,7 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
         _close_published(created_parent_entries)
         created_parent_entries = []
         return target
-    except Exception:
+    except Exception as original_error:
         staging_name_still_bound = False
         if staging_reservation is not None:
             try:
@@ -3255,20 +3472,31 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
             # staging root. Unknown competitors remain and make root cleanup
             # fail closed.
             if staging_name_still_bound:
-                _rollback_published(staging_child_reservations, recursive=False)
+                _rollback_published(
+                    staging_child_reservations,
+                    recursive=False,
+                    receipt=rollback_receipt,
+                )
             else:
                 # The original staging root was moved away; preserve that
                 # detached tree and never reacquire the replacement by name.
-                _close_published(staging_child_reservations)
+                _close_published(staging_child_reservations, receipt=rollback_receipt)
             staging_child_reservations = []
         if staging_reservation is not None:
             if staging_name_still_bound:
-                _remove_reserved_empty_directory(staging_reservation)
+                _remove_reserved_empty_directory(
+                    staging_reservation,
+                    receipt=rollback_receipt,
+                )
             else:
-                _close_published([staging_reservation])
+                _close_published([staging_reservation], receipt=rollback_receipt)
             staging_reservation = None
         if target_reserved:
-            _rollback_published(published_entries, recursive=False)
+            _rollback_published(
+                published_entries,
+                recursive=False,
+                receipt=rollback_receipt,
+            )
             if target_reservation is not None:
                 _remove_reserved_target(
                     target_reservation[0],
@@ -3276,16 +3504,31 @@ def scaffold(spec: dict[str, Any], project_root: Path) -> Path:
                     None
                     if target_reservation[2] is None or target_reservation[3] is None
                     else (target_reservation[2], target_reservation[3]),
+                    receipt=rollback_receipt,
                 )
                 try:
                     os.close(target_reservation[0])
-                except OSError:
-                    pass
+                except OSError as exc:
+                    rollback_receipt.record_failure(
+                        "close rollback descriptor",
+                        target_reservation[1],
+                        exc,
+                    )
                 target_reservation = None
             elif skills_parent_fd is not None and target_identity is not None:
-                _remove_reserved_target(skills_parent_fd, target.name, target_identity)
-        _rollback_published(created_parent_entries, recursive=False)
+                _remove_reserved_target(
+                    skills_parent_fd,
+                    target.name,
+                    target_identity,
+                    receipt=rollback_receipt,
+                )
+        _rollback_published(
+            created_parent_entries,
+            recursive=False,
+            receipt=rollback_receipt,
+        )
         created_parent_entries = []
+        _raise_if_rollback_incomplete(original_error, rollback_receipt)
         raise
     finally:
         if staging_fd is not None:
