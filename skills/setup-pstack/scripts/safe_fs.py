@@ -512,6 +512,18 @@ def _native_unlink_at(
         )
     if stat.S_ISDIR(expected_metadata.st_mode) != is_directory:
         raise SafeFilesystemError(f"entry type changed during removal: {name}")
+    if sys.platform == "darwin" and identity_reference is not None:
+        # The reference is bound after the entry reaches its private name. It
+        # removes that inode even if the private name is replaced meanwhile.
+        try:
+            _darwin_delete_reference(identity_reference, name)
+            return
+        except OSError as exc:
+            # Some Darwin filesystems reject an otherwise valid FSRef after a
+            # private rename with status -47. The descriptor-relative claim
+            # below remains the bounded fallback for that platform case.
+            if "status -47" not in str(exc):
+                raise
 
     claimed_name = unique_entry_name(parent_fd, ".pstack-unlink-")
     atomic_rename_noreplace_at(parent_fd, name, claimed_name)
@@ -831,6 +843,13 @@ def _delete_private_entry(
         )
         quarantine_receipt_path = receipt_path.parent / quarantine_name
         quarantine_directory_metadata = os.fstat(quarantine_fd)
+        if sys.platform == "darwin":
+            quarantine_directory_reference = _darwin_identity_reference_at(
+                parent_fd,
+                quarantine_name,
+                quarantine_directory_metadata,
+                receipt_path=quarantine_receipt_path,
+            )
         atomic_rename_noreplace_between(
             parent_fd,
             delete_name,
@@ -840,6 +859,13 @@ def _delete_private_entry(
         quarantine_entry_metadata = lstat_at(quarantine_fd, quarantine_entry_name)
         if not _same_entry(quarantine_entry_metadata, expected_metadata):
             raise SafeFilesystemError(f"private cleanup identity changed in quarantine: {private_name}")
+        if sys.platform == "darwin":
+            quarantine_entry_reference = _darwin_identity_reference_at(
+                quarantine_fd,
+                quarantine_entry_name,
+                quarantine_entry_metadata,
+                receipt_path=quarantine_receipt_path / quarantine_entry_name,
+            )
         _native_unlink_at(
             quarantine_fd,
             quarantine_entry_name,
