@@ -1498,6 +1498,33 @@ class WorkflowBehaviorTests(unittest.TestCase):
             with self.assertRaises(figure_it_out.StateError):
                 figure_it_out.Workflow.load(state_path, workspace_root=root)
 
+            for location in ("event", "row"):
+                with self.subTest(location=location):
+                    nested_state = json.loads(state_path.read_text(encoding="utf-8"))
+                    refusal_event = next(
+                        event for event in nested_state["events"] if event["event"] == "action_refused"
+                    )
+                    target = refusal_event["decision"] if location == "event" else nested_state["decisions"][0]
+                    target["private"] = "secret"
+                    nested_path = root / f"run-{location}.json"
+                    nested_path.write_text(json.dumps(nested_state), encoding="utf-8")
+
+                    with self.assertRaises(figure_it_out.StateError):
+                        figure_it_out.Workflow.load(nested_path, workspace_root=root)
+
+            nested_state = json.loads(state_path.read_text(encoding="utf-8"))
+            refusal_event = next(
+                event for event in nested_state["events"] if event["event"] == "action_refused"
+            )
+            forged_evidence = ["target:token@host"]
+            refusal_event["decision"]["evidence"] = forged_evidence
+            nested_state["decisions"][0]["evidence"] = deepcopy(forged_evidence)
+            nested_path = root / "run-noncanonical-evidence.json"
+            nested_path.write_text(json.dumps(nested_state), encoding="utf-8")
+
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(nested_path, workspace_root=root)
+
     def test_persisted_allowed_actions_must_match_lifecycle_status(self):
         def failed(workflow):
             workflow.start_phase()

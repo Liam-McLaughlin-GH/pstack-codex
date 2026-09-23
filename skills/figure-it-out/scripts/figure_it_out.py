@@ -30,6 +30,8 @@ DEFAULT_LIMITS = {
     "max_decisions": 128,
 }
 VALID_RESULTS = {"open", "verified", "failed", "reverted", "blocked", "not_run", "inconclusive"}
+DECISION_REQUIRED_FIELDS = {"at", "phase", "decision", "why", "evidence", "result", "event_sequence"}
+DECISION_OPTIONAL_FIELDS = {"status", "reason", "next_action"}
 CHECK_STATUSES = {"verified", "failed", "blocked", "not_run", "inconclusive"}
 RUN_STATUSES = {"planned", "running", "failed", "interrupted", "blocked", "completed"}
 PHASE_STATUSES = {"pending", "in_progress", "passed", "failed", "interrupted", "blocked"}
@@ -596,6 +598,12 @@ def _require_state_fields(value: Mapping[str, Any], fields: set[str], label: str
         raise StateError(f"invalid state: {label} is missing required fields: {', '.join(missing)}")
 
 
+def _reject_state_fields(value: Mapping[str, Any], fields: set[str], label: str) -> None:
+    unexpected = sorted(set(value) - fields)
+    if unexpected:
+        raise StateError(f"invalid state: {label} has unsupported fields: {unexpected}")
+
+
 def _validate_lifecycle_graph_v2(
     state: Mapping[str, Any],
     validated_plan: Mapping[str, Any],
@@ -688,9 +696,14 @@ def _validate_lifecycle_graph_v2(
         decision = event["decision"]
         if not isinstance(decision, Mapping):
             fail(f"events[{index}].decision must be an object")
+        _reject_state_fields(
+            decision,
+            DECISION_REQUIRED_FIELDS | DECISION_OPTIONAL_FIELDS,
+            f"events[{index}].decision",
+        )
         _require_state_fields(
             decision,
-            {"at", "phase", "decision", "why", "evidence", "result", "event_sequence"},
+            DECISION_REQUIRED_FIELDS,
             f"events[{index}].decision",
         )
         for field in ("at", "phase", "decision", "why"):
@@ -804,6 +817,15 @@ def _validate_lifecycle_graph_v2(
             expected_action = action if SAFE_ACTION.fullmatch(action) else "invalid-action"
             if decision["decision"] != f"refused action {expected_action}":
                 fail(f"events[{index}] refusal decision does not match the action")
+            expected_evidence = [
+                {"kind": "reference", "ref": f"scope:{expected_action}"},
+                {
+                    "kind": "reference",
+                    "ref": "target:provided" if event.get("target") is not None else "target:none",
+                },
+            ]
+            if decision["evidence"] != expected_evidence:
+                fail(f"events[{index}] refusal decision evidence is not canonical")
             continue
 
         if event_name == "decision_recorded":
@@ -1343,9 +1365,14 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
     for index, decision in enumerate(state["decisions"]):
         if not isinstance(decision, Mapping):
             raise StateError(f"invalid state: decisions[{index}] must be an object")
+        _reject_state_fields(
+            decision,
+            DECISION_REQUIRED_FIELDS | DECISION_OPTIONAL_FIELDS,
+            f"decisions[{index}]",
+        )
         _require_state_fields(
             decision,
-            {"at", "phase", "decision", "why", "evidence", "result", "event_sequence"},
+            DECISION_REQUIRED_FIELDS,
             f"decisions[{index}]",
         )
         if isinstance(decision["event_sequence"], bool) or not isinstance(decision["event_sequence"], int) or decision["event_sequence"] < 1:
