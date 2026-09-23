@@ -163,6 +163,15 @@ class G1ParityTests(unittest.TestCase):
         self.assertTrue(gate.request("merge", authorized=True))
         self.assertEqual(gate.calls, ["merge"])
 
+    def test_contract_fixture_checks_the_actual_playbooks(self) -> None:
+        contracts = fixture_data()["playbook_contracts"]
+        self.assertGreaterEqual(len(contracts), 11)
+        for filename, markers in contracts.items():
+            text = (PLAYBOOK_DIR / filename).read_text(encoding="utf-8")
+            for marker in markers:
+                self.assertIn(marker, text, f"{filename} is missing {marker!r}")
+            self.assertIn("UNSUPPORTED-SEAM:", text, filename)
+
     def test_representative_state_and_stop_paths(self) -> None:
         cases = fixture_data()
         autonomous = cases["autonomous"]

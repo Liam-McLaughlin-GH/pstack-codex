@@ -20,9 +20,11 @@ from evidence. Do not implement the planned change.
 6. Every verification block opens with the rule that tests alone are not
    enough. A live check must name its matching local surface or say BLOCKED.
    A perf block names a metric, unit, baseline, probe, and failure number.
-7. Run the available local plan checker. If it is not installed, use a small
-   structural fixture check and record BLOCKED for the missing checker. Fix
-   every printed issue before handoff.
+7. Run the available local plan checker. If it is not installed, use the
+   structural contract in
+   `tests/poteto_mode/fixtures/playbook_contracts.json`: every phase must name
+   an owner, inputs, acceptance evidence, dependencies, and a final gate.
+   Record the fixture result and fix every printed issue before handoff.
 8. Stop after returning the plan path and checks. Execution starts only on an
    explicit go and still follows the side-effect gate.
 

@@ -67,8 +67,10 @@ process proportional to the risk and keep every claim tied to evidence.
 - An explicit pause uses [Pause safely](playbooks/pause-safely.md).
 - A multi-phase deliverable uses [Multi-phase plan](playbooks/multi-phase-plan.md).
 - Disk recovery uses [Worktree cleanup](playbooks/worktree-cleanup.md).
-- Every execution playbook hands off through [Opening a PR](playbooks/opening-a-pr.md)
-  only after its local checks pass and forge authorization exists.
+- Every change-producing execution playbook hands off through [Opening a PR](playbooks/opening-a-pr.md)
+  only after its local checks pass and forge authorization exists. Read-only
+  diagnosis playbooks end with their report and an explicit status instead of
+  entering a change handoff.
 
 ## Workflow contracts
 

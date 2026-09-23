@@ -16,7 +16,10 @@ Commits:
   story and pass its focused check.
 - Stage named files only. Keep local audit trails out of the tree unless the
   reviewer needs them.
-- Before a commit, run the prose and comment checks requested by the project.
+- Before a commit, run the prose and comment checks requested by the project,
+  including `$technical-writing`, `$unslop`, and `$no-comments` when those
+  skills are available. Record `NOT RUN` with the missing capability when one
+  is unavailable.
 
 Review package:
 

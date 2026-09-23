@@ -13,7 +13,9 @@ narrow it, and attribute it to source. Do not rerun the capture.
 5. Compare a paired capture when supplied. Without one, call the result the
    strongest hypothesis supported by the artifact.
 6. Hand back a cited diagnosis with no fix. Route to Bug fix or Perf issue
-   only after the cause is known. Keep the throughput checkpoint:
+   only after the cause is known. If a parser or source map is unavailable,
+   mark the result `BLOCKED`, `INCONCLUSIVE`, or `NOT RUN` and stop with the
+   trace report. Keep the throughput checkpoint:
    throughput checkpoint: n/a, read-only forensics.
 
 UNSUPPORTED-SEAM: a missing parser or source-map adapter limits the claim.

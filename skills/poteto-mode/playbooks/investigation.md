@@ -14,11 +14,13 @@ explanation or a recommendation.
    create a branch, edit code, create a PR, send a message, or mutate data.
 6. Apply $unslop to the final explanation. If the investigation is the
    prelude to a change, hand the evidence back and route to Bug fix or
-   Feature. Do not begin that change in this playbook.
+   Feature. Do not begin that change in this playbook. When a named surface is
+   unavailable, mark the result `BLOCKED`, `INCONCLUSIVE`, or `NOT RUN`.
 
 UNSUPPORTED-SEAM: external issue, chat, observability, or analytics sources are
 not assumed. Record the unavailable category and use local source evidence,
 explicitly supplied artifacts, or a bounded read-only connector.
 
-Reply with the investigation output, source pointers, confidence labels, and
-unresolved evidence gaps. The side-effect log must remain empty.
+Reply with an evidence report containing the investigation output, source
+pointers, confidence labels, and unresolved evidence gaps. The side-effect
+log must remain empty.
