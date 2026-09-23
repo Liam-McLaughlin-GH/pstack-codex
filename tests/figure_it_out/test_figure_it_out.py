@@ -1208,6 +1208,22 @@ class WorkflowBehaviorTests(unittest.TestCase):
             with self.assertRaises(figure_it_out.StateError):
                 figure_it_out.Workflow.load(state_path, workspace_root=root)
 
+    def test_refusal_decision_timestamps_must_be_timezone_aware_iso_values(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            with self.assertRaises(figure_it_out.ScopeRefusal):
+                workflow.guard_action("deploy", "production")
+            state_path = root / "run.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            refusal_event = next(event for event in state["events"] if event["event"] == "action_refused")
+            refusal_event["decision"]["at"] = "secret@host"
+            state["decisions"][0]["at"] = "secret@host"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(state_path, workspace_root=root)
+
     def test_schema_one_state_is_explicitly_migrated_to_schema_two(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

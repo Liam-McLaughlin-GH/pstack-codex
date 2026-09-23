@@ -548,6 +548,16 @@ def _state_text(value: Any, field: str, *, max_length: int = MAX_TEXT) -> None:
         raise StateError(f"invalid state: {exc}") from exc
 
 
+def _state_timestamp(value: Any, field: str) -> None:
+    _state_text(value, field, max_length=100)
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError) as exc:
+        raise StateError(f"invalid state: {field} must be an ISO 8601 timestamp") from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise StateError(f"invalid state: {field} must include a timezone")
+
+
 def _state_evidence(value: Any, field: str) -> None:
     if not isinstance(value, list):
         raise StateError(f"invalid state: {field} must be a list")
@@ -589,7 +599,7 @@ def _state_failure(value: Any, field: str) -> None:
     _state_text(value["reason"], f"{field}.reason", max_length=1000)
     _state_evidence(value["evidence"], f"{field}.evidence")
     _state_text(value["next_action"], f"{field}.next_action", max_length=1000)
-    _state_text(value["at"], f"{field}.at")
+    _state_timestamp(value["at"], f"{field}.at")
 
 
 def _require_state_fields(value: Mapping[str, Any], fields: set[str], label: str) -> None:
@@ -706,7 +716,8 @@ def _validate_lifecycle_graph_v2(
             DECISION_REQUIRED_FIELDS,
             f"events[{index}].decision",
         )
-        for field in ("at", "phase", "decision", "why"):
+        _state_timestamp(decision["at"], f"events[{index}].decision.at")
+        for field in ("phase", "decision", "why"):
             _state_text(decision[field], f"events[{index}].decision.{field}")
         if not isinstance(decision["result"], str) or decision["result"] not in VALID_RESULTS:
             fail(f"events[{index}].decision.result is invalid")
@@ -1058,7 +1069,7 @@ def _validate_lifecycle_graph_v2(
                 fail(f"events[{index}].result_snapshot has an invalid status")
             _state_evidence(snapshot["evidence"], f"events[{index}].result_snapshot.evidence")
             _state_text(snapshot["observed"], f"events[{index}].result_snapshot.observed", max_length=1000)
-            _state_text(snapshot["at"], f"events[{index}].result_snapshot.at")
+            _state_timestamp(snapshot["at"], f"events[{index}].result_snapshot.at")
             if decision["result"] != snapshot["status"] or decision["evidence"] != snapshot["evidence"]:
                 fail(f"events[{index}] predicate decision does not match its result")
             last_predicate_event[check_id] = event
@@ -1202,8 +1213,9 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
     _require_state_fields(state, required_fields, "root")
     if state["schema_version"] != SCHEMA_VERSION:
         raise StateError("invalid state: unsupported state schema")
-    for field in ("run_id", "created_at", "updated_at"):
-        _state_text(state[field], field)
+    _state_text(state["run_id"], "run_id", max_length=100)
+    for field in ("created_at", "updated_at"):
+        _state_timestamp(state[field], field)
 
     status = state["status"]
     if not isinstance(status, str) or status not in RUN_STATUSES:
@@ -1362,7 +1374,7 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
             raise StateError(f"invalid state: predicate_results[{check_id}] has an invalid passed/status pair")
         _state_evidence(result["evidence"], f"predicate_results[{check_id}].evidence")
         _state_text(result["observed"], f"predicate_results[{check_id}].observed", max_length=1000)
-        _state_text(result["at"], f"predicate_results[{check_id}].at")
+        _state_timestamp(result["at"], f"predicate_results[{check_id}].at")
 
     for index, decision in enumerate(state["decisions"]):
         if not isinstance(decision, Mapping):
@@ -1379,7 +1391,8 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
         )
         if isinstance(decision["event_sequence"], bool) or not isinstance(decision["event_sequence"], int) or decision["event_sequence"] < 1:
             raise StateError(f"invalid state: decisions[{index}].event_sequence must be positive")
-        for field in ("at", "phase", "decision", "why"):
+        _state_timestamp(decision["at"], f"decisions[{index}].at")
+        for field in ("phase", "decision", "why"):
             _state_text(decision[field], f"decisions[{index}].{field}")
         if not isinstance(decision["result"], str) or decision["result"] not in VALID_RESULTS:
             raise StateError(f"invalid state: decisions[{index}] has an invalid result")
@@ -1404,7 +1417,9 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
         )
         if isinstance(checkpoint["event_sequence"], bool) or not isinstance(checkpoint["event_sequence"], int) or checkpoint["event_sequence"] < 1:
             raise StateError(f"invalid state: checkpoints[{index}].event_sequence must be positive")
-        for field in ("id", "at", "phase", "label", "next_action"):
+        _state_text(checkpoint["id"], f"checkpoints[{index}].id")
+        _state_timestamp(checkpoint["at"], f"checkpoints[{index}].at")
+        for field in ("phase", "label", "next_action"):
             _state_text(checkpoint[field], f"checkpoints[{index}].{field}")
         if checkpoint["phase"] not in phase_ids:
             raise StateError(f"invalid state: checkpoints[{index}].phase is not a declared phase")
@@ -1431,7 +1446,8 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
             raise StateError(f"invalid state: replans[{index}].event_sequence must be positive")
         if isinstance(replan["number"], bool) or not isinstance(replan["number"], int) or replan["number"] < 1:
             raise StateError(f"invalid state: replans[{index}].number must be a positive integer")
-        for field in ("at", "phase", "reason", "next_action"):
+        _state_timestamp(replan["at"], f"replans[{index}].at")
+        for field in ("phase", "reason", "next_action"):
             _state_text(replan[field], f"replans[{index}].{field}")
         if replan["number"] != index + 1:
             raise StateError(f"invalid state: replans[{index}].number is not sequential")
@@ -1454,7 +1470,7 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
         _require_state_fields(event, {"at", "event", "sequence"}, f"events[{index}]")
         if isinstance(event["sequence"], bool) or not isinstance(event["sequence"], int) or event["sequence"] < 1:
             raise StateError(f"invalid state: events[{index}].sequence must be positive")
-        _state_text(event["at"], f"events[{index}].at")
+        _state_timestamp(event["at"], f"events[{index}].at")
         _state_text(event["event"], f"events[{index}].event")
 
     def has_event(event_name: str, **expected: Any) -> bool:
@@ -1494,7 +1510,7 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
         if not isinstance(blocker, Mapping):
             raise StateError("invalid state: blocker must be an object or null")
         _require_state_fields(blocker, {"at", "phase", "reason", "evidence", "next_action"}, "blocker")
-        _state_text(blocker["at"], "blocker.at")
+        _state_timestamp(blocker["at"], "blocker.at")
         _state_text(blocker["reason"], "blocker.reason")
         _state_text(blocker["next_action"], "blocker.next_action")
         if blocker["phase"] is not None and blocker["phase"] not in phase_ids:
@@ -1512,7 +1528,8 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
         if not isinstance(interruption, Mapping):
             raise StateError("invalid state: interruption must be an object or null")
         _require_state_fields(interruption, {"at", "phase", "checkpoint", "reason"}, "interruption")
-        for field in ("at", "phase", "checkpoint", "reason"):
+        _state_timestamp(interruption["at"], "interruption.at")
+        for field in ("phase", "checkpoint", "reason"):
             _state_text(interruption[field], f"interruption.{field}")
         if interruption["phase"] not in phase_ids:
             raise StateError("invalid state: interruption.phase is not a declared phase")
@@ -1531,7 +1548,7 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
         if not isinstance(terminal, Mapping):
             raise StateError("invalid state: completed runs require terminal details")
         _require_state_fields(terminal, {"at", "predicate", "checks"}, "terminal")
-        _state_text(terminal["at"], "terminal.at")
+        _state_timestamp(terminal["at"], "terminal.at")
         _state_text(terminal["predicate"], "terminal.predicate")
         if terminal["predicate"] != validated_plan["terminal_predicate"]["description"]:
             raise StateError("invalid state: terminal predicate does not match the plan")
