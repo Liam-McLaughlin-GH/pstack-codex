@@ -1067,6 +1067,52 @@ class MaintainVerificationSkillBehaviorTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, label + ": " + result.stderr)
                 self.assertEqual(json_output(result)["outcome"], "clean", label)
 
+    def test_dependency_free_frontmatter_rejects_less_indented_block_scalar_lines(self) -> None:
+        variants = {
+            "folded": "description: >-\n    Verify the tiny CLI:\n  through its shell harness.\n",
+            "literal": "description: |-\n    Verify the tiny CLI.\n  Keep line breaks.\n",
+        }
+        with tempfile.TemporaryDirectory(prefix="maintain-verification-frontmatter-block-indent-") as temporary:
+            root = Path(temporary)
+            for label, description in variants.items():
+                fixture_root = root / label
+                fixture_root.mkdir()
+                fixture = create_project(fixture_root, stale=False)
+                skill_file = fixture["skill_root"] / "SKILL.md"
+                body = skill_file.read_text(encoding="utf-8").split("---\n", 2)[2]
+                skill_file.write_text(
+                    "---\n"
+                    "name: verify-tiny\n"
+                    + description
+                    + "---\n"
+                    + body,
+                    encoding="utf-8",
+                )
+                result = run_helper_without_yaml(
+                    "audit",
+                    "--skill-root",
+                    str(fixture["skill_root"]),
+                    "--project-root",
+                    str(fixture["project"]),
+                    "--reader-report",
+                    str(fixture["reader_path"]),
+                    "--live-report",
+                    str(fixture["live_path"]),
+                    "--json",
+                )
+                self.assertEqual(result.returncode, 1, label + ": " + result.stderr)
+                payload = json_output(result)
+                self.assertEqual(payload["outcome"], "blocked", label)
+                self.assertTrue(
+                    any(
+                        item["kind"] == "doc-drift"
+                        and item.get("path") == "SKILL.md"
+                        and "invalid block scalar indentation" in item["message"]
+                        for item in payload["findings"]
+                    ),
+                    label,
+                )
+
     def test_dependency_free_frontmatter_rejects_malformed_scalars(self) -> None:
         variants = {
             "comment-null": "description: # comment",

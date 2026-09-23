@@ -366,7 +366,11 @@ def _block_scalar_value(
 
     if any(line.startswith("\t") for line in non_empty_lines):
         raise MaintainError(f"frontmatter field {key!r} has invalid block scalar indentation")
-    indent = explicit_indent or min(len(line) - len(line.lstrip(" ")) for line in non_empty_lines)
+    indent = (
+        explicit_indent
+        if explicit_indent is not None
+        else len(non_empty_lines[0]) - len(non_empty_lines[0].lstrip(" "))
+    )
     if indent < 1 or any(len(line) - len(line.lstrip(" ")) < indent for line in non_empty_lines):
         raise MaintainError(f"frontmatter field {key!r} has invalid block scalar indentation")
 
