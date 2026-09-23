@@ -78,8 +78,8 @@ frontmatter to the supported `name` and `description` fields, use lowercase
 hyphenated names, and link every bundled reference from `SKILL.md`.
 
 Put detailed, user-approved rules in a reference file when that keeps the
-skill body short. Include the source commit and retained copyright notice in a
-provenance reference. Link every bundled reference from `SKILL.md`, validate
+skill body short. Include the retained copyright notice in the skill or its
+bundled references. Link every bundled reference from `SKILL.md`, validate
 links in every bundled Markdown file with no-follow reads, and do not paste
 another skill into the generated skill.
 Run `$unslop` over the generated prose and validate frontmatter and relative
@@ -111,6 +111,4 @@ return the proposed reference content and the approved destination rather than
 silently choosing a personal storage path.
 
 Read [`references/codex-skill-contract.md`](references/codex-skill-contract.md)
-for the local authoring and validation contract. Read
-[`references/upstream-provenance.md`](references/upstream-provenance.md) when
-you need the pinned source or license notice.
+for the local authoring and validation contract when needed.
