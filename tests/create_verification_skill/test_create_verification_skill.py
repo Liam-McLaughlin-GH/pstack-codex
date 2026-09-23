@@ -1467,6 +1467,67 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
             self.assertEqual(competitor.stat().st_nlink, 2)
             self.assertEqual(list(destination_dir.iterdir()), [])
 
+    def test_publication_swap_after_identity_observation_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-publish-observation-race-") as temporary:
+            root = Path(temporary)
+            source_dir = root / "source"
+            destination_dir = root / "destination"
+            source_dir.mkdir()
+            destination_dir.mkdir()
+            source_path = source_dir / "source.txt"
+            source_path.write_text("original\n", encoding="utf-8")
+            competitor = root / "competitor.txt"
+            competitor.write_text("competitor\n", encoding="utf-8")
+            detached = root / "detached-original.txt"
+            source_fd = os.open(source_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            destination_fd = os.open(destination_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            original_identity = scaffold_module._published_identity
+            injected = False
+
+            def replace_after_observation(
+                parent_fd: int,
+                name: str,
+                *,
+                is_directory: bool,
+                entry_fd: int | None = None,
+            ) -> scaffold_module.PublishedEntry:
+                nonlocal injected
+                observed = original_identity(
+                    parent_fd,
+                    name,
+                    is_directory=is_directory,
+                    entry_fd=entry_fd,
+                )
+                if name == "published.txt" and not injected:
+                    destination = destination_dir / name
+                    destination.rename(detached)
+                    os.link(competitor, destination)
+                    injected = True
+                return observed
+
+            try:
+                with mock.patch.object(
+                    scaffold_module,
+                    "_published_identity",
+                    side_effect=replace_after_observation,
+                ):
+                    with self.assertRaises(CollisionError):
+                        scaffold_module._publish_entry_no_replace(
+                            source_path,
+                            destination_dir / "published.txt",
+                            destination_dir_fd=destination_fd,
+                            source_dir_fd=source_fd,
+                            source_name="source.txt",
+                            source_metadata=os.lstat(source_path),
+                        )
+            finally:
+                os.close(source_fd)
+                os.close(destination_fd)
+
+            self.assertTrue(injected)
+            self.assertEqual((destination_dir / "published.txt").read_text(encoding="utf-8"), "competitor\n")
+            self.assertEqual(detached.read_text(encoding="utf-8"), "original\n")
+
     def test_source_replacement_after_descriptor_binding_never_publishes_competitor(self) -> None:
         for kind in ("hardlink", "symlink", "fifo"):
             with self.subTest(kind=kind), tempfile.TemporaryDirectory(

@@ -2888,6 +2888,17 @@ def _publish_entry_no_replace(
             entry_fd=temporary_descriptor,
         )
         _close_published([observed])
+        # Recheck after closing the observation descriptor. A concurrent
+        # hook can swap the published name immediately after the first
+        # comparison; the second descriptor-versus-path check must turn that
+        # race into rollback.
+        observed = _published_identity(
+            destination_dir_fd,
+            destination_name,
+            is_directory=False,
+            entry_fd=temporary_descriptor,
+        )
+        _close_published([observed])
     except Exception:
         _rollback_published(published)
         raise
