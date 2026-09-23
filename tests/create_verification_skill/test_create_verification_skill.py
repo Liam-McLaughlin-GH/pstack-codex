@@ -476,7 +476,12 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
             ("busybox", ["sh", "-c", "echo unsafe"]),
             ("xargs", ["sh", "-c", "echo unsafe"]),
             ("python", ["-c", "print('unsafe')"]),
+            ("py", ["-c", "print('unsafe')"]),
+            ("pythonw", ["-c", "print('unsafe')"]),
+            ("pythonw.exe", ["--command", "print('unsafe')"]),
             ("node", ["-e", "console.log('unsafe')"]),
+            ("node", ["-p", "process.env.SECRET"]),
+            ("node", ["--print", "process.env.SECRET"]),
         )
         for executable, argv in cases:
             with self.subTest(executable=executable):
@@ -592,6 +597,18 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
             )
             errors = scaffold_module.validate_generated_skill(skill_root)
             self.assertTrue(any("must target declared disposable state" in error for error in errors), errors)
+
+    def test_cleanup_accepts_bounded_python_unbuffered_and_module_prefixes(self) -> None:
+        accepted_argv = (
+            ["-u", "tiny_app.py", "cleanup", "--state", "scratch/state.txt"],
+            ["-m", "tiny_app", "cleanup", "--state", "scratch/state.txt"],
+            ["-u", "-m", "tiny_app", "cleanup", "--state", "scratch/state.txt"],
+        )
+        for argv in accepted_argv:
+            with self.subTest(argv=argv):
+                spec = spec_for()
+                spec["app"]["cleanup"] = {"executable": sys.executable, "argv": argv}  # type: ignore[index]
+                validate_spec(spec)
 
 
     def test_existing_tree_rejects_blank_context_and_evidence_proof(self) -> None:
@@ -961,6 +978,285 @@ class CreateVerificationSkillBehaviorTests(unittest.TestCase):
                 else:
                     self.assertFalse(target.exists())
                     self.assertFalse((project / ".agents").exists())
+
+    def test_post_link_identity_failure_rolls_back_the_child(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="create-verification-post-link-identity-") as temporary:
+            root = Path(temporary)
+            project = root / "project"
+            project.mkdir()
+            copy_fixture(project)
+            target = project / ".agents" / "skills" / "verify-tiny-fixture"
+            original_identity = scaffold_module._published_identity
+            injected = False
+
+            def fail_after_regular_identity(
+                parent_fd: int,
+                name: str,
+                *,
+                is_directory: bool,
+                entry_fd: int | None = None,
+            ) -> scaffold_module.PublishedEntry:
+                nonlocal injected
+                observed = original_identity(
+                    parent_fd,
+                    name,
+                    is_directory=is_directory,
+                    entry_fd=entry_fd,
+                )
+                if not is_directory and not injected:
+                    injected = True
+                    scaffold_module._close_published([observed])
+                    raise ScaffoldError("forced post-link identity failure")
+                return observed
+
+            with mock.patch.object(
+                scaffold_module,
+                "_published_identity",
+                side_effect=fail_after_regular_identity,
+            ):
+                with self.assertRaises(ScaffoldError):
+                    scaffold_module.scaffold(spec_for(), project)
+
+            self.assertTrue(injected)
+            self.assertFalse(target.exists())
+            self.assertFalse((project / ".agents").exists())
+
+    def test_source_replacement_after_descriptor_binding_never_publishes_competitor(self) -> None:
+        for kind in ("hardlink", "symlink", "fifo"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(
+                prefix=f"create-verification-source-race-{kind}-"
+            ) as temporary:
+                root = Path(temporary)
+                project = root / "project"
+                project.mkdir()
+                copy_fixture(project)
+                outside = root / "competitor.txt"
+                outside.write_text("competitor\n", encoding="utf-8")
+                detached = root / "detached-source.txt"
+                target = project / ".agents" / "skills" / "verify-tiny-fixture"
+                original_open = scaffold_module._open_regular_descriptor
+                injected = False
+                detached_content: str | None = None
+
+                def race_source_open(
+                    name: Path | str,
+                    label: str,
+                    *,
+                    dir_fd: int | None = None,
+                ) -> int:
+                    nonlocal detached_content, injected
+                    descriptor = original_open(name, label, dir_fd=dir_fd)
+                    if label == "staging source file" and not injected:
+                        injected = True
+                        staging_root = project / ".agents" / "skills"
+                        source_path = next(staging_root.glob(".verify-tiny-fixture.staging-*"))
+                        source_path = source_path / str(name)
+                        detached_content = source_path.read_text(encoding="utf-8")
+                        source_path.rename(detached)
+                        if kind == "hardlink":
+                            os.link(outside, source_path)
+                        elif kind == "symlink":
+                            os.symlink(outside, source_path)
+                        else:
+                            os.mkfifo(source_path)
+                    return descriptor
+
+                with mock.patch.object(
+                    scaffold_module,
+                    "_open_regular_descriptor",
+                    side_effect=race_source_open,
+                ):
+                    with self.assertRaises((ScaffoldError, OSError)):
+                        scaffold_module.scaffold(spec_for(), project)
+
+                self.assertTrue(injected)
+                self.assertFalse(target.exists())
+                self.assertEqual(outside.read_text(encoding="utf-8"), "competitor\n")
+                self.assertIsNotNone(detached_content)
+                self.assertEqual(detached.read_text(encoding="utf-8"), detached_content)
+
+    def test_cleanup_identity_races_preserve_replacement_entries(self) -> None:
+        for kind in ("file", "empty-directory", "tree"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(
+                prefix=f"create-verification-cleanup-race-{kind}-"
+            ) as temporary:
+                root = Path(temporary)
+                parent = root / "parent"
+                parent.mkdir()
+                victim = parent / "victim"
+                replacement = parent / "replacement"
+                detached = root / "detached"
+                if kind == "file":
+                    victim.write_text("owned\n", encoding="utf-8")
+                    replacement.write_text("competitor\n", encoding="utf-8")
+                elif kind == "empty-directory":
+                    victim.mkdir()
+                    replacement.mkdir()
+                    (replacement / "sentinel.txt").write_text("competitor\n", encoding="utf-8")
+                else:
+                    victim.mkdir()
+                    (victim / "owned.txt").write_text("owned\n", encoding="utf-8")
+                    replacement.mkdir()
+                    (replacement / "sentinel.txt").write_text("competitor\n", encoding="utf-8")
+
+                expected = os.lstat(victim)
+                parent_fd = os.open(
+                    parent,
+                    os.O_RDONLY
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                )
+                original_atomic = scaffold_module._atomic_rename_noreplace
+                injected = False
+
+                def race_quarantine(
+                    old_dir_fd: int,
+                    old_name: str,
+                    new_dir_fd: int,
+                    new_name: str,
+                ) -> None:
+                    nonlocal injected
+                    if old_dir_fd == parent_fd and old_name == "victim" and not injected:
+                        injected = True
+                        victim.rename(detached)
+                        replacement.rename(victim)
+                    original_atomic(old_dir_fd, old_name, new_dir_fd, new_name)
+
+                try:
+                    with mock.patch.object(
+                        scaffold_module,
+                        "_atomic_rename_noreplace",
+                        side_effect=race_quarantine,
+                    ):
+                        with self.assertRaises((ScaffoldError, OSError)):
+                            if kind == "file":
+                                scaffold_module._remove_owned_entry(
+                                    parent_fd,
+                                    "victim",
+                                    expected.st_dev,
+                                    expected.st_ino,
+                                    is_directory=False,
+                                )
+                            elif kind == "empty-directory":
+                                scaffold_module._remove_owned_empty_directory(
+                                    parent_fd,
+                                    "victim",
+                                    expected.st_dev,
+                                    expected.st_ino,
+                                )
+                            else:
+                                scaffold_module._remove_tree_at(
+                                    parent_fd,
+                                    "victim",
+                                    expected.st_dev,
+                                    expected.st_ino,
+                                )
+                finally:
+                    os.close(parent_fd)
+
+                self.assertTrue(injected)
+                self.assertEqual(victim.read_text(encoding="utf-8") if kind == "file" else (victim / "sentinel.txt").read_text(encoding="utf-8"), "competitor\n")
+                self.assertTrue(detached.exists())
+                if kind == "file":
+                    self.assertEqual(detached.read_text(encoding="utf-8"), "owned\n")
+                else:
+                    self.assertTrue(detached.is_dir())
+
+    def test_reservation_identity_capture_failure_cleans_only_owned_entry(self) -> None:
+        for phase in ("staging", "target"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory(
+                prefix=f"create-verification-reservation-capture-{phase}-"
+            ) as temporary:
+                root = Path(temporary)
+                project = root / "project"
+                project.mkdir()
+                copy_fixture(project)
+                original_identity = scaffold_module._published_identity
+                injected = False
+
+                def fail_reservation_capture(
+                    parent_fd: int,
+                    name: str,
+                    *,
+                    is_directory: bool,
+                    entry_fd: int | None = None,
+                ) -> scaffold_module.PublishedEntry:
+                    nonlocal injected
+                    is_target = name == "verify-tiny-fixture"
+                    is_staging = name.startswith(".verify-tiny-fixture.staging-")
+                    if (phase == "target" and is_target) or (phase == "staging" and is_staging):
+                        injected = True
+                        raise ScaffoldError("forced reservation identity capture failure")
+                    return original_identity(
+                        parent_fd,
+                        name,
+                        is_directory=is_directory,
+                        entry_fd=entry_fd,
+                    )
+
+                with mock.patch.object(
+                    scaffold_module,
+                    "_published_identity",
+                    side_effect=fail_reservation_capture,
+                ):
+                    with self.assertRaises(ScaffoldError):
+                        scaffold_module.scaffold(spec_for(), project)
+
+                self.assertTrue(injected)
+                self.assertFalse((project / ".agents").exists())
+
+    def test_reservation_identity_mismatch_preserves_competitor_and_owned_detached_entry(self) -> None:
+        for phase in ("staging", "target"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory(
+                prefix=f"create-verification-reservation-race-{phase}-"
+            ) as temporary:
+                root = Path(temporary)
+                project = root / "project"
+                project.mkdir()
+                copy_fixture(project)
+                skills_parent = project / ".agents" / "skills"
+                target = skills_parent / "verify-tiny-fixture"
+                detached = root / f"detached-{phase}"
+                original_identity = scaffold_module._published_identity
+                injected = False
+
+                def replace_before_capture(
+                    parent_fd: int,
+                    name: str,
+                    *,
+                    is_directory: bool,
+                    entry_fd: int | None = None,
+                ) -> scaffold_module.PublishedEntry:
+                    nonlocal injected
+                    is_target = name == "verify-tiny-fixture"
+                    is_staging = name.startswith(".verify-tiny-fixture.staging-")
+                    if (phase == "target" and is_target) or (phase == "staging" and is_staging):
+                        injected = True
+                        entry = target if phase == "target" else skills_parent / name
+                        entry.rename(detached)
+                        entry.mkdir()
+                        (entry / "sentinel.txt").write_text("competitor\n", encoding="utf-8")
+                    return original_identity(
+                        parent_fd,
+                        name,
+                        is_directory=is_directory,
+                        entry_fd=entry_fd,
+                    )
+
+                with mock.patch.object(
+                    scaffold_module,
+                    "_published_identity",
+                    side_effect=replace_before_capture,
+                ):
+                    with self.assertRaises((ScaffoldError, OSError)):
+                        scaffold_module.scaffold(spec_for(), project)
+
+                self.assertTrue(injected)
+                entry = target if phase == "target" else next(
+                    skills_parent.glob(".verify-tiny-fixture.staging-*")
+                )
+                self.assertEqual((entry / "sentinel.txt").read_text(encoding="utf-8"), "competitor\n")
+                self.assertTrue(detached.is_dir())
 
     def test_existing_tree_revalidates_all_emitted_command_contracts(self) -> None:
         with tempfile.TemporaryDirectory(prefix="create-verification-command-validation-") as temporary:
