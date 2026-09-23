@@ -278,7 +278,13 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             def fail_publication(parent_fd: int, source_name: str, target_name: str) -> None:
                 raise OSError("injected publication failure")
 
-            def replace_final_parent(parent_fd: int, name: str, *, is_directory: bool) -> None:
+            def replace_final_parent(
+                parent_fd: int,
+                name: str,
+                *,
+                is_directory: bool,
+                **kwargs: object,
+            ) -> None:
                 nonlocal directory_checks, swapped
                 if is_directory:
                     directory_checks += 1
@@ -287,7 +293,7 @@ class SetupPstackBehaviorTests(unittest.TestCase):
                     os.rename(destination, expected_parent)
                     os.rename(replacement, destination)
                     raise safe_fs.SafeFilesystemError("injected final parent replacement")
-                original_unlink(parent_fd, name, is_directory=is_directory)
+                original_unlink(parent_fd, name, is_directory=is_directory, **kwargs)
 
             module.atomic_rename_noreplace_at = fail_publication
             safe_fs._native_unlink_at = replace_final_parent
@@ -863,7 +869,13 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             def fail_publication(parent_fd: int, source_name: str, target_name: str) -> None:
                 raise OSError("injected configuration publication failure")
 
-            def replace_final_parent(parent_fd: int, name: str, *, is_directory: bool) -> None:
+            def replace_final_parent(
+                parent_fd: int,
+                name: str,
+                *,
+                is_directory: bool,
+                **kwargs: object,
+            ) -> None:
                 nonlocal directory_checks, swapped
                 if is_directory:
                     directory_checks += 1
@@ -872,7 +884,7 @@ class SetupPstackBehaviorTests(unittest.TestCase):
                     os.rename(rollback_agents.parent, expected_parent)
                     os.rename(replacement_parent, rollback_agents.parent)
                     raise safe_fs.SafeFilesystemError("injected final configuration parent replacement")
-                original_unlink(parent_fd, name, is_directory=is_directory)
+                original_unlink(parent_fd, name, is_directory=is_directory, **kwargs)
 
             module.atomic_rename_noreplace_at = fail_publication
             safe_fs._native_unlink_at = replace_final_parent
@@ -1273,6 +1285,68 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertIsNotNone(raised.exception.recovery_receipt)
             self.assertEqual((residue / "operator.txt").read_text(encoding="utf-8"), "keep me\n")
             self.assertEqual((root / "expected-root" / "expected.txt").read_text(encoding="utf-8"), "expected\n")
+
+    def test_final_quarantine_race_preserves_competitor_and_reports_receipt(self) -> None:
+        module = load_module(CONFIGURER, "configure_for_final_quarantine_race_test")
+        safe_fs = sys.modules["safe_fs"]
+        for kind in ("file", "empty-directory"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(prefix="setup-pstack-final-quarantine-race-test-") as temporary:
+                root = Path(temporary)
+                parent = root / "parent"
+                parent.mkdir()
+                residue = parent / ".pstack-agents-old-final"
+                residue.mkdir()
+                victim = residue / "victim"
+                competitor = root / "competitor"
+                if kind == "file":
+                    victim.write_text("expected\n", encoding="utf-8")
+                    competitor.write_text("competitor\n", encoding="utf-8")
+                else:
+                    victim.mkdir()
+                    competitor.mkdir()
+                original_delete = safe_fs._native_unlink_at
+                swapped = False
+
+                def replace_after_quarantine_check(
+                    directory_fd: int,
+                    name: str,
+                    *,
+                    is_directory: bool,
+                    **kwargs: object,
+                ) -> None:
+                    nonlocal swapped
+                    if name == "entry" and not swapped:
+                        swapped = True
+                        os.rename(name, root / "expected-private", src_dir_fd=directory_fd)
+                        os.rename(competitor, name, dst_dir_fd=directory_fd)
+                    original_delete(
+                        directory_fd,
+                        name,
+                        is_directory=is_directory,
+                        **kwargs,
+                    )
+
+                safe_fs._native_unlink_at = replace_after_quarantine_check
+                try:
+                    with self.assertRaises(module.ConfigurationError) as raised:
+                        module._cleanup_residue(residue)
+                finally:
+                    safe_fs._native_unlink_at = original_delete
+
+                self.assertTrue(swapped)
+                self.assertEqual(raised.exception.status, "cleanup_refused")
+                self.assertEqual(raised.exception.recovery_state, "cleanup_recovery_pending")
+                self.assertIsNotNone(raised.exception.recovery_receipt)
+                self.assertIn("--expected-dev", raised.exception.retry or "")
+                quarantine_dirs = sorted(residue.glob(".pstack-dispose-*"))
+                self.assertEqual(len(quarantine_dirs), 1)
+                preserved_competitor = quarantine_dirs[0] / "entry"
+                self.assertTrue(preserved_competitor.exists())
+                if kind == "file":
+                    self.assertEqual(preserved_competitor.read_text(encoding="utf-8"), "competitor\n")
+                else:
+                    self.assertTrue(preserved_competitor.is_dir())
+                    self.assertEqual(list(preserved_competitor.iterdir()), [])
 
     def test_created_parent_recovery_receipt_is_bounded_and_deterministic(self) -> None:
         module = load_module(CONFIGURER, "configure_for_bounded_cleanup_receipt_test")

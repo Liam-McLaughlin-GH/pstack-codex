@@ -18,11 +18,18 @@ from pathlib import Path
 class SafeFilesystemError(RuntimeError):
     """Raised when a requested path cannot be used without following a link."""
 
-    def __init__(self, message: str, *, cleanup_receipt: "CleanupReceipt | None" = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        cleanup_receipt: "CleanupReceipt | None" = None,
+        preserve_private: bool = False,
+    ) -> None:
         super().__init__(message)
         self.cleanup_receipt = cleanup_receipt
         self.recovery_receipt = cleanup_receipt
         self.receipt = cleanup_receipt
+        self.preserve_private = preserve_private
 
 
 @dataclass(frozen=True)
@@ -313,6 +320,7 @@ def _with_cleanup_receipt(
     return SafeFilesystemError(
         str(error),
         cleanup_receipt=CleanupReceipt.from_entries(entries),
+        preserve_private=getattr(error, "preserve_private", False),
     )
 
 
@@ -400,16 +408,114 @@ def unique_entry_name(parent_fd: int, prefix: str) -> str:
     raise SafeFilesystemError(f"could not allocate a temporary name in {parent_fd}")
 
 
-def _native_unlink_at(parent_fd: int, name: str, *, is_directory: bool) -> None:
-    """Remove a quarantined entry through the platform unlinkat primitive.
+class _DarwinFSRef(ctypes.Structure):
+    _fields_ = [("hidden", ctypes.c_ubyte * 80)]
 
-    The final destructive operation is deliberately kept out of the public
-    ``os.unlink``/``os.rmdir`` attributes.  That prevents a caller from
-    interposing a second public-name replacement between the quarantine claim
-    and the removal.  The directory descriptor is held open for the complete
-    quarantine lifetime, so the final lookup is relative to the directory we
-    bound rather than to a path assembled later.
-    """
+
+def _darwin_file_manager_functions():
+    try:
+        framework = ctypes.CDLL(None, use_errno=True)
+        make_reference = getattr(framework, "FSPathMakeRefWithOptions")
+        delete_reference = getattr(framework, "FSDeleteObject")
+    except (AttributeError, OSError) as exc:
+        raise SafeFilesystemError(
+            "Darwin has no identity-bound cleanup primitive",
+            preserve_private=True,
+        ) from exc
+    make_reference.argtypes = [
+        ctypes.c_char_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(_DarwinFSRef),
+        ctypes.POINTER(ctypes.c_ubyte),
+    ]
+    make_reference.restype = ctypes.c_int32
+    delete_reference.argtypes = [ctypes.POINTER(_DarwinFSRef)]
+    delete_reference.restype = ctypes.c_int16
+    return make_reference, delete_reference
+
+
+def _darwin_path_for_fd(directory_fd: int) -> bytes:
+    get_path = getattr(fcntl, "F_GETPATH", 50)
+    try:
+        raw_path = fcntl.fcntl(directory_fd, get_path, b"\0" * 1024)
+    except OSError as exc:
+        raise SafeFilesystemError("could not resolve a Darwin directory descriptor") from exc
+    path = raw_path.split(b"\0", 1)[0]
+    if not path:
+        raise SafeFilesystemError("Darwin returned an empty directory descriptor path")
+    return path
+
+
+def _darwin_identity_reference_at(
+    directory_fd: int,
+    name: str,
+    expected_metadata: os.stat_result,
+    *,
+    receipt_path: Path,
+) -> _DarwinFSRef:
+    """Bind a Darwin entry to an FSRef while checking its descriptor-relative identity."""
+
+    try:
+        current_before = lstat_at(directory_fd, name)
+        if not _same_entry(current_before, expected_metadata):
+            raise SafeFilesystemError(f"entry identity changed during removal: {name}")
+        make_reference, _ = _darwin_file_manager_functions()
+        reference = _DarwinFSRef()
+        is_directory = ctypes.c_ubyte()
+        entry_path = _darwin_path_for_fd(directory_fd).rstrip(b"/") + b"/" + os.fsencode(name)
+        status = make_reference(entry_path, 0x01, ctypes.byref(reference), ctypes.byref(is_directory))
+        if status != 0:
+            raise OSError(errno.EIO, f"FSPathMakeRefWithOptions failed with status {status}", name)
+        current_after = lstat_at(directory_fd, name)
+        if not _same_entry(current_after, expected_metadata):
+            raise SafeFilesystemError(f"entry identity changed during removal: {name}")
+        if bool(is_directory.value) != stat.S_ISDIR(expected_metadata.st_mode):
+            raise SafeFilesystemError(f"entry type changed during removal: {name}")
+        return reference
+    except BaseException as exc:
+        if isinstance(exc, SafeFilesystemError) and exc.cleanup_receipt is not None:
+            raise exc
+        reason = "identity-delete-unavailable" if getattr(exc, "preserve_private", False) else "replaced"
+        raise _with_cleanup_receipt(
+            exc,
+            path=receipt_path,
+            expected_metadata=expected_metadata,
+            reason=reason,
+        ) from exc
+
+
+def _darwin_delete_reference(reference: _DarwinFSRef, name: str) -> None:
+    _, delete_reference = _darwin_file_manager_functions()
+    status = delete_reference(ctypes.byref(reference))
+    if status != 0:
+        raise OSError(errno.EIO, f"FSDeleteObject failed with status {status}", name)
+
+
+def _native_unlink_at(
+    parent_fd: int,
+    name: str,
+    *,
+    is_directory: bool,
+    expected_metadata: os.stat_result,
+    identity_reference: _DarwinFSRef | None = None,
+    receipt_path: Path | None = None,
+) -> None:
+    """Remove an entry through an identity-bound primitive when required."""
+
+    if sys.platform == "darwin":
+        if identity_reference is None:
+            unavailable = SafeFilesystemError(
+                "Darwin identity-bound cleanup is unavailable; private entry preserved",
+                preserve_private=True,
+            )
+            raise _with_cleanup_receipt(
+                unavailable,
+                path=receipt_path or Path(name),
+                expected_metadata=expected_metadata,
+                reason="identity-delete-unavailable",
+            )
+        _darwin_delete_reference(identity_reference, name)
+        return
 
     try:
         libc = ctypes.CDLL(None, use_errno=True)
@@ -419,8 +525,7 @@ def _native_unlink_at(parent_fd: int, name: str, *, is_directory: bool) -> None:
 
     function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
     function.restype = ctypes.c_int
-    # Darwin's AT_REMOVEDIR is 0x80; Linux uses 0x200.
-    flags = (0x00000080 if sys.platform == "darwin" else 0x00000200) if is_directory else 0
+    flags = 0x00000200 if is_directory else 0
     result = function(parent_fd, os.fsencode(name), flags)
     if result != 0:
         error_number = ctypes.get_errno()
@@ -684,17 +789,20 @@ def _delete_private_entry(
 
     The second no-replace rename protects the first private name.  The third
     move puts the expected identity below a separately opened, mode-700
-    quarantine directory.  The final unlinkat is relative to that held
-    directory descriptor, never to the public or first private name.  If any
-    claim fails, the expected entry is restored without replacing a competitor
-    and the caller receives a bounded recovery receipt.
+    quarantine directory.  Darwin cleanup uses a reference bound before the
+    final removal; an unavailable identity-bound primitive leaves the private
+    entry in place and returns a bounded recovery receipt.
     """
 
     delete_name: str | None = None
     quarantine_name: str | None = None
     quarantine_fd: int | None = None
-    quarantine_entry_name = "entry"
-    quarantine_metadata: os.stat_result | None = None
+    quarantine_entry_name: str | None = "entry"
+    quarantine_directory_metadata: os.stat_result | None = None
+    quarantine_directory_reference: _DarwinFSRef | None = None
+    quarantine_entry_metadata: os.stat_result | None = None
+    quarantine_entry_reference: _DarwinFSRef | None = None
+    quarantine_receipt_path: Path | None = None
     try:
         current_metadata = lstat_at(parent_fd, private_name)
         if not _same_entry(current_metadata, expected_metadata):
@@ -704,30 +812,56 @@ def _delete_private_entry(
         claimed_metadata = lstat_at(parent_fd, delete_name)
         if not _same_entry(claimed_metadata, expected_metadata):
             raise SafeFilesystemError(f"private cleanup identity changed: {private_name}")
+        if sys.platform == "darwin":
+            quarantine_entry_reference = _darwin_identity_reference_at(
+                parent_fd,
+                delete_name,
+                claimed_metadata,
+                receipt_path=receipt_path,
+            )
 
         quarantine_name, quarantine_fd = create_unique_directory(
             parent_fd,
             ".pstack-dispose-",
             mode=0o700,
         )
+        quarantine_receipt_path = receipt_path.parent / quarantine_name
+        quarantine_directory_metadata = os.fstat(quarantine_fd)
+        if sys.platform == "darwin":
+            quarantine_directory_reference = _darwin_identity_reference_at(
+                parent_fd,
+                quarantine_name,
+                quarantine_directory_metadata,
+                receipt_path=quarantine_receipt_path,
+            )
         atomic_rename_noreplace_between(
             parent_fd,
             delete_name,
             quarantine_fd,
             quarantine_entry_name,
         )
-        quarantine_metadata = lstat_at(quarantine_fd, quarantine_entry_name)
-        if not _same_entry(quarantine_metadata, expected_metadata):
+        quarantine_entry_metadata = lstat_at(quarantine_fd, quarantine_entry_name)
+        if not _same_entry(quarantine_entry_metadata, expected_metadata):
             raise SafeFilesystemError(f"private cleanup identity changed in quarantine: {private_name}")
         _native_unlink_at(
             quarantine_fd,
             quarantine_entry_name,
             is_directory=is_directory,
+            expected_metadata=quarantine_entry_metadata,
+            identity_reference=quarantine_entry_reference,
+            receipt_path=receipt_path,
         )
         quarantine_entry_name = None
         os.close(quarantine_fd)
         quarantine_fd = None
-        _native_unlink_at(parent_fd, quarantine_name, is_directory=True)
+        _native_unlink_at(
+            parent_fd,
+            quarantine_name,
+            is_directory=True,
+            expected_metadata=quarantine_directory_metadata,
+            identity_reference=quarantine_directory_reference,
+            receipt_path=quarantine_receipt_path,
+        )
         quarantine_name = None
         try:
             lstat_at(parent_fd, public_name)
@@ -735,35 +869,80 @@ def _delete_private_entry(
             return
         raise SafeFilesystemError(f"replacement appeared during removal: {public_name}")
     except BaseException as exc:
-        if quarantine_fd is not None and quarantine_entry_name is not None:
+        preserve_private = isinstance(exc, SafeFilesystemError) and exc.preserve_private
+        if preserve_private and delete_name is not None and quarantine_entry_name is not None:
+            exc = _with_cleanup_receipt(
+                exc,
+                path=receipt_path.parent / delete_name,
+                expected_metadata=expected_metadata,
+                reason="private-cleanup-pending",
+            )
+        if preserve_private and quarantine_entry_metadata is not None and quarantine_entry_name is not None:
+            exc = _with_cleanup_receipt(
+                exc,
+                path=(quarantine_receipt_path or receipt_path.parent) / quarantine_entry_name,
+                expected_metadata=quarantine_entry_metadata,
+                reason="private-cleanup-pending",
+            )
+        if not preserve_private and quarantine_fd is not None and quarantine_entry_name is not None:
             try:
-                lstat_at(quarantine_fd, quarantine_entry_name)
+                current_entry_metadata = lstat_at(quarantine_fd, quarantine_entry_name)
             except FileNotFoundError:
                 pass
             else:
-                if delete_name is None:
-                    delete_name = unique_entry_name(parent_fd, ".pstack-cleanup-")
-                try:
-                    atomic_rename_noreplace_between(
-                        quarantine_fd,
-                        quarantine_entry_name,
-                        parent_fd,
-                        delete_name,
+                if quarantine_entry_metadata is not None and not _same_entry(
+                    current_entry_metadata,
+                    quarantine_entry_metadata,
+                ):
+                    exc = _with_cleanup_receipt(
+                        exc,
+                        path=(quarantine_receipt_path or receipt_path.parent) / quarantine_entry_name,
+                        expected_metadata=quarantine_entry_metadata,
+                        reason="replaced",
                     )
-                except (OSError, SafeFilesystemError) as restore_error:
-                    exc = SafeFilesystemError(f"{exc}; {restore_error}")
-        if delete_name is not None:
+                else:
+                    if delete_name is None:
+                        delete_name = unique_entry_name(parent_fd, ".pstack-cleanup-")
+                    try:
+                        atomic_rename_noreplace_between(
+                            quarantine_fd,
+                            quarantine_entry_name,
+                            parent_fd,
+                            delete_name,
+                        )
+                    except (OSError, SafeFilesystemError) as restore_error:
+                        exc = SafeFilesystemError(f"{exc}; {restore_error}")
+        if delete_name is not None and not preserve_private:
             try:
                 _restore_bound_entry(parent_fd, public_name, delete_name)
             except SafeFilesystemError as restore_error:
                 exc = SafeFilesystemError(f"{exc}; {restore_error}")
         if quarantine_name is not None:
+            current_quarantine_metadata: os.stat_result | None = None
             try:
-                quarantine_metadata = lstat_at(parent_fd, quarantine_name)
-                if stat.S_ISDIR(quarantine_metadata.st_mode):
-                    _native_unlink_at(parent_fd, quarantine_name, is_directory=True)
-            except (OSError, SafeFilesystemError) as cleanup_error:
-                exc = SafeFilesystemError(f"{exc}; {cleanup_error}")
+                current_quarantine_metadata = lstat_at(parent_fd, quarantine_name)
+            except FileNotFoundError:
+                pass
+            else:
+                if stat.S_ISDIR(current_quarantine_metadata.st_mode):
+                    if quarantine_directory_metadata is None:
+                        quarantine_directory_metadata = current_quarantine_metadata
+                    try:
+                        _native_unlink_at(
+                            parent_fd,
+                            quarantine_name,
+                            is_directory=True,
+                            expected_metadata=quarantine_directory_metadata,
+                            identity_reference=quarantine_directory_reference,
+                            receipt_path=quarantine_receipt_path or receipt_path.parent / quarantine_name,
+                        )
+                    except (OSError, SafeFilesystemError) as cleanup_error:
+                        exc = _with_cleanup_receipt(
+                            exc,
+                            path=quarantine_receipt_path or receipt_path.parent / quarantine_name,
+                            expected_metadata=quarantine_directory_metadata,
+                            reason="cleanup-recovery-pending",
+                        )
         if quarantine_fd is not None:
             try:
                 os.close(quarantine_fd)
