@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import importlib.util
 import json
 import os
@@ -711,7 +712,16 @@ class WorkflowBehaviorTests(unittest.TestCase):
             self.assertEqual((root / "atomic" / "run.json").read_bytes(), before_bytes)
 
     def test_evidence_requires_concrete_local_references_for_bare_and_structured_values(self):
-        invalid_references = ["not-run", "not_run", "https://example.test/result", "file:///tmp/result", "foo:bar"]
+        invalid_references = [
+            "not-run",
+            "not_run",
+            "https://example.test/result",
+            "file:///tmp/result",
+            "foo:bar",
+            "tests/test_workflow.py:not-a-line",
+            "check:../outside",
+            "check:",
+        ]
         for reference in invalid_references:
             with self.subTest(kind="bare", reference=reference):
                 with self.assertRaises(figure_it_out.PlanError):
@@ -881,6 +891,181 @@ class WorkflowBehaviorTests(unittest.TestCase):
 
             self.assertEqual(workflow.state, before_state)
             self.assertEqual((root / "run.json").read_bytes(), before_bytes)
+
+    def test_start_and_finish_restore_live_state_when_replace_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            starting = self.workflow(root / "start", phase_count=1)
+            before_state = deepcopy(starting.state)
+            before_bytes = (root / "start" / "run.json").read_bytes()
+            with patch.object(figure_it_out.os, "replace", side_effect=OSError("simulated replace failure")):
+                with self.assertRaises(OSError):
+                    starting.start_phase()
+            self.assertEqual(starting.state, before_state)
+            self.assertEqual((root / "start" / "run.json").read_bytes(), before_bytes)
+
+            finishing = self.workflow(root / "finish", phase_count=1)
+            finishing.start_phase()
+            finishing.complete_phase(
+                "output",
+                {"check_id": "check-1", "passed": True, "evidence": ["tests/pass.txt"]},
+            )
+            finishing.record_predicate("focused-tests", True, ["tests/focused.txt"])
+            finishing.record_predicate("artifact-inspection", True, ["tests/artifact.txt"])
+            before_state = deepcopy(finishing.state)
+            before_bytes = (root / "finish" / "run.json").read_bytes()
+            with patch.object(figure_it_out.os, "replace", side_effect=OSError("simulated replace failure")):
+                with self.assertRaises(OSError):
+                    finishing.finish()
+            self.assertEqual(finishing.state, before_state)
+            self.assertEqual((root / "finish" / "run.json").read_bytes(), before_bytes)
+
+    def test_persisted_graph_requires_exact_reverse_lifecycle_bindings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            cases = {
+                "orphan-checkpoint": (
+                    lambda workflow: (workflow.start_phase(), workflow.checkpoint("safe point", ["artifacts/cp.txt"], "continue")),
+                    lambda state: state["checkpoints"].append({**deepcopy(state["checkpoints"][0]), "id": "cp-orphan", "event_sequence": 99}),
+                ),
+                "missing-checkpoint-reverse-reference": (
+                    lambda workflow: (workflow.start_phase(), workflow.checkpoint("safe point", ["artifacts/cp.txt"], "continue")),
+                    lambda state: state["phases"][0].update(checkpoints=[]),
+                ),
+                "missing-checkpoint-event": (
+                    lambda workflow: (workflow.start_phase(), workflow.checkpoint("safe point", ["artifacts/cp.txt"], "continue")),
+                    lambda state: state["events"].__setitem__(
+                        slice(None), [event for event in state["events"] if event["event"] != "checkpoint"]
+                    ),
+                ),
+                "orphan-replan": (
+                    lambda workflow: (
+                        workflow.start_phase(),
+                        workflow.fail_phase("check disagreed", ["tests/failure.txt"], "replan the phase"),
+                        workflow.replan("change approach", ["tests/replan.txt"], "start again"),
+                    ),
+                    lambda state: state["replans"].append({**deepcopy(state["replans"][0]), "number": 2, "event_sequence": 99}),
+                ),
+                "missing-replan-event": (
+                    lambda workflow: (
+                        workflow.start_phase(),
+                        workflow.fail_phase("check disagreed", ["tests/failure.txt"], "replan the phase"),
+                        workflow.replan("change approach", ["tests/replan.txt"], "start again"),
+                    ),
+                    lambda state: state["events"].__setitem__(
+                        slice(None), [event for event in state["events"] if event["event"] != "replanned"]
+                    ),
+                ),
+            }
+            for name, (setup, mutate) in cases.items():
+                with self.subTest(case=name):
+                    run_root = root / name
+                    workflow = self.workflow(run_root, phase_count=1)
+                    setup(workflow)
+                    state_path = run_root / "run.json"
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    mutate(state)
+                    state_path.write_text(json.dumps(state), encoding="utf-8")
+                    with self.assertRaises(figure_it_out.StateError):
+                        figure_it_out.Workflow.load(state_path, workspace_root=run_root)
+
+            phase_pass = self.workflow(root / "phase-pass-decision", phase_count=1)
+            phase_pass.start_phase()
+            phase_pass.complete_phase(
+                "output",
+                {"check_id": "check-1", "passed": True, "evidence": ["tests/pass.txt"]},
+            )
+            state_path = root / "phase-pass-decision" / "run.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            pass_event = next(event for event in state["events"] if event["event"] == "phase_passed")
+            state["decisions"] = [
+                decision for decision in state["decisions"] if decision["event_sequence"] != pass_event["sequence"]
+            ]
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(state_path, workspace_root=root / "phase-pass-decision")
+
+            forged = self.workflow(root / "forged-phase-pass-decision", phase_count=1)
+            forged.start_phase()
+            forged.complete_phase(
+                "output",
+                {"check_id": "check-1", "passed": True, "evidence": ["tests/pass.txt"]},
+            )
+            state_path = root / "forged-phase-pass-decision" / "run.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            pass_event = next(event for event in state["events"] if event["event"] == "phase_passed")
+            pass_event["decision"]["why"] = "forged decision"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(state_path, workspace_root=root / "forged-phase-pass-decision")
+
+    def test_event_sequence_preserves_append_order_and_exports_overflow_refusals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1, max_decisions=1)
+            workflow.start_phase()
+            timestamp = "2026-09-23T00:00:00+00:00"
+            with patch.object(figure_it_out, "_now", return_value=timestamp):
+                workflow.record_decision("phase-1", "first decision", "bounded test", ["tests/decision.txt"], "open")
+                workflow.checkpoint("after decision", ["artifacts/checkpoint.txt"], "continue phase-1")
+                for _ in range(2):
+                    with self.assertRaises(figure_it_out.ScopeRefusal):
+                        workflow.guard_action("deploy", "production")
+
+            self.assertEqual([event["sequence"] for event in workflow.state["events"]], list(range(1, len(workflow.state["events"]) + 1)))
+            audit_path = workflow.export_audit(root / "audit.tsv")
+            with audit_path.open(encoding="utf-8", newline="") as handle:
+                audit_rows = list(csv.reader(handle, delimiter="\t"))
+            self.assertEqual(audit_rows[1][2], "first decision")
+            self.assertEqual(audit_rows[2][2], "checkpoint: after decision")
+            refusals = [row for row in audit_rows if row[2] == "refused action deploy"]
+            self.assertEqual(len(refusals), 2)
+            self.assertEqual(workflow.state["events"][-1]["decision_in_list"], False)
+            self.assertEqual(
+                len([event for event in workflow.state["events"] if event["event"] == "action_refused"]),
+                len(refusals),
+            )
+
+            forged = json.loads((root / "run.json").read_text(encoding="utf-8"))
+            forged["events"][1]["sequence"] = forged["events"][0]["sequence"]
+            (root / "run.json").write_text(json.dumps(forged), encoding="utf-8")
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(root / "run.json", workspace_root=root)
+
+    def test_schema_one_state_is_explicitly_migrated_to_schema_two(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.completed_workflow(root)
+            state_path = root / "run.json"
+            legacy = json.loads(state_path.read_text(encoding="utf-8"))
+            legacy["schema_version"] = 1
+            legacy["plan"]["schema_version"] = 1
+            for event in legacy["events"]:
+                event.pop("sequence", None)
+                event.pop("decision", None)
+                event.pop("decision_in_list", None)
+                event.pop("decision_overflow", None)
+                if event["event"] == "phase_passed":
+                    event.pop("output_snapshot", None)
+                    event.pop("verification_snapshot", None)
+                elif event["event"] == "predicate_recorded":
+                    event.pop("result_snapshot", None)
+                elif event["event"] == "completed":
+                    event.pop("terminal_snapshot", None)
+            for decision in legacy["decisions"]:
+                decision.pop("event_sequence", None)
+            for result in legacy["predicate_results"].values():
+                result.pop("event_sequence", None)
+            state_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+            migrated = figure_it_out.Workflow.load(state_path, workspace_root=root)
+            self.assertEqual(migrated.state["schema_version"], 2)
+            self.assertEqual(migrated.state["plan"]["schema_version"], 2)
+            persisted = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["schema_version"], 2)
+            self.assertTrue(all("sequence" in event for event in persisted["events"]))
+            self.assertTrue(all("event_sequence" in decision for decision in persisted["decisions"]))
 
     def test_persisted_allowed_actions_must_match_lifecycle_status(self):
         def failed(workflow):
