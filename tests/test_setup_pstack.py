@@ -249,12 +249,14 @@ class SetupPstackBehaviorTests(unittest.TestCase):
                 module.atomic_rename_noreplace_at = original_publish
                 module.cleanup_created_directories = original_cleanup
             self.assertEqual(raised.exception.status, "cleanup_pending")
+            self.assertEqual(raised.exception.recovery_state, "rollback_parent_cleanup_pending")
             self.assertIn("created parent cleanup", str(raised.exception))
             self.assertIsNotNone(raised.exception.recovery_receipt)
             self.assertLessEqual(len(raised.exception.recovery_receipt.entries), 8)
             self.assertIn("skills", {entry.path.name for entry in raised.exception.recovery_receipt.entries})
             self.assertIn("Recovery receipt:", str(raised.exception))
             self.assertEqual(raised.exception.as_dict()["recovery_receipt"], raised.exception.recovery_receipt.as_dict())
+            self.assertEqual(raised.exception.as_dict()["recovery_state"], "rollback_parent_cleanup_pending")
             self.assertEqual((destination / "operator.txt").read_text(encoding="utf-8"), "keep me\n")
             self.assertTrue((root / "original-skills").is_dir())
 
@@ -833,6 +835,41 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertNotEqual(outcome.status, "published")
             self.assertEqual((outcome.residue / "operator.txt").read_text(encoding="utf-8"), "keep residue\n")
 
+            private_agents = root / ".codex" / "agents-private"
+            initial = module.build_plan(models, private_agents, budget="medium", default_model="codex-test")
+            module.apply_plan(initial, private_agents)
+            private_replacement = root / "private-replacement"
+            private_replacement.mkdir()
+            (private_replacement / "operator.txt").write_text("keep private replacement\n", encoding="utf-8")
+            original_rename = safe_fs.atomic_rename_noreplace_at
+            swapped = False
+
+            def replace_private_quarantine(parent_fd: int, source_name: str, target_name: str) -> None:
+                nonlocal swapped
+                original_rename(parent_fd, source_name, target_name)
+                if not swapped and source_name.startswith(".pstack-agents-") and target_name.startswith(".pstack-cleanup-"):
+                    swapped = True
+                    residue_path = private_agents.parent / target_name
+                    os.rename(residue_path, root / "expected-private-agents")
+                    os.rename(private_replacement, private_agents.parent / target_name)
+
+            safe_fs.atomic_rename_noreplace_at = replace_private_quarantine
+            try:
+                outcome = module.apply_plan(
+                    module.build_plan(models, private_agents, budget="large"),
+                    private_agents,
+                    allow_replace=True,
+                )
+            finally:
+                safe_fs.atomic_rename_noreplace_at = original_rename
+            self.assertTrue(swapped)
+            self.assertEqual(outcome.status, "publication_recovery_pending")
+            self.assertIsNotNone(outcome.recovery_receipt, outcome.as_dict())
+            self.assertEqual(
+                (outcome.residue / "operator.txt").read_text(encoding="utf-8"),
+                "keep private replacement\n",
+            )
+
     def test_configuration_fallback_publishes_and_cleans_by_identity(self) -> None:
         module = load_module(CONFIGURER, "configure_for_fallback_test")
         with tempfile.TemporaryDirectory(prefix="setup-pstack-config-fallback-test-") as temporary:
@@ -936,6 +973,14 @@ class SetupPstackBehaviorTests(unittest.TestCase):
                     self.assertEqual((victim / "replacement.txt").read_text(encoding="utf-8"), "replacement\n")
                     self.assertEqual((root / "expected-victim" / "expected.txt").read_text(encoding="utf-8"), "expected\n")
 
+            stable_residue = parent / ".pstack-agents-old-stable"
+            nested = stable_residue / "first" / "second"
+            nested.mkdir(parents=True)
+            (nested / "expected.txt").write_text("expected\n", encoding="utf-8")
+            stable_outcome = module._cleanup_residue(stable_residue)
+            self.assertEqual(stable_outcome.status, "cleanup_complete")
+            self.assertFalse(stable_residue.exists())
+
     def test_recursive_cleanup_preserves_replacement_after_binding_an_entry(self) -> None:
         module = load_module(CONFIGURER, "configure_for_recursive_cleanup_replacement_test")
         safe_fs = sys.modules["safe_fs"]
@@ -974,6 +1019,54 @@ class SetupPstackBehaviorTests(unittest.TestCase):
                     safe_fs.atomic_rename_noreplace_at = original_rename
                 self.assertTrue(swapped)
                 self.assertEqual(raised.exception.status, "cleanup_refused")
+                if kind == "file":
+                    self.assertEqual(victim.read_text(encoding="utf-8"), "replacement\n")
+                else:
+                    self.assertEqual((victim / "replacement.txt").read_text(encoding="utf-8"), "replacement\n")
+
+        for kind in ("file", "directory"):
+            with self.subTest(private_kind=kind), tempfile.TemporaryDirectory(prefix="setup-pstack-private-cleanup-test-") as temporary:
+                root = Path(temporary)
+                parent = root / "parent"
+                parent.mkdir()
+                residue = parent / ".pstack-agents-old-private"
+                residue.mkdir()
+                victim = residue / "victim"
+                replacement = root / "replacement"
+                expected_private = root / "expected-private"
+                if kind == "file":
+                    victim.write_text("expected\n", encoding="utf-8")
+                    replacement.write_text("replacement\n", encoding="utf-8")
+                else:
+                    victim.mkdir()
+                    (victim / "expected.txt").write_text("expected\n", encoding="utf-8")
+                    replacement.mkdir()
+                    (replacement / "replacement.txt").write_text("replacement\n", encoding="utf-8")
+                original_lstat = safe_fs.lstat_at
+                swapped = False
+
+                def replace_private_quarantine(directory_fd: int, name: str) -> os.stat_result:
+                    nonlocal swapped
+                    metadata = original_lstat(directory_fd, name)
+                    if name.startswith(".pstack-cleanup-") and not swapped:
+                        swapped = True
+                        os.rename(residue / name, expected_private)
+                        os.rename(replacement, residue / name)
+                        metadata = original_lstat(directory_fd, name)
+                    return metadata
+
+                safe_fs.lstat_at = replace_private_quarantine
+                try:
+                    with self.assertRaises(module.ConfigurationError) as raised:
+                        module._cleanup_residue(residue)
+                finally:
+                    safe_fs.lstat_at = original_lstat
+                self.assertTrue(swapped)
+                self.assertEqual(raised.exception.status, "cleanup_refused")
+                self.assertEqual(raised.exception.recovery_state, "cleanup_recovery_pending")
+                self.assertIsNotNone(raised.exception.recovery_receipt)
+                self.assertIn("--expected-dev", raised.exception.retry or "")
+                self.assertTrue(expected_private.exists())
                 if kind == "file":
                     self.assertEqual(victim.read_text(encoding="utf-8"), "replacement\n")
                 else:
@@ -1546,6 +1639,28 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             helper.write_text("from cursor_tools import (\n    Task,\n    OtherTool,\n)\n", encoding="utf-8")
             multiline_task_errors = module.verify_port(root, run_helpers=False)
             self.assertTrue(any("Cursor Task call" in error for error in multiline_task_errors))
+
+            mjs_helper.write_text("from cursor_tools import Task  // UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")
+            extensionless_helper.write_text("from cursor_tools import Task  # UNSUPPORTED-SEAM: Cursor Task\n", encoding="utf-8")
+            helper.write_text(
+                "from cursor_tools import (\n"
+                "    # Task is only mentioned in a comment\n"
+                "    OtherTool,\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            comment_only_task_errors = module.verify_port(root, run_helpers=False)
+            self.assertFalse(any("Cursor Task call" in error for error in comment_only_task_errors))
+
+            helper.write_text(
+                "from cursor_tools import (\n"
+                "    OtherTool,  # Task is still only a comment here\n"
+                "    Task,\n"
+                ")\n",
+                encoding="utf-8",
+            )
+            valid_commented_task_errors = module.verify_port(root, run_helpers=False)
+            self.assertTrue(any("Cursor Task call" in error for error in valid_commented_task_errors))
 
             helper.write_text("from cursor_tools import \\\n    Task,\n", encoding="utf-8")
             backslash_task_errors = module.verify_port(root, run_helpers=False)

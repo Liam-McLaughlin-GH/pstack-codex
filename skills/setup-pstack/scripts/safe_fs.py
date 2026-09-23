@@ -234,6 +234,24 @@ def cleanup_created_directories(created: list[CreatedDirectory]) -> None:
         )
 
 
+def recovery_receipt_for_created_directories(
+    created: list[CreatedDirectory],
+    *,
+    reason: str = "rollback-parent-cleanup",
+) -> CleanupReceipt:
+    return CleanupReceipt.from_entries(
+        [
+            CleanupReceiptEntry(
+                entry.path,
+                entry.metadata.st_dev,
+                entry.metadata.st_ino,
+                reason,
+            )
+            for entry in created
+        ]
+    )
+
+
 @contextmanager
 def directory_lock(fd: int):
     """Serialize writers that publish through the same stable directory."""
@@ -251,6 +269,40 @@ def lstat_at(directory_fd: int, name: str) -> os.stat_result:
 
 def _same_entry(left: os.stat_result, right: os.stat_result) -> bool:
     return (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino)
+
+
+def _cleanup_receipt_path(
+    receipt_root: Path | None,
+    relative: tuple[str, ...],
+    fallback_name: str,
+) -> Path:
+    if receipt_root is not None:
+        return receipt_root.joinpath(*relative) if relative else receipt_root
+    return Path(*relative) if relative else Path(fallback_name)
+
+
+def _with_cleanup_receipt(
+    error: BaseException,
+    *,
+    path: Path,
+    expected_metadata: os.stat_result,
+    reason: str,
+) -> SafeFilesystemError:
+    entries: list[CleanupReceiptEntry] = []
+    if isinstance(error, SafeFilesystemError) and error.cleanup_receipt is not None:
+        entries.extend(error.cleanup_receipt.entries)
+    entries.append(
+        CleanupReceiptEntry(
+            path,
+            expected_metadata.st_dev,
+            expected_metadata.st_ino,
+            reason,
+        )
+    )
+    return SafeFilesystemError(
+        str(error),
+        cleanup_receipt=CleanupReceipt.from_entries(entries),
+    )
 
 
 def read_regular_file_at(
@@ -527,9 +579,16 @@ def _restore_bound_entry(parent_fd: int, public_name: str, private_name: str) ->
             ) from exc
 
 
-def _move_bound_entry(parent_fd: int, name: str, expected_metadata: os.stat_result) -> str:
+def _move_bound_entry(
+    parent_fd: int,
+    name: str,
+    expected_metadata: os.stat_result,
+    *,
+    receipt_path: Path | None = None,
+) -> str:
     """Move an identity-checked entry to a private name before removing it."""
 
+    receipt_path = receipt_path or Path(name)
     current_metadata = lstat_at(parent_fd, name)
     if not _same_entry(current_metadata, expected_metadata):
         raise SafeFilesystemError(f"entry identity changed during removal: {name}")
@@ -537,7 +596,12 @@ def _move_bound_entry(parent_fd: int, name: str, expected_metadata: os.stat_resu
     try:
         atomic_rename_noreplace_at(parent_fd, name, private_name)
     except FileNotFoundError as exc:
-        raise SafeFilesystemError(f"entry disappeared during removal: {name}") from exc
+        raise _with_cleanup_receipt(
+            exc,
+            path=receipt_path,
+            expected_metadata=expected_metadata,
+            reason="replaced",
+        ) from exc
     try:
         moved_metadata = lstat_at(parent_fd, private_name)
         if not _same_entry(moved_metadata, expected_metadata):
@@ -546,37 +610,108 @@ def _move_bound_entry(parent_fd: int, name: str, expected_metadata: os.stat_resu
         try:
             _restore_bound_entry(parent_fd, name, private_name)
         except SafeFilesystemError as restore_error:
-            raise SafeFilesystemError(f"{exc}; {restore_error}") from exc
-        raise
+            exc = SafeFilesystemError(f"{exc}; {restore_error}")
+        if isinstance(exc, SafeFilesystemError) and exc.cleanup_receipt is not None:
+            raise exc
+        raise _with_cleanup_receipt(
+            exc,
+            path=receipt_path,
+            expected_metadata=expected_metadata,
+            reason="replaced",
+        ) from exc
     return private_name
 
 
-def _remove_owned_empty_directory(parent_fd: int, name: str, expected_metadata: os.stat_result) -> None:
-    """Remove a created directory without ever rmdir-ing a replacement."""
+def _delete_private_entry(
+    parent_fd: int,
+    public_name: str,
+    private_name: str,
+    expected_metadata: os.stat_result,
+    *,
+    is_directory: bool,
+    receipt_path: Path,
+) -> None:
+    """Claim a private entry again before deleting it.
 
-    private_name = _move_bound_entry(parent_fd, name, expected_metadata)
-    moved = True
+    The second no-replace rename makes the entry being deleted a fresh private
+    claim. If the original private name was replaced, the replacement is
+    moved to that claim and is then preserved instead of being deleted.
+    """
+
+    delete_name: str | None = None
     try:
+        current_metadata = lstat_at(parent_fd, private_name)
+        if not _same_entry(current_metadata, expected_metadata):
+            raise SafeFilesystemError(f"private cleanup identity changed: {private_name}")
+        delete_name = unique_entry_name(parent_fd, ".pstack-cleanup-")
+        atomic_rename_noreplace_at(parent_fd, private_name, delete_name)
+        claimed_metadata = lstat_at(parent_fd, delete_name)
+        if not _same_entry(claimed_metadata, expected_metadata):
+            raise SafeFilesystemError(f"private cleanup identity changed: {private_name}")
+        if is_directory:
+            os.rmdir(delete_name, dir_fd=parent_fd)
+        else:
+            os.unlink(delete_name, dir_fd=parent_fd)
         try:
-            current_metadata = lstat_at(parent_fd, private_name)
-        except FileNotFoundError as exc:
-            raise SafeFilesystemError(f"created directory disappeared during cleanup: {name}") from exc
-        if not _same_entry(current_metadata, expected_metadata) or not stat.S_ISDIR(current_metadata.st_mode):
-            raise SafeFilesystemError(f"created directory identity changed during cleanup: {name}")
-        os.rmdir(private_name, dir_fd=parent_fd)
-        moved = False
-        try:
-            lstat_at(parent_fd, name)
+            lstat_at(parent_fd, public_name)
         except FileNotFoundError:
             return
-        raise SafeFilesystemError(f"created directory replacement appeared during cleanup: {name}")
+        raise SafeFilesystemError(f"replacement appeared during removal: {public_name}")
     except BaseException as exc:
-        if moved:
+        if delete_name is not None:
             try:
-                _restore_bound_entry(parent_fd, name, private_name)
+                _restore_bound_entry(parent_fd, public_name, delete_name)
             except SafeFilesystemError as restore_error:
-                raise SafeFilesystemError(f"{exc}; {restore_error}") from exc
-        raise
+                exc = SafeFilesystemError(f"{exc}; {restore_error}")
+        if isinstance(exc, SafeFilesystemError) and exc.cleanup_receipt is not None:
+            raise exc
+        reason = "replaced" if "identity" in str(exc) or "replacement" in str(exc) else "cleanup-error"
+        raise _with_cleanup_receipt(
+            exc,
+            path=receipt_path,
+            expected_metadata=expected_metadata,
+            reason=reason,
+        ) from exc
+
+
+def _remove_owned_empty_directory(
+    parent_fd: int,
+    name: str,
+    expected_metadata: os.stat_result,
+    *,
+    receipt_path: Path | None = None,
+) -> None:
+    """Remove a created directory without ever rmdir-ing a replacement."""
+
+    receipt_path = receipt_path or Path(name)
+    private_name = _move_bound_entry(
+        parent_fd,
+        name,
+        expected_metadata,
+        receipt_path=receipt_path,
+    )
+    try:
+        _delete_private_entry(
+            parent_fd,
+            name,
+            private_name,
+            expected_metadata,
+            is_directory=True,
+            receipt_path=receipt_path,
+        )
+    except BaseException as exc:
+        try:
+            _restore_bound_entry(parent_fd, name, private_name)
+        except SafeFilesystemError as restore_error:
+            exc = SafeFilesystemError(f"{exc}; {restore_error}")
+        if isinstance(exc, SafeFilesystemError) and exc.cleanup_receipt is not None:
+            raise exc
+        raise _with_cleanup_receipt(
+            exc,
+            path=receipt_path,
+            expected_metadata=expected_metadata,
+            reason="replaced" if "replacement" in str(exc) or "identity" in str(exc) else "cleanup-error",
+        ) from exc
 
 
 def remove_tree_at(
@@ -586,6 +721,7 @@ def remove_tree_at(
     expected_metadata: os.stat_result | None = None,
     guard_name: str | None = None,
     guard_metadata: os.stat_result | None = None,
+    receipt_root: Path | None = None,
 ) -> None:
     """Remove an entry by first binding every owned entry to a private name.
 
@@ -614,7 +750,7 @@ def remove_tree_at(
     def remove_directory_children(directory_fd: int, relative: tuple[str, ...]) -> None:
         children = sorted(os.listdir(directory_fd))
         expected_children = {
-            path[0]
+            path[-1]
             for path in identities
             if len(path) == len(relative) + 1 and path[:-1] == relative
         }
@@ -640,6 +776,7 @@ def remove_tree_at(
         validate_guard()
         private_name: str | None = None
         moved = True
+        receipt_path = _cleanup_receipt_path(receipt_root, relative, entry_name)
         try:
             if top_level and stat.S_ISDIR(entry_metadata.st_mode):
                 validate_entry(directory_parent_fd, entry_name, entry_metadata)
@@ -652,11 +789,27 @@ def remove_tree_at(
                 finally:
                     os.close(directory_fd)
                 validate_guard()
-                private_name = _move_bound_entry(directory_parent_fd, entry_name, entry_metadata)
-                validate_entry(directory_parent_fd, private_name, entry_metadata)
-                os.rmdir(private_name, dir_fd=directory_parent_fd)
+                private_name = _move_bound_entry(
+                    directory_parent_fd,
+                    entry_name,
+                    entry_metadata,
+                    receipt_path=receipt_path,
+                )
+                _delete_private_entry(
+                    directory_parent_fd,
+                    entry_name,
+                    private_name,
+                    entry_metadata,
+                    is_directory=True,
+                    receipt_path=receipt_path,
+                )
             else:
-                private_name = _move_bound_entry(directory_parent_fd, entry_name, entry_metadata)
+                private_name = _move_bound_entry(
+                    directory_parent_fd,
+                    entry_name,
+                    entry_metadata,
+                    receipt_path=receipt_path,
+                )
                 moved_metadata = validate_entry(directory_parent_fd, private_name, entry_metadata)
                 if stat.S_ISDIR(moved_metadata.st_mode):
                     directory_fd = _open_child_directory(directory_parent_fd, private_name)
@@ -668,25 +821,41 @@ def remove_tree_at(
                     finally:
                         os.close(directory_fd)
                     validate_guard()
-                    validate_entry(directory_parent_fd, private_name, entry_metadata)
-                    os.rmdir(private_name, dir_fd=directory_parent_fd)
+                    _delete_private_entry(
+                        directory_parent_fd,
+                        entry_name,
+                        private_name,
+                        entry_metadata,
+                        is_directory=True,
+                        receipt_path=receipt_path,
+                    )
                 else:
                     validate_guard()
-                    validate_entry(directory_parent_fd, private_name, entry_metadata)
-                    os.unlink(private_name, dir_fd=directory_parent_fd)
+                    _delete_private_entry(
+                        directory_parent_fd,
+                        entry_name,
+                        private_name,
+                        entry_metadata,
+                        is_directory=False,
+                        receipt_path=receipt_path,
+                    )
             moved = False
-            try:
-                lstat_at(directory_parent_fd, entry_name)
-            except FileNotFoundError:
-                return
-            raise SafeFilesystemError(f"replacement appeared during removal: {entry_name}")
         except BaseException as exc:
             if moved and private_name is not None:
                 try:
                     _restore_bound_entry(directory_parent_fd, entry_name, private_name)
                 except SafeFilesystemError as restore_error:
-                    raise SafeFilesystemError(f"{exc}; {restore_error}") from exc
-            raise
+                    exc = SafeFilesystemError(f"{exc}; {restore_error}")
+            if isinstance(exc, SafeFilesystemError) and exc.cleanup_receipt is not None:
+                raise exc
+            if private_name is None:
+                raise
+            raise _with_cleanup_receipt(
+                exc,
+                path=receipt_path,
+                expected_metadata=entry_metadata,
+                reason="replaced" if "replacement" in str(exc) or "identity" in str(exc) else "cleanup-error",
+            ) from exc
 
     remove_bound(parent_fd, name, (), metadata, top_level=True)
 

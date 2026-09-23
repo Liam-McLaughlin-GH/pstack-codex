@@ -4,10 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import io
 import importlib.util
 import re
 import subprocess
 import sys
+import tokenize
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
@@ -71,6 +73,57 @@ REFERENCE_DEFINITION_PREFIX = re.compile(r"^[ \t]{0,3}\[(?P<label>[^\]]+)\]:")
 REFERENCE_USE = re.compile(r"(?<!!)\[(?P<text>[^\]]+)\]\[(?P<label>[^\]]*)\]")
 FENCE = re.compile(r"^\s*(```|~~~)")
 CODE_SPAN = re.compile(r"`[^`]*`")
+
+
+def _mask_comments(text: str) -> str:
+    """Keep import spans stable while removing Python and C-style comments."""
+
+    characters = list(text)
+    line_offsets = [0]
+    for index, character in enumerate(text):
+        if character == "\n":
+            line_offsets.append(index + 1)
+
+    def offset(position: tuple[int, int]) -> int:
+        line, column = position
+        if line <= 0 or line > len(line_offsets):
+            return len(text)
+        return min(line_offsets[line - 1] + column, len(text))
+
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(text).readline):
+            if token.type != tokenize.COMMENT:
+                continue
+            start = offset(token.start)
+            end = offset(token.end)
+            for index in range(start, end):
+                if characters[index] not in "\r\n":
+                    characters[index] = " "
+    except (IndentationError, SyntaxError, tokenize.TokenError):
+        pass
+
+    for line_start, line in enumerate("".join(characters).splitlines(keepends=True)):
+        quote: str | None = None
+        escaped = False
+        for column, character in enumerate(line):
+            if escaped:
+                escaped = False
+                continue
+            if character == "\\" and quote is not None:
+                escaped = True
+                continue
+            if character in {"'", '"'}:
+                if quote == character:
+                    quote = None
+                elif quote is None:
+                    quote = character
+                continue
+            if quote is None and line[column : column + 2] == "//":
+                start = sum(len(item) for item in "".join(characters).splitlines(keepends=True)[:line_start]) + column
+                for index in range(start, start + len(line.rstrip("\r\n")) - column):
+                    characters[index] = " "
+                break
+    return "".join(characters)
 
 
 class ValidationError(ValueError):
@@ -296,16 +349,18 @@ def _check_boundary_mentions(root: Path, path: Path, text: str, errors: list[str
                     "add an explicit same-line UNSUPPORTED-SEAM annotation or use a Codex surface"
                 )
 
+    comment_free_text = _mask_comments(text)
     for import_pattern in (
         MULTILINE_CURSOR_TASK_IMPORT,
         BACKSLASH_CURSOR_TASK_IMPORT,
     ):
-        for match in import_pattern.finditer(text):
+        for match in import_pattern.finditer(comment_free_text):
             if import_pattern is BACKSLASH_CURSOR_TASK_IMPORT and "\\" not in match.group(0):
                 continue
+            original_match = text[match.start() : match.end()]
             annotations = [
                 annotation.group("detail").casefold()
-                for annotation in BOUNDARY_ANNOTATION.finditer(match.group(0))
+                for annotation in BOUNDARY_ANNOTATION.finditer(original_match)
             ]
             if any(alias in detail for detail in annotations for alias in SEAM_ANNOTATION_ALIASES["Cursor Task call"]):
                 continue

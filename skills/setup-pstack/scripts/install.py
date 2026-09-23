@@ -36,6 +36,7 @@ from safe_fs import (  # noqa: E402
     open_child_directory,
     open_directory,
     remove_tree_at,
+    recovery_receipt_for_created_directories,
     snapshot_tree,
     sync_directory,
     write_snapshot,
@@ -54,6 +55,7 @@ class InstallError(RuntimeError):
         residue: Path | None = None,
         retry: str | None = None,
         recovery_receipt: CleanupReceipt | None = None,
+        recovery_state: str | None = None,
     ) -> None:
         super().__init__(message)
         self.status = status
@@ -61,6 +63,7 @@ class InstallError(RuntimeError):
         self.retry = retry
         self.recovery_receipt = recovery_receipt
         self.receipt = recovery_receipt
+        self.recovery_state = recovery_state
 
     def as_dict(self) -> dict[str, object]:
         result: dict[str, object] = {"status": self.status, "error": str(self)}
@@ -70,6 +73,8 @@ class InstallError(RuntimeError):
             result["retry"] = self.retry
         if self.recovery_receipt is not None:
             result["recovery_receipt"] = self.recovery_receipt.as_dict()
+        if self.recovery_state is not None:
+            result["recovery_state"] = self.recovery_state
         return result
 
 
@@ -298,7 +303,12 @@ def _cleanup_residue(
                     residue=residue,
                 )
             try:
-                remove_tree_at(parent_handle.fd, residue.name, expected_metadata=metadata)
+                remove_tree_at(
+                    parent_handle.fd,
+                    residue.name,
+                    expected_metadata=metadata,
+                    receipt_root=residue,
+                )
             except SafeFilesystemError as exc:
                 retry = _cleanup_retry_hint(residue, metadata)
                 raise InstallError(
@@ -307,6 +317,8 @@ def _cleanup_residue(
                     status="cleanup_refused",
                     residue=residue,
                     retry=retry,
+                    recovery_receipt=exc.cleanup_receipt,
+                    recovery_state="cleanup_recovery_pending" if exc.cleanup_receipt is not None else None,
                 ) from exc
             except OSError as exc:
                 retry = _cleanup_retry_hint(residue, metadata)
@@ -342,6 +354,7 @@ def apply_install(source: Path, destination: Path) -> InstallPlan:
     completed = False
     primary_error: InstallError | None = None
     recovery_receipt: CleanupReceipt | None = None
+    recovery_state: str | None = None
     try:
         with directory_lock(destination_handle.fd):
             try:
@@ -386,15 +399,22 @@ def apply_install(source: Path, destination: Path) -> InstallPlan:
                             destination_handle.fd,
                             staging_name,
                             expected_metadata=staging_metadata,
+                            receipt_root=destination_handle.path / staging_name,
                         )
                     except (OSError, SafeFilesystemError) as exc:
+                        if isinstance(exc, SafeFilesystemError) and exc.cleanup_receipt is not None:
+                            recovery_receipt = exc.cleanup_receipt
+                            recovery_state = "rollback_cleanup_pending"
                         cleanup_errors.append(f"staging residue {destination_handle.path / staging_name}: {exc}")
                 if not completed:
                     try:
                         cleanup_created_directories(destination_handle.created)
                     except (OSError, SafeFilesystemError) as exc:
-                        if isinstance(exc, SafeFilesystemError):
+                        if isinstance(exc, SafeFilesystemError) and exc.cleanup_receipt is not None:
                             recovery_receipt = exc.cleanup_receipt
+                        elif recovery_receipt is None:
+                            recovery_receipt = recovery_receipt_for_created_directories(destination_handle.created)
+                        recovery_state = "rollback_parent_cleanup_pending"
                         cleanup_errors.append(f"created parent cleanup: {exc}")
                 else:
                     close_created_directories(destination_handle.created)
@@ -415,12 +435,15 @@ def apply_install(source: Path, destination: Path) -> InstallPlan:
                         message += f". Retry with {retry}"
                     if recovery_receipt is not None:
                         message += f". Recovery receipt: {recovery_receipt.render()}"
+                    if recovery_state is not None:
+                        message += f". Recovery state: {recovery_state}"
                     raise InstallError(
                         message,
                         status="cleanup_pending",
                         residue=residue,
                         retry=retry,
                         recovery_receipt=recovery_receipt,
+                        recovery_state=recovery_state,
                     ) from primary_error
     except (OSError, SafeFilesystemError) as exc:
         if primary_error is None:
