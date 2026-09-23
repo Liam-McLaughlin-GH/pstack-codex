@@ -1138,6 +1138,46 @@ class WorkflowBehaviorTests(unittest.TestCase):
             with self.assertRaises(figure_it_out.StateError):
                 figure_it_out.Workflow.load(checkpoint_state_path, workspace_root=root / "checkpoints")
 
+    def test_overflow_event_reordered_before_capacity_pressure_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1, max_decisions=2)
+            workflow.record_decision("phase-1", "first decision", "first", ["tests/first.txt"], "open")
+            workflow.record_decision("phase-1", "second decision", "second", ["tests/second.txt"], "open")
+            with self.assertRaises(figure_it_out.ScopeRefusal):
+                workflow.guard_action("deploy", "production")
+            with self.assertRaises(figure_it_out.ScopeRefusal):
+                workflow.guard_action("deploy", "production")
+
+            state_path = root / "run.json"
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            events_by_decision = {
+                event["decision"]["decision"]: event
+                for event in state["events"]
+                if event["event"] in figure_it_out.DECISION_EVENTS
+            }
+            reordered = [
+                events_by_decision["first decision"],
+                next(event for event in state["events"] if event["event"] == "action_refused" and not event["decision_in_list"]),
+                events_by_decision["second decision"],
+                next(event for event in state["events"] if event["event"] == "action_refused" and event["decision_in_list"]),
+            ]
+            listed_events = []
+            for sequence, event in enumerate(reordered, start=1):
+                event["sequence"] = sequence
+                event["decision"]["event_sequence"] = sequence
+                if event["decision_in_list"]:
+                    listed_events.append(event)
+
+            for decision, event in zip(state["decisions"], listed_events):
+                decision["event_sequence"] = event["sequence"]
+                event["decision"] = deepcopy(decision)
+            state["events"] = reordered
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(state_path, workspace_root=root)
+
     def test_schema_one_state_is_explicitly_migrated_to_schema_two(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1276,6 +1316,78 @@ class WorkflowBehaviorTests(unittest.TestCase):
                     self.assertNotIn("Traceback", result.stderr)
                     self.assertTrue(json.loads(result.stderr)["error"])
                     self.assertEqual(result.stdout, "")
+
+    def test_original_schema_one_multiple_interruption_cycles_migrate_from_event_history(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workflow = self.workflow(root, phase_count=1)
+            workflow.start_phase()
+            workflow.checkpoint("first safe point", ["artifacts/first.txt"], "resume from first")
+            workflow.interrupt("first stop")
+            workflow.resume()
+            workflow.checkpoint("second safe point", ["artifacts/second.txt"], "resume from second")
+            workflow.interrupt("second stop")
+            workflow.resume()
+            workflow.complete_phase(
+                "resumed output",
+                {"check_id": "check-1", "passed": True, "evidence": ["tests/resumed.txt"]},
+            )
+            workflow.record_predicate("focused-tests", True, ["tests/focused.txt"])
+            workflow.record_predicate("artifact-inspection", True, ["artifacts/inspection.txt"])
+            workflow.finish()
+
+            state_path = root / "run.json"
+            legacy = json.loads(state_path.read_text(encoding="utf-8"))
+            legacy["schema_version"] = 1
+            legacy["plan"]["schema_version"] = 1
+            legacy["plan"]["scope"].pop("logical_actions", None)
+            for event in legacy["events"]:
+                event.pop("sequence", None)
+                event.pop("decision", None)
+                event.pop("decision_in_list", None)
+                event.pop("decision_overflow", None)
+                event.pop("reason", None)
+                for field in (
+                    "checkpoint_snapshot",
+                    "output_snapshot",
+                    "verification_snapshot",
+                    "failure_snapshot",
+                    "interruption_snapshot",
+                    "blocker_snapshot",
+                    "result_snapshot",
+                    "terminal_snapshot",
+                ):
+                    event.pop(field, None)
+            for checkpoint in legacy["checkpoints"]:
+                checkpoint.pop("event_sequence", None)
+            for replan in legacy["replans"]:
+                replan.pop("event_sequence", None)
+            for decision in legacy["decisions"]:
+                decision.pop("event_sequence", None)
+                decision.pop("status", None)
+                decision.pop("reason", None)
+                decision.pop("next_action", None)
+            for result in legacy["predicate_results"].values():
+                result.pop("event_sequence", None)
+                result.pop("status", None)
+            malformed = deepcopy(legacy)
+            next(event for event in malformed["events"] if event["event"] == "interrupted")["checkpoint"] = "cp-missing"
+            malformed_path = root / "malformed.json"
+            malformed_path.write_text(json.dumps(malformed), encoding="utf-8")
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(malformed_path, workspace_root=root)
+
+            state_path.write_text(json.dumps(legacy), encoding="utf-8")
+
+            migrated = figure_it_out.Workflow.load(state_path, workspace_root=root)
+            interruptions = [
+                event["interruption_snapshot"]
+                for event in migrated.state["events"]
+                if event["event"] == "interrupted"
+            ]
+            self.assertEqual([snapshot["checkpoint"] for snapshot in interruptions], ["cp-1", "cp-2"])
+            self.assertEqual(migrated.state["resume_count"], 2)
+            self.assertEqual(migrated.state["status"], "completed")
 
     def test_persisted_allowed_actions_must_match_lifecycle_status(self):
         def failed(workflow):

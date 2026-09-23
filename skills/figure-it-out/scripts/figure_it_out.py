@@ -634,6 +634,7 @@ def _validate_lifecycle_graph_v2(
     }
     replans_by_number = {replan["number"]: replan for replan in state["replans"]}
     listed_decision_sequences: list[int] = []
+    listed_decision_count = 0
 
     def fail(message: str) -> None:
         raise StateError(f"invalid state: {message}")
@@ -673,6 +674,7 @@ def _validate_lifecycle_graph_v2(
         return value
 
     def decision_for_event(event: Mapping[str, Any], index: int) -> Mapping[str, Any] | None:
+        nonlocal listed_decision_count
         event_name = event["event"]
         decision_fields = {"decision", "decision_in_list", "decision_overflow"}
         present = decision_fields & set(event)
@@ -713,17 +715,27 @@ def _validate_lifecycle_graph_v2(
             fail(f"events[{index}] decision accounting flags must be booleans")
         row = decision_rows_by_sequence.get(sequence)
         if in_list:
-            if row is None or row != decision:
-                fail(f"events[{index}] decision does not match its persisted decision row")
+            if listed_decision_count >= len(state["decisions"]):
+                fail(f"events[{index}] lists a decision row beyond the recorded decision history")
+            expected_row = state["decisions"][listed_decision_count]
+            if row is None or row != decision or expected_row != decision:
+                fail(f"events[{index}] decision does not match its persisted decision row in append order")
+            if decision_row_positions.get(sequence) != listed_decision_count:
+                fail(f"events[{index}] decision row position does not match append order")
             listed_decision_sequences.append(sequence)
-            expected_overflow = decision_row_positions[sequence] >= validated_plan["limits"]["max_decisions"]
+            expected_overflow = listed_decision_count >= validated_plan["limits"]["max_decisions"]
             if overflow != expected_overflow:
                 fail(f"events[{index}] has an invalid decision overflow flag")
+            if expected_overflow and decision.get("status") not in {"blocked", "refused"}:
+                fail(f"events[{index}] records overflow without a blocked or refused decision")
+            listed_decision_count += 1
         else:
             if row is not None or not overflow or event_name not in {"action_refused", "blocked"}:
                 fail(f"events[{index}] has an unaccounted embedded decision")
-            if len(state["decisions"]) <= validated_plan["limits"]["max_decisions"]:
-                fail(f"events[{index}] claims decision overflow without capacity pressure")
+            if listed_decision_count <= validated_plan["limits"]["max_decisions"]:
+                fail(f"events[{index}] claims decision overflow before recorded capacity pressure")
+            if decision.get("status") not in {"blocked", "refused"}:
+                fail(f"events[{index}] records overflow without a blocked or refused decision")
         return decision
 
     for index, event in enumerate(state["events"]):
@@ -1013,6 +1025,8 @@ def _validate_lifecycle_graph_v2(
             expected_next_action = ""
             continue
 
+    if listed_decision_count != len(state["decisions"]):
+        fail("decision rows do not match the number of listed decision events")
     if listed_decision_sequences != [decision["event_sequence"] for decision in state["decisions"]]:
         fail("decision rows do not match decision-bearing events in append order")
     if len(checkpoint_event_order) != len(checkpoint_by_id) or set(checkpoint_event_order) != set(checkpoint_by_id):
@@ -1793,7 +1807,15 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
 
     used_legacy_decisions: set[int] = set()
     normalized_events: list[dict[str, Any]] = []
-    for original in events:
+    last_interruption_index = max(
+        (
+            index
+            for index, original in enumerate(events)
+            if isinstance(original, Mapping) and original.get("event") == "interrupted"
+        ),
+        default=None,
+    )
+    for event_index, original in enumerate(events):
         if not isinstance(original, Mapping):
             raise StateError("invalid state: schema-1 event must be an object")
         event = deepcopy(dict(original))
@@ -1883,8 +1905,32 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             interruption = migrated.get("interruption")
             if not isinstance(interruption, Mapping):
                 raise StateError("invalid state: schema-1 interruption must be an object")
-            event.setdefault("reason", interruption.get("reason", "legacy interruption"))
-            event.setdefault("interruption_snapshot", deepcopy(interruption))
+            phase_id = event.get("phase")
+            checkpoint_id = event.get("checkpoint")
+            if not isinstance(phase_id, str) or phase_id not in phase_by_id:
+                raise StateError("invalid state: schema-1 interruption event has an invalid phase")
+            if not isinstance(checkpoint_id, str):
+                raise StateError("invalid state: schema-1 interruption event has an invalid checkpoint")
+            checkpoint = checkpoint_by_id.get(checkpoint_id)
+            if checkpoint is None or checkpoint.get("phase") != phase_id:
+                raise StateError("invalid state: schema-1 interruption event has an invalid checkpoint")
+            try:
+                event_reason = _text(
+                    event.get("reason", interruption.get("reason")),
+                    "schema-1 interruption.reason",
+                    max_length=1000,
+                )
+                event_at = _text(event.get("at"), "schema-1 interruption.at")
+            except PlanError as exc:
+                raise StateError(f"invalid state: schema-1 interruption event is invalid: {exc}") from exc
+            event["reason"] = event_reason
+            if "interruption_snapshot" not in event:
+                snapshot = deepcopy(interruption) if event_index == last_interruption_index else {}
+                snapshot["at"] = snapshot.get("at", event_at)
+                snapshot["phase"] = phase_id
+                snapshot["checkpoint"] = checkpoint_id
+                snapshot["reason"] = event_reason
+                event["interruption_snapshot"] = snapshot
         elif event_name == "blocked":
             blocker = migrated.get("blocker")
             if not isinstance(blocker, Mapping):
@@ -1937,6 +1983,7 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
 
     migrated["decisions"] = []
     latest_predicate_events: dict[str, dict[str, Any]] = {}
+    migrated_decision_count = 0
     for sequence, event in enumerate(normalized_events, start=1):
         event["sequence"] = sequence
         if event.get("event") in DECISION_EVENTS:
@@ -1945,10 +1992,17 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             record.pop("event_sequence", None)
             record["event_sequence"] = sequence
             if listed:
-                decision_index = len(migrated["decisions"])
+                decision_index = migrated_decision_count
                 migrated["decisions"].append(record)
                 decision_overflow = decision_index >= limit
+                if decision_overflow and record.get("status") not in {"blocked", "refused"}:
+                    raise StateError("invalid state: schema-1 decision overflow is not a bounded refusal or blocker")
+                migrated_decision_count += 1
             else:
+                if migrated_decision_count <= limit:
+                    raise StateError("invalid state: schema-1 decision overflow appears before capacity pressure")
+                if record.get("status") not in {"blocked", "refused"}:
+                    raise StateError("invalid state: schema-1 decision overflow is not a bounded refusal or blocker")
                 decision_overflow = True
             event["decision"] = deepcopy(record)
             event["decision_in_list"] = listed
