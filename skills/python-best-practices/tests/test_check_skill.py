@@ -54,11 +54,28 @@ class RoutingRegressionTests(unittest.TestCase):
     def test_existing_safe_source_routing_is_preserved(self) -> None:
         self.assertEqual(
             CHECKER.route_for_task(
-                "Write a production showpass-frontend Next.js component"
+                "Write a showpass-frontend Next.js component"
             ),
             "showpass-frontend",
         )
         self.assertEqual(CHECKER.route_for_task("fab --list"), "web-k8s")
+
+    def test_production_and_live_wording_override_frontend_ownership(self) -> None:
+        for request in (
+            "Write a production showpass-frontend Next.js component",
+            "Review a live packages/core component",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "unsafe")
+
+    def test_frontend_repository_tokens_require_a_real_suffix_boundary(self) -> None:
+        for request in (
+            "Change packages/core-extra",
+            "Change showpass-frontend-extra",
+        ):
+            with self.subTest(request=request):
+                self.assertEqual(CHECKER.route_for_task(request), "general")
+                self.assertEqual(CHECKER.repositories_for_task(request), ())
 
     def test_framework_only_component_requests_stay_general(self) -> None:
         for request in (
@@ -185,6 +202,8 @@ class LedgerRegistrationTests(unittest.TestCase):
             "frontend-mobile-package",
             "frontend-desktop-package",
             "showpass-backend",
+            "production-frontend-source",
+            "live-frontend-package-source",
             "mixed-angularjs-react",
         ):
             with self.subTest(name=name):

@@ -78,24 +78,22 @@ DEPLOYMENT_OPERATION_RE = re.compile(
     r"(?![a-z0-9])"
 )
 PRODUCTION_LIVE_RE = re.compile(r"\b(?:production|prod|live)\b")
-SOURCE_TASK_RE = re.compile(
-    r"\b(?:write|edit|implement|refactor|add|fix|review)\b.*?"
-    r"\b(?:component|function|class|module|parser|source|code|file|package|"
-    r"queryset|serializer|view)\b"
-)
 BACKEND_CUE_RE = re.compile(
     r"\b(?:showpass\s+backend|web-app|django|drf|orm|manage\.py|celery)\b"
 )
 FRONTEND_CUE_RE = re.compile(
-    r"\b(?:showpass-frontend|next(?:\.js|js)?|react(?:\s+native)?|frontend|client)\b"
+    r"(?<![a-z0-9_-])(?:showpass-frontend|next(?:\.js|js)?|"
+    r"react(?:\s+native)?|frontend|client)(?![a-z0-9_-])"
 )
 FRONTEND_OWNER_CUE_RE = re.compile(
-    r"\b(?:showpass-frontend|next(?:\.js|js)?|react(?:\s+native)?)\b"
+    r"(?<![a-z0-9_-])(?:showpass-frontend|next(?:\.js|js)?|"
+    r"react(?:\s+native)?)(?![a-z0-9_-])"
 )
 FRONTEND_REPOSITORY_CUE_RE = re.compile(
-    r"\bshowpass-frontend\b|\bpackages/(?:core|next-app|mobile|desktop)\b"
+    r"(?<![a-z0-9_-])(?:showpass-frontend|packages/(?:core|next-app|mobile|desktop))"
+    r"(?![a-z0-9_-])"
 )
-SHOWPASS_PRODUCT_CUE_RE = re.compile(r"\bshowpass\b")
+SHOWPASS_PRODUCT_CUE_RE = re.compile(r"(?<![a-z0-9_-])showpass(?![a-z0-9_-])")
 SHOWPASS_UI_CUE_RE = re.compile(
     r"\bshowpass\s+(?:web|mobile|desktop|frontend|ui|client)\b"
 )
@@ -171,7 +169,7 @@ def _has_infrastructure_cue(text: str) -> bool:
 
 
 def _production_live_requires_review(text: str) -> bool:
-    return bool(PRODUCTION_LIVE_RE.search(text)) and not SOURCE_TASK_RE.search(text)
+    return bool(PRODUCTION_LIVE_RE.search(text))
 
 
 def repositories_for_task(task: str) -> Tuple[str, ...]:
