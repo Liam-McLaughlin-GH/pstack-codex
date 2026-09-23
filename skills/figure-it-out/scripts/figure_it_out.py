@@ -22,6 +22,7 @@ from typing import Any, Mapping, Sequence
 LEGACY_SCHEMA_VERSION = 1
 SCHEMA_VERSION = 2
 MAX_TEXT = 4000
+MAX_DECISION_OVERFLOW_EVENTS = 1
 DEFAULT_LIMITS = {
     "max_attempts_per_phase": 2,
     "max_checkpoints": 8,
@@ -713,6 +714,15 @@ def _validate_lifecycle_graph_v2(
         overflow = event["decision_overflow"]
         if not isinstance(in_list, bool) or not isinstance(overflow, bool):
             fail(f"events[{index}] decision accounting flags must be booleans")
+        if overflow:
+            overflow_count = sum(
+                1
+                for prior in state["events"][: index + 1]
+                if prior.get("decision_overflow") is True
+                and prior.get("event") in {"action_refused", "blocked"}
+            )
+            if overflow_count > MAX_DECISION_OVERFLOW_EVENTS:
+                fail(f"events[{index}] exceeds the bounded decision overflow allowance")
         row = decision_rows_by_sequence.get(sequence)
         if in_list:
             if listed_decision_count >= len(state["decisions"]):
@@ -1771,10 +1781,25 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             record = deepcopy(dict(event["decision"]))
             if "evidence" in record:
                 record["evidence"] = _migrate_schema_1_evidence(record["evidence"], "event.decision.evidence")
+            if event_name == "action_refused":
+                action = event.get("action", "invalid-action")
+                action_reference = action if isinstance(action, str) and SAFE_ACTION.fullmatch(action) else "invalid-action"
+                record["evidence"] = [
+                    {"kind": "reference", "ref": f"scope:{action_reference}"},
+                    {"kind": "reference", "ref": "target:provided" if event.get("target") is not None else "target:none"},
+                ]
             return record, False
         record, index = matching_decision(event, used)
         if record is not None and index is not None:
             used.add(index)
+            if event_name == "action_refused":
+                action = event.get("action", "invalid-action")
+                action_reference = action if isinstance(action, str) and SAFE_ACTION.fullmatch(action) else "invalid-action"
+                record = deepcopy(record)
+                record["evidence"] = [
+                    {"kind": "reference", "ref": f"scope:{action_reference}"},
+                    {"kind": "reference", "ref": "target:provided" if event.get("target") is not None else "target:none"},
+                ]
             return deepcopy(record), True
         phase = event.get("phase") or "run"
         if event_name == "phase_passed":
@@ -1915,8 +1940,11 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             if checkpoint is None or checkpoint.get("phase") != phase_id:
                 raise StateError("invalid state: schema-1 interruption event has an invalid checkpoint")
             try:
+                reason_value = event.get("reason")
+                if reason_value is None and event_index != last_interruption_index:
+                    reason_value = "legacy interruption reason unavailable"
                 event_reason = _text(
-                    event.get("reason", interruption.get("reason")),
+                    reason_value if reason_value is not None else interruption.get("reason"),
                     "schema-1 interruption.reason",
                     max_length=1000,
                 )
@@ -1977,6 +2005,14 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
     limit = migrated["plan"]["limits"]["max_decisions"]
     if len(listed_records) > limit + 1:
         raise StateError("invalid state: schema-1 decision history cannot fit the bounded schema-2 limit")
+    overflow_events = [
+        event
+        for event in normalized_events
+        if event.get("event") in {"action_refused", "blocked"}
+        and event.get("__migration_decision") is not None
+    ]
+    if len(overflow_events) > limit + MAX_DECISION_OVERFLOW_EVENTS:
+        raise StateError("invalid state: schema-1 decision history exceeds the bounded overflow allowance")
     for index, record in enumerate(listed_records):
         if index >= limit and record.get("status") not in {"blocked", "refused"}:
             raise StateError("invalid state: schema-1 decision overflow is not a bounded refusal or blocker")
@@ -2254,6 +2290,14 @@ class Workflow:
         sequence = len(self.state["events"]) + 1
         persisted_record = deepcopy(record)
         persisted_record["event_sequence"] = sequence
+        overflow_count = sum(
+            1
+            for prior in self.state["events"]
+            if prior.get("decision_overflow") is True
+            and prior.get("event") in {"action_refused", "blocked"}
+        )
+        if len(self.state["decisions"]) > limit and overflow_count >= MAX_DECISION_OVERFLOW_EVENTS:
+            raise StateError("decision overflow limit reached")
         if len(self.state["decisions"]) < limit:
             decision_in_list = True
             decision_overflow = False
@@ -2863,6 +2907,15 @@ class Workflow:
             reason=reason,
             next_action=next_action,
         )
+
+        overflow_count = sum(
+            1
+            for event in self.state["events"]
+            if event.get("decision_overflow") is True
+            and event.get("event") in {"action_refused", "blocked"}
+        )
+        if overflow_count >= MAX_DECISION_OVERFLOW_EVENTS and len(self.state["decisions"]) > self.state["plan"]["limits"]["max_decisions"]:
+            raise ScopeRefusal(reason, refusal)
 
         def mutate() -> None:
             self._append_decision_event("action_refused", record, **refusal)

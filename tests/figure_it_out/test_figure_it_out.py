@@ -1091,7 +1091,7 @@ class WorkflowBehaviorTests(unittest.TestCase):
             self.assertEqual(audit_rows[1][2], "first decision")
             self.assertEqual(audit_rows[2][2], "checkpoint: after decision")
             refusals = [row for row in audit_rows if row[2] == "refused action deploy"]
-            self.assertEqual(len(refusals), 2)
+            self.assertEqual(len(refusals), 1)
             expected_audit_decisions = []
             for event in workflow.state["events"]:
                 if event["event"] == "checkpoint":
@@ -1099,7 +1099,7 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 elif event["event"] in figure_it_out.DECISION_EVENTS:
                     expected_audit_decisions.append(event["decision"]["decision"])
             self.assertEqual([row[2] for row in audit_rows[1:]], expected_audit_decisions)
-            self.assertEqual(workflow.state["events"][-1]["decision_in_list"], False)
+            self.assertEqual(workflow.state["events"][-1]["decision_in_list"], True)
             self.assertEqual(
                 len([event for event in workflow.state["events"] if event["event"] == "action_refused"]),
                 len(refusals),
@@ -1138,7 +1138,7 @@ class WorkflowBehaviorTests(unittest.TestCase):
             with self.assertRaises(figure_it_out.StateError):
                 figure_it_out.Workflow.load(checkpoint_state_path, workspace_root=root / "checkpoints")
 
-    def test_overflow_event_reordered_before_capacity_pressure_is_rejected(self):
+    def test_multiple_overflow_refusals_are_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             workflow = self.workflow(root, phase_count=1, max_decisions=2)
@@ -1151,28 +1151,13 @@ class WorkflowBehaviorTests(unittest.TestCase):
 
             state_path = root / "run.json"
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            events_by_decision = {
-                event["decision"]["decision"]: event
-                for event in state["events"]
-                if event["event"] in figure_it_out.DECISION_EVENTS
-            }
-            reordered = [
-                events_by_decision["first decision"],
-                next(event for event in state["events"] if event["event"] == "action_refused" and not event["decision_in_list"]),
-                events_by_decision["second decision"],
-                next(event for event in state["events"] if event["event"] == "action_refused" and event["decision_in_list"]),
-            ]
-            listed_events = []
-            for sequence, event in enumerate(reordered, start=1):
-                event["sequence"] = sequence
-                event["decision"]["event_sequence"] = sequence
-                if event["decision_in_list"]:
-                    listed_events.append(event)
-
-            for decision, event in zip(state["decisions"], listed_events):
-                decision["event_sequence"] = event["sequence"]
-                event["decision"] = deepcopy(decision)
-            state["events"] = reordered
+            refusal_event = next(event for event in state["events"] if event["event"] == "action_refused")
+            forged_overflow = deepcopy(refusal_event)
+            forged_overflow["sequence"] = len(state["events"]) + 1
+            forged_overflow["decision"]["event_sequence"] = forged_overflow["sequence"]
+            forged_overflow["decision_in_list"] = False
+            forged_overflow["decision_overflow"] = True
+            state["events"].append(forged_overflow)
             state_path.write_text(json.dumps(state), encoding="utf-8")
 
             with self.assertRaises(figure_it_out.StateError):
@@ -1279,6 +1264,7 @@ class WorkflowBehaviorTests(unittest.TestCase):
             self.assertEqual(migrated_refusal.state["events"][0]["event"], "action_refused")
             self.assertEqual(migrated_refusal.state["events"][0]["target"], "<invalid-target>")
             self.assertEqual(len(migrated_refusal.state["decisions"]), 1)
+            self.assertNotIn("token@host", json.dumps(migrated_refusal.state["decisions"]))
 
             malformed_cases = {
                 "predicate-results": lambda state: state.update(predicate_results=[]),
@@ -1386,6 +1372,10 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 if event["event"] == "interrupted"
             ]
             self.assertEqual([snapshot["checkpoint"] for snapshot in interruptions], ["cp-1", "cp-2"])
+            self.assertEqual(
+                [snapshot["reason"] for snapshot in interruptions],
+                ["legacy interruption reason unavailable", "second stop"],
+            )
             self.assertEqual(migrated.state["resume_count"], 2)
             self.assertEqual(migrated.state["status"], "completed")
 
