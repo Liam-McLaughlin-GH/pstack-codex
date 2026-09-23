@@ -1256,6 +1256,7 @@ class WorkflowBehaviorTests(unittest.TestCase):
             refusal_event = refusal_legacy["events"][0]
             refusal_event.pop("event", None)
             refusal_event["target"] = "token@host"
+            refusal_event["private"] = {"target": "token@host"}
             refusal_decision = refusal_legacy["decisions"][0]
             refusal_decision["evidence"] = ["scope:deploy", "target:token@host"]
             refusal_legacy["decisions"] = [refusal_decision]
@@ -1264,7 +1265,7 @@ class WorkflowBehaviorTests(unittest.TestCase):
             self.assertEqual(migrated_refusal.state["events"][0]["event"], "action_refused")
             self.assertEqual(migrated_refusal.state["events"][0]["target"], "<invalid-target>")
             self.assertEqual(len(migrated_refusal.state["decisions"]), 1)
-            self.assertNotIn("token@host", json.dumps(migrated_refusal.state["decisions"]))
+            self.assertNotIn("token@host", json.dumps(migrated_refusal.state))
 
             orphan_legacy = legacy_state(json.loads(refusal_state_path.read_text(encoding="utf-8")))
             orphan_legacy["events"] = []
@@ -1287,6 +1288,9 @@ class WorkflowBehaviorTests(unittest.TestCase):
                 "at": orphan_decision["at"],
                 "event": "decision_recorded",
                 "phase": "phase-1",
+                "target": "token@host",
+                "reason": "target token@host was out of scope",
+                "private": {"target": "token@host"},
             }]
             mislabeled_decision = mislabeled_legacy["decisions"][0]
             mislabeled_decision["evidence"] = ["scope:deploy", "target:token@host"]

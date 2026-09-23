@@ -2041,6 +2041,24 @@ def _migrate_schema_1_state(state: Mapping[str, Any]) -> dict[str, Any]:
             record, listed = event_decision(event, used_legacy_decisions)
             if event_name == "action_refused" and "phase" not in event:
                 event["phase"] = record.get("phase", "run")
+            is_refusal = record.get("status") == "refused" or (
+                isinstance(record.get("decision"), str)
+                and record["decision"].startswith("refused action ")
+            )
+            if is_refusal:
+                # Legacy event objects are untrusted too.  Keep only the
+                # bounded target marker needed by an action_refused event;
+                # discard arbitrary target, reason, and private metadata from
+                # both matched and mislabeled refusal events.
+                event.pop("private", None)
+                if event_name == "action_refused":
+                    event["target"] = _sanitize_refusal_target(event.get("target"))
+                    event["reason"] = "legacy refusal"
+                    event["next_action"] = "choose a declared local action or replan with owner approval"
+                else:
+                    event.pop("target", None)
+                    event.pop("reason", None)
+                    event.pop("private", None)
             event["__migration_decision"] = record
             event["__migration_listed"] = listed
         normalized_events.append(event)
