@@ -32,6 +32,19 @@ CHECK_STATUSES = {"verified", "failed", "blocked", "not_run", "inconclusive"}
 RUN_STATUSES = {"planned", "running", "failed", "interrupted", "blocked", "completed"}
 PHASE_STATUSES = {"pending", "in_progress", "passed", "failed", "interrupted", "blocked"}
 ACTION_REFUSAL_STATUSES = {"failed", "interrupted", "blocked", "completed"}
+LIFECYCLE_EVENTS = {
+    "phase_started",
+    "checkpoint",
+    "phase_passed",
+    "phase_failed",
+    "replanned",
+    "interrupted",
+    "resumed",
+    "blocked",
+    "predicate_recorded",
+    "completed",
+}
+AUDIT_EVENTS = {"action_allowed", "action_refused"}
 STRUCTURED_EVIDENCE_KINDS = {"artifact", "blocker", "command", "path", "reference", "test"}
 EVIDENCE_PLACEHOLDER_KEYS = {
     "agent report",
@@ -447,6 +460,395 @@ def _require_state_fields(value: Mapping[str, Any], fields: set[str], label: str
         raise StateError(f"invalid state: {label} is missing required fields: {', '.join(missing)}")
 
 
+def _validate_lifecycle_graph(
+    state: Mapping[str, Any],
+    validated_plan: Mapping[str, Any],
+    phases: Sequence[Mapping[str, Any]],
+    checkpoint_by_id: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Replay persisted transition events and compare them with the snapshot."""
+
+    phase_ids = [phase["id"] for phase in validated_plan["phases"]]
+    check_ids = set(validated_plan["terminal_predicate"]["checks"])
+    phase_states = {phase_id: "pending" for phase_id in phase_ids}
+    phase_attempts = {phase_id: 0 for phase_id in phase_ids}
+    last_phase_passed: dict[str, Mapping[str, Any]] = {}
+    last_phase_failed: dict[str, Mapping[str, Any]] = {}
+    last_predicate_event: dict[str, Mapping[str, Any]] = {}
+    seen_checkpoints: set[str] = set()
+    latest_checkpoint: dict[str, str] = {}
+    latest_interruption: Mapping[str, Any] | None = None
+    latest_interruption_snapshot: Mapping[str, Any] | None = None
+    latest_blocker: Mapping[str, Any] | None = None
+    last_replacement: dict[str, Mapping[str, Any]] = {}
+    run_status = "planned"
+    resume_count = 0
+    expected_next_action = f"start phase {phase_ids[0]}"
+    next_replan_number = 1
+    completed_event: Mapping[str, Any] | None = None
+
+    replans_by_number = {replan["number"]: replan for replan in state["replans"]}
+
+    def fail(message: str) -> None:
+        raise StateError(f"invalid state: {message}")
+
+    def current_phase() -> str | None:
+        return next((phase_id for phase_id in phase_ids if phase_states[phase_id] != "passed"), None)
+
+    def all_phases_passed() -> bool:
+        return all(phase_states[phase_id] == "passed" for phase_id in phase_ids)
+
+    def event_text(event: Mapping[str, Any], index: int, field: str, *, max_length: int = MAX_TEXT) -> str:
+        if field not in event:
+            fail(f"events[{index}] is missing {field}")
+        _state_text(event[field], f"events[{index}].{field}", max_length=max_length)
+        return event[field]
+
+    def event_phase(event: Mapping[str, Any], index: int, *, allow_none: bool = False) -> str | None:
+        if "phase" not in event:
+            fail(f"events[{index}] is missing phase")
+        phase_id = event["phase"]
+        if allow_none and phase_id is None:
+            return None
+        if not isinstance(phase_id, str) or phase_id not in phase_ids:
+            fail(f"events[{index}].phase is not a declared phase")
+        return phase_id
+
+    def event_int(event: Mapping[str, Any], index: int, field: str, *, minimum: int = 1) -> int:
+        value = event.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            fail(f"events[{index}].{field} must be an integer at least {minimum}")
+        return value
+
+    def event_bool(event: Mapping[str, Any], index: int, field: str) -> bool:
+        value = event.get(field)
+        if not isinstance(value, bool):
+            fail(f"events[{index}].{field} must be a boolean")
+        return value
+
+    for index, event in enumerate(state["events"]):
+        event_name = event["event"]
+        if event_name not in LIFECYCLE_EVENTS | AUDIT_EVENTS:
+            fail(f"events[{index}].event is not a supported event")
+        if completed_event is not None and event_name != "action_refused":
+            fail("lifecycle events cannot be appended after completion")
+
+        if event_name == "action_allowed":
+            event_text(event, index, "action", max_length=100)
+            if event.get("target") is not None:
+                _state_text(event["target"], f"events[{index}].target", max_length=500)
+            if completed_event is not None:
+                fail("action_allowed cannot be appended after completion")
+            continue
+
+        if event_name == "action_refused":
+            if event.get("status") != "refused":
+                fail(f"events[{index}].action_refused must have refused status")
+            event_text(event, index, "action", max_length=100)
+            event_text(event, index, "reason", max_length=1000)
+            event_text(event, index, "next_action", max_length=1000)
+            if event.get("target") is not None:
+                _state_text(event["target"], f"events[{index}].target", max_length=500)
+            continue
+
+        if event_name == "phase_started":
+            phase_id = event_phase(event, index)
+            assert phase_id is not None
+            if run_status not in {"planned", "running"}:
+                fail(f"events[{index}] starts a phase from {run_status}")
+            if phase_id != current_phase() or phase_states[phase_id] != "pending":
+                fail(f"events[{index}] starts a phase that is not the current pending phase")
+            attempt = event_int(event, index, "attempt")
+            if attempt != phase_attempts[phase_id] + 1:
+                fail(f"events[{index}] has a non-sequential attempt for {phase_id}")
+            phase_attempts[phase_id] = attempt
+            phase_states[phase_id] = "in_progress"
+            run_status = "running"
+            expected_next_action = f"produce and verify phase {phase_id} output"
+            continue
+
+        if event_name == "checkpoint":
+            phase_id = event_phase(event, index)
+            assert phase_id is not None
+            checkpoint_id = event_text(event, index, "checkpoint", max_length=100)
+            if run_status != "running" or phase_id != current_phase() or phase_states[phase_id] != "in_progress":
+                fail(f"events[{index}] records a checkpoint outside the current phase")
+            checkpoint = checkpoint_by_id.get(checkpoint_id)
+            if checkpoint is None or checkpoint["phase"] != phase_id:
+                fail(f"events[{index}] references a checkpoint for another phase")
+            if checkpoint_id in seen_checkpoints:
+                fail(f"events[{index}] repeats checkpoint {checkpoint_id}")
+            seen_checkpoints.add(checkpoint_id)
+            latest_checkpoint[phase_id] = checkpoint_id
+            if "checkpoint_snapshot" in event and event["checkpoint_snapshot"] != checkpoint:
+                fail(f"events[{index}].checkpoint_snapshot does not match the checkpoint")
+            expected_next_action = checkpoint["next_action"]
+            continue
+
+        if event_name == "phase_passed":
+            phase_id = event_phase(event, index)
+            assert phase_id is not None
+            check_id = event_text(event, index, "check_id", max_length=100)
+            if run_status != "running" or phase_id != current_phase() or phase_states[phase_id] != "in_progress":
+                fail(f"events[{index}] passes a phase outside the current phase")
+            phase_states[phase_id] = "passed"
+            last_phase_passed[phase_id] = event
+            if "verification_snapshot" in event:
+                _state_phase_verification(
+                    event["verification_snapshot"],
+                    f"events[{index}].verification_snapshot",
+                    check_id,
+                )
+            next_phase = current_phase()
+            expected_next_action = (
+                f"inspect output, then start phase {next_phase}" if next_phase is not None else "record terminal predicate checks"
+            )
+            continue
+
+        if event_name == "phase_failed":
+            phase_id = event_phase(event, index)
+            assert phase_id is not None
+            reason = event_text(event, index, "reason", max_length=1000)
+            if run_status != "running" or phase_id != current_phase() or phase_states[phase_id] != "in_progress":
+                fail(f"events[{index}] fails a phase outside the current phase")
+            phase_states[phase_id] = "failed"
+            last_phase_failed[phase_id] = event
+            run_status = "failed"
+            if "failure_snapshot" in event:
+                _state_failure(event["failure_snapshot"], f"events[{index}].failure_snapshot")
+                if event["failure_snapshot"]["reason"] != reason:
+                    fail(f"events[{index}].failure_snapshot does not match the failure")
+            expected_next_action = ""
+            continue
+
+        if event_name == "replanned":
+            phase_id = event_phase(event, index)
+            assert phase_id is not None
+            number = event_int(event, index, "number")
+            if run_status != "failed" or phase_id != current_phase() or phase_states[phase_id] != "failed":
+                fail(f"events[{index}] replans outside the failed current phase")
+            if number != next_replan_number:
+                fail(f"events[{index}] has a non-sequential replan number")
+            replan = replans_by_number.get(number)
+            if replan is None or replan["phase"] != phase_id:
+                fail(f"events[{index}] has no matching replan record")
+            if "replacement" in event and event["replacement"] != replan["replacement"]:
+                fail(f"events[{index}].replacement does not match the replan record")
+            phase_states[phase_id] = "pending"
+            run_status = "planned"
+            last_replacement[phase_id] = replan["replacement"]
+            next_replan_number += 1
+            expected_next_action = f"start replanned phase {phase_id}"
+            continue
+
+        if event_name == "interrupted":
+            phase_id = event_phase(event, index)
+            assert phase_id is not None
+            checkpoint_id = event_text(event, index, "checkpoint", max_length=100)
+            if run_status != "running" or phase_id != current_phase() or phase_states[phase_id] != "in_progress":
+                fail(f"events[{index}] interrupts outside the current phase")
+            if latest_checkpoint.get(phase_id) != checkpoint_id:
+                fail(f"events[{index}] interrupts without the latest checkpoint")
+            phase_states[phase_id] = "interrupted"
+            run_status = "interrupted"
+            interruption = {"phase": phase_id, "checkpoint": checkpoint_id}
+            if "reason" in event:
+                interruption["reason"] = event["reason"]
+                _state_text(event["reason"], f"events[{index}].reason", max_length=1000)
+            latest_interruption_snapshot = None
+            if "interruption_snapshot" in event:
+                snapshot = event["interruption_snapshot"]
+                if not isinstance(snapshot, Mapping):
+                    fail(f"events[{index}].interruption_snapshot must be an object")
+                _require_state_fields(
+                    snapshot,
+                    {"at", "phase", "checkpoint", "reason"},
+                    f"events[{index}].interruption_snapshot",
+                )
+                for field in ("at", "phase", "checkpoint", "reason"):
+                    _state_text(snapshot[field], f"events[{index}].interruption_snapshot.{field}")
+                if snapshot["phase"] != phase_id or snapshot["checkpoint"] != checkpoint_id or snapshot["reason"] != interruption.get("reason"):
+                    fail(f"events[{index}].interruption_snapshot does not match the interruption")
+                latest_interruption_snapshot = snapshot
+            latest_interruption = interruption
+            expected_next_action = f"resume from checkpoint {checkpoint_id}"
+            continue
+
+        if event_name == "resumed":
+            phase_id = event_phase(event, index)
+            assert phase_id is not None
+            checkpoint_id = event_text(event, index, "checkpoint", max_length=100)
+            if run_status != "interrupted" or phase_id != current_phase() or phase_states[phase_id] != "interrupted":
+                fail(f"events[{index}] resumes outside the interrupted phase")
+            if latest_interruption is None or latest_interruption["phase"] != phase_id or latest_interruption["checkpoint"] != checkpoint_id:
+                fail(f"events[{index}] does not match the interruption")
+            phase_states[phase_id] = "in_progress"
+            run_status = "running"
+            resume_count += 1
+            expected_next_action = f"continue phase {phase_id} from checkpoint {checkpoint_id}"
+            continue
+
+        if event_name == "blocked":
+            phase_id = event_phase(event, index, allow_none=True)
+            if run_status == "completed":
+                fail(f"events[{index}] blocks a completed run")
+            if phase_id != current_phase():
+                fail(f"events[{index}] blocker phase does not match the current phase")
+            if phase_id is not None and phase_states[phase_id] in {"pending", "in_progress", "interrupted"}:
+                phase_states[phase_id] = "blocked"
+            run_status = "blocked"
+            reason = event_text(event, index, "reason", max_length=1000)
+            latest_blocker = event
+            if "blocker_snapshot" in event:
+                _state_failure(event["blocker_snapshot"], f"events[{index}].blocker_snapshot")
+                if event["blocker_snapshot"]["reason"] != reason:
+                    fail(f"events[{index}].blocker_snapshot does not match the blocker")
+            expected_next_action = ""
+            continue
+
+        if event_name == "predicate_recorded":
+            check_id = event_text(event, index, "check_id", max_length=100)
+            passed = event_bool(event, index, "passed")
+            if run_status != "running" or not all_phases_passed():
+                fail(f"events[{index}] records a predicate before all phases pass")
+            if check_id not in check_ids:
+                fail(f"events[{index}] records an undeclared predicate")
+            if "result_snapshot" in event:
+                snapshot = event["result_snapshot"]
+                if not isinstance(snapshot, Mapping):
+                    fail(f"events[{index}].result_snapshot must be an object")
+                _require_state_fields(
+                    snapshot,
+                    {"check_id", "passed", "status", "evidence", "observed", "at"},
+                    f"events[{index}].result_snapshot",
+                )
+                if snapshot["check_id"] != check_id or snapshot["passed"] is not passed:
+                    fail(f"events[{index}].result_snapshot does not match the predicate")
+                if snapshot["status"] not in CHECK_STATUSES or (snapshot["status"] == "verified") is not passed:
+                    fail(f"events[{index}].result_snapshot has an invalid status")
+                _state_evidence(snapshot["evidence"], f"events[{index}].result_snapshot.evidence")
+                _state_text(snapshot["observed"], f"events[{index}].result_snapshot.observed", max_length=1000)
+                _state_text(snapshot["at"], f"events[{index}].result_snapshot.at")
+            last_predicate_event[check_id] = event
+            expected_next_action = (
+                "finish when all terminal checks pass" if passed else f"address failed terminal check {check_id}"
+            )
+            continue
+
+        if event_name == "completed":
+            if run_status != "running" or not all_phases_passed():
+                fail(f"events[{index}] completes a run before the predicate is ready")
+            if any(check_id not in last_predicate_event or not last_predicate_event[check_id]["passed"] for check_id in check_ids):
+                fail(f"events[{index}] completes a run without all verified predicate events")
+            completed_event = event
+            run_status = "completed"
+            expected_next_action = ""
+            continue
+
+    if run_status != state["status"]:
+        fail("run status does not match the lifecycle event graph")
+    state_phase_statuses = {phase["id"]: phase["status"] for phase in phases}
+    if state_phase_statuses != phase_states:
+        fail("phase statuses do not match the lifecycle event graph")
+    state_phase_attempts = {phase["id"]: phase["attempt"] for phase in phases}
+    if state_phase_attempts != phase_attempts:
+        fail("phase attempts do not match the lifecycle event graph")
+    if state["resume_count"] != resume_count:
+        fail("resume_count does not match the lifecycle event graph")
+    if state["current_phase"] != current_phase():
+        fail("current_phase does not match the lifecycle event graph")
+
+    if state["status"] == "completed" and completed_event is None:
+        fail("completed runs require a completed lifecycle event")
+    if state["status"] != "completed" and completed_event is not None:
+        fail("non-completed runs cannot retain a completed lifecycle event")
+    if completed_event is not None and "terminal_snapshot" in completed_event:
+        if completed_event["terminal_snapshot"] != state["terminal"]:
+            fail("terminal snapshot does not match the completed lifecycle event")
+
+    for phase in phases:
+        phase_id = phase["id"]
+        if phase_id in last_replacement:
+            plan_phase = next(item for item in validated_plan["phases"] if item["id"] == phase_id)
+            if plan_phase != last_replacement[phase_id]:
+                fail(f"phase {phase_id} plan does not match its final replacement")
+        if phase["status"] == "passed":
+            pass_event = last_phase_passed.get(phase_id)
+            if pass_event is None or pass_event["check_id"] != phase["verification"]["id"]:
+                fail(f"phase {phase_id} has no final matching phase_passed event")
+            if "verification_snapshot" in pass_event and pass_event["verification_snapshot"] != phase["verification_result"]:
+                fail(f"phase {phase_id} verification evidence does not match its lifecycle event")
+        if phase["status"] == "failed":
+            failure_event = last_phase_failed.get(phase_id)
+            if failure_event is None or failure_event["reason"] != phase["failure"]["reason"]:
+                fail(f"phase {phase_id} failure does not match its lifecycle event")
+            if "failure_snapshot" in failure_event and failure_event["failure_snapshot"] != phase["failure"]:
+                fail(f"phase {phase_id} failure snapshot does not match its lifecycle event")
+
+    if latest_interruption is None:
+        if state["interruption"] is not None:
+            fail("interruption details exist without an interrupted lifecycle event")
+    else:
+        interruption = state["interruption"]
+        if interruption is None:
+            fail("interrupted lifecycle history has no interruption details")
+        if interruption["phase"] != latest_interruption["phase"] or interruption["checkpoint"] != latest_interruption["checkpoint"]:
+            fail("interruption details do not match the lifecycle event")
+        if "reason" in latest_interruption and interruption["reason"] != latest_interruption["reason"]:
+            fail("interruption reason does not match the lifecycle event")
+        if latest_interruption_snapshot is not None and latest_interruption_snapshot != interruption:
+            fail("interruption snapshot does not match the lifecycle event")
+
+    if latest_blocker is None:
+        if state["status"] == "blocked":
+            fail("blocked runs require a blocked lifecycle event")
+    else:
+        blocker = state["blocker"]
+        if blocker is None or blocker["phase"] != latest_blocker.get("phase") or blocker["reason"] != latest_blocker["reason"]:
+            fail("blocker details do not match the lifecycle event")
+        if "blocker_snapshot" in latest_blocker and latest_blocker["blocker_snapshot"] != blocker:
+            fail("blocker snapshot does not match the lifecycle event")
+
+    for check_id in check_ids:
+        result = state["predicate_results"][check_id]
+        predicate_event = last_predicate_event.get(check_id)
+        if result is None:
+            if predicate_event is not None:
+                fail(f"predicate_results[{check_id}] is missing its lifecycle event result")
+        else:
+            if predicate_event is None or result["passed"] is not predicate_event["passed"]:
+                fail(f"predicate_results[{check_id}] does not match its lifecycle event")
+            if "result_snapshot" in predicate_event and predicate_event["result_snapshot"] != result:
+                fail(f"predicate_results[{check_id}] evidence does not match its lifecycle event")
+
+        terminal_decisions = [
+            decision
+            for decision in state["decisions"]
+            if decision["phase"] == "run" and decision["decision"] == f"terminal check {check_id}"
+        ]
+        if result is None:
+            if terminal_decisions:
+                fail(f"predicate decision exists without predicate_results[{check_id}]")
+        else:
+            if not terminal_decisions:
+                fail(f"predicate_results[{check_id}] has no terminal decision")
+            latest_decision = terminal_decisions[-1]
+            if latest_decision["result"] != result["status"] or latest_decision["evidence"] != result["evidence"]:
+                fail(f"predicate_results[{check_id}] evidence does not match its terminal decision")
+
+    if state["status"] == "completed":
+        expected_next_action = None
+    elif state["status"] == "blocked":
+        expected_next_action = state["blocker"]["next_action"]
+    elif state["status"] == "failed":
+        phase = next(phase for phase in phases if phase["id"] == state["current_phase"])
+        expected_next_action = f"replan phase {phase['id']}: {phase['failure']['next_action']}"
+    elif state["status"] == "interrupted":
+        expected_next_action = f"resume from checkpoint {state['interruption']['checkpoint']}"
+    if state["next_action"] != expected_next_action:
+        fail("next_action does not match the lifecycle event graph")
+
+
 def _require_state_object(state: Mapping[str, Any]) -> None:
     if not isinstance(state, Mapping):
         raise StateError("invalid state: root must be an object")
@@ -785,6 +1187,8 @@ def _require_state_object(state: Mapping[str, Any]) -> None:
     elif terminal is not None:
         raise StateError("invalid state: only completed runs may have terminal details")
 
+    _validate_lifecycle_graph(state, validated_plan, phases, checkpoint_by_id)
+
 
 class Workflow:
     """A finite state machine backed by one local JSON state file."""
@@ -1071,7 +1475,12 @@ class Workflow:
         self.state["checkpoints"].append(checkpoint)
         phase["checkpoints"].append(checkpoint["id"])
         self.state["next_action"] = next_action
-        self._event("checkpoint", checkpoint=checkpoint["id"], phase=phase["id"])
+        self._event(
+            "checkpoint",
+            checkpoint=checkpoint["id"],
+            phase=phase["id"],
+            checkpoint_snapshot=deepcopy(checkpoint),
+        )
         self._persist()
         return deepcopy(checkpoint)
 
@@ -1106,7 +1515,12 @@ class Workflow:
         else:
             self.state["current_phase"] = next_phase["id"]
             self.state["next_action"] = f"inspect output, then start phase {next_phase['id']}"
-        self._event("phase_passed", phase=phase["id"], check_id=check_id)
+        self._event(
+            "phase_passed",
+            phase=phase["id"],
+            check_id=check_id,
+            verification_snapshot=deepcopy(phase["verification_result"]),
+        )
         self.record_decision(
             phase["id"],
             f"passed phase {phase['id']}",
@@ -1134,7 +1548,12 @@ class Workflow:
         phase["failure"] = {"reason": reason, "evidence": evidence_values, "next_action": next_action, "at": _now()}
         self.state["status"] = "failed"
         self.state["next_action"] = f"replan phase {phase['id']}: {next_action}"
-        self._event("phase_failed", phase=phase["id"], reason=reason)
+        self._event(
+            "phase_failed",
+            phase=phase["id"],
+            reason=reason,
+            failure_snapshot=deepcopy(phase["failure"]),
+        )
         self.record_decision(
             phase["id"],
             f"failed: {reason}",
@@ -1212,7 +1631,13 @@ class Workflow:
             self._decision_record(candidate_phase["id"], "replan phase", reason, evidence_values, "open")
         )
         candidate["events"].append(
-            {"at": _now(), "event": "replanned", "phase": candidate_phase["id"], "number": replan_record["number"]}
+            {
+                "at": _now(),
+                "event": "replanned",
+                "phase": candidate_phase["id"],
+                "number": replan_record["number"],
+                "replacement": deepcopy(replan_record["replacement"]),
+            }
         )
         self._persist_candidate(candidate)
         return deepcopy(self.state)
@@ -1230,7 +1655,13 @@ class Workflow:
         phase["status"] = "interrupted"
         self.state["interruption"] = {"at": _now(), "phase": phase["id"], "checkpoint": last_checkpoint, "reason": reason}
         self.state["next_action"] = f"resume from checkpoint {last_checkpoint}"
-        self._event("interrupted", phase=phase["id"], checkpoint=last_checkpoint)
+        self._event(
+            "interrupted",
+            phase=phase["id"],
+            checkpoint=last_checkpoint,
+            reason=reason,
+            interruption_snapshot=deepcopy(self.state["interruption"]),
+        )
         self._persist()
         return deepcopy(self.state)
 
@@ -1260,7 +1691,7 @@ class Workflow:
         self.state["status"] = "blocked"
         self.state["blocker"] = {"at": _now(), "phase": current_id, "reason": reason, "evidence": evidence_values, "next_action": next_action}
         self.state["next_action"] = next_action
-        self._event("blocked", phase=current_id, reason=reason)
+        self._event("blocked", phase=current_id, reason=reason, blocker_snapshot=deepcopy(self.state["blocker"]))
 
     def block(self, reason: str, evidence: Sequence[Any] | str, next_action: str) -> dict[str, Any]:
         _require_state_object(self.state)
@@ -1372,9 +1803,6 @@ class Workflow:
             "observed": observed_value,
             "at": _now(),
         }
-        self.state["predicate_results"][check_id] = result
-        self.state["next_action"] = "finish when all terminal checks pass" if passed else f"address failed terminal check {check_id}"
-        self._event("predicate_recorded", check_id=check_id, passed=bool(passed))
         self.record_decision(
             self.state.get("current_phase") or "run",
             f"terminal check {check_id}",
@@ -1383,6 +1811,9 @@ class Workflow:
             status_value,
             persist=False,
         )
+        self.state["predicate_results"][check_id] = result
+        self.state["next_action"] = "finish when all terminal checks pass" if passed else f"address failed terminal check {check_id}"
+        self._event("predicate_recorded", check_id=check_id, passed=bool(passed), result_snapshot=deepcopy(result))
         self._persist()
         return deepcopy(result)
 
@@ -1411,7 +1842,7 @@ class Workflow:
             "predicate": self.state["plan"]["terminal_predicate"]["description"],
             "checks": deepcopy(results),
         }
-        self._event("completed")
+        self._event("completed", terminal_snapshot=deepcopy(self.state["terminal"]))
         self._persist()
         return deepcopy(self.state)
 

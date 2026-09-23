@@ -84,6 +84,18 @@ class WorkflowBehaviorTests(unittest.TestCase):
             workspace_root=root,
         )
 
+    def completed_workflow(self, root: Path):
+        workflow = self.workflow(root, phase_count=1)
+        workflow.start_phase()
+        workflow.complete_phase(
+            "completed output",
+            {"check_id": "check-1", "passed": True, "evidence": ["tests/phase-pass.txt"]},
+        )
+        workflow.record_predicate("focused-tests", True, ["tests/focused.txt"])
+        workflow.record_predicate("artifact-inspection", True, ["artifacts/inspection.txt"])
+        workflow.finish()
+        return workflow
+
     def test_normal_completion_requires_outputs_and_terminal_predicate(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -345,6 +357,72 @@ class WorkflowBehaviorTests(unittest.TestCase):
             self.assertEqual(persisted.state["terminal"], terminal_before)
             self.assertEqual(persisted.state["predicate_results"], predicate_results_before)
             self.assertEqual(persisted.state["decisions"], decisions_before)
+
+    def test_reopened_completed_run_is_rejected_on_load_and_before_finish(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            persisted = self.completed_workflow(root / "persisted")
+            state_path = root / "persisted" / "run.json"
+            forged = json.loads(state_path.read_text(encoding="utf-8"))
+            forged["status"] = "running"
+            forged["terminal"] = None
+            forged["next_action"] = "finish"
+            for result in forged["predicate_results"].values():
+                result["evidence"] = ["tests/forged-late-evidence.txt"]
+            state_path.write_text(json.dumps(forged), encoding="utf-8")
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(state_path, workspace_root=root / "persisted")
+
+            in_memory = self.completed_workflow(root / "in-memory")
+            in_memory.state["status"] = "running"
+            in_memory.state["terminal"] = None
+            in_memory.state["next_action"] = "finish"
+            with self.assertRaises(figure_it_out.StateError):
+                in_memory.finish()
+
+    def test_persisted_lifecycle_rejects_terminal_cross_field_edits(self):
+        mutations = {
+            "completed_without_event": lambda state: state["events"].pop(),
+            "completed_without_terminal": lambda state: state.update(terminal=None),
+            "terminal_snapshot_mismatch": lambda state: next(
+                event for event in state["events"] if event["event"] == "completed"
+            )["terminal_snapshot"].update(predicate="forged predicate"),
+            "terminal_checks_mismatch": lambda state: state["terminal"]["checks"]["focused-tests"].update(
+                evidence=["tests/forged-terminal.txt"]
+            ),
+            "predicate_and_terminal_evidence_forged": lambda state: (
+                state["predicate_results"]["focused-tests"].update(evidence=["tests/forged-late.txt"]),
+                state["terminal"]["checks"]["focused-tests"].update(evidence=["tests/forged-late.txt"]),
+            ),
+            "predicate_event_removed": lambda state: state["events"].__setitem__(
+                slice(None),
+                [event for event in state["events"] if not (event["event"] == "predicate_recorded" and event["check_id"] == "focused-tests")],
+            ),
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for label, mutate in mutations.items():
+                with self.subTest(case=label):
+                    workflow = self.completed_workflow(root / label)
+                    state_path = root / label / "run.json"
+                    state = json.loads(state_path.read_text(encoding="utf-8"))
+                    mutate(state)
+                    state_path.write_text(json.dumps(state), encoding="utf-8")
+                    with self.assertRaises(figure_it_out.StateError):
+                        figure_it_out.Workflow.load(state_path, workspace_root=root / label)
+
+            ready = self.workflow(root / "ready", phase_count=1)
+            ready.start_phase()
+            ready.complete_phase(
+                "ready output",
+                {"check_id": "check-1", "passed": True, "evidence": ["tests/phase-pass.txt"]},
+            )
+            ready.record_predicate("focused-tests", True, ["tests/focused.txt"])
+            ready.record_predicate("artifact-inspection", True, ["artifacts/inspection.txt"])
+            ready.state["next_action"] = "finish"
+            (root / "ready" / "run.json").write_text(json.dumps(ready.state), encoding="utf-8")
+            with self.assertRaises(figure_it_out.StateError):
+                figure_it_out.Workflow.load(root / "ready" / "run.json", workspace_root=root / "ready")
 
     def test_malformed_persisted_state_is_rejected_before_start(self):
         with tempfile.TemporaryDirectory() as directory:
