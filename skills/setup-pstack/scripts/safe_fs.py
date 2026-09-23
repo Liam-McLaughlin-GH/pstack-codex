@@ -565,6 +565,16 @@ def _native_unlink_at(
         claimed_metadata = lstat_at(parent_fd, claimed_name)
         if not _same_entry(claimed_metadata, expected_metadata):
             raise SafeFilesystemError(f"entry identity changed during removal: {name}", preserve_private=True)
+        # A cleanup hook can still replace the second private name after its
+        # identity check. Claim it once more under a distinct private prefix
+        # before the final unlink so that replacement is detected as a
+        # mismatch instead of being deleted by pathname.
+        last_name = unique_entry_name(parent_fd, ".pstack-final-")
+        atomic_rename_noreplace_at(parent_fd, claimed_name, last_name)
+        claimed_name = last_name
+        claimed_metadata = lstat_at(parent_fd, claimed_name)
+        if not _same_entry(claimed_metadata, expected_metadata):
+            raise SafeFilesystemError(f"entry identity changed during removal: {name}", preserve_private=True)
         try:
             libc = ctypes.CDLL(None, use_errno=True)
             function = getattr(libc, "unlinkat")
