@@ -15,7 +15,7 @@ matching post-change artifact.
 4. Capture a post-fix artifact with the same workload. Compare artifacts in a
    queryable form. Report before, after, delta, unit, source mapping, and
    paths. An artifact with no mapping or a wrong surface is INCONCLUSIVE.
-5. Apply $sequence-verifiable-units. Verify one attempt before starting the
+5. Apply $principle-sequence-verifiable-units. Verify one attempt before starting the
    next. Cite the measurement in the handoff.
 6. Route accepted work through [Opening a PR](./opening-a-pr.md). Forge and
    deployment actions remain gated.
