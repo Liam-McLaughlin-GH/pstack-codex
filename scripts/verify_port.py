@@ -272,13 +272,25 @@ def _scalar(value: str, field: str) -> str:
             index += 2 + width
         raise ValidationError(f"frontmatter field {field!r} has an unterminated quote")
 
+    explicit_string_tag = re.match(
+        r"^(?:!!str|!<tag:yaml\.org,2002:str>)(?:[ \t]+(?P<payload>.*))?$",
+        value,
+        re.IGNORECASE,
+    )
+    if explicit_string_tag is not None:
+        payload = (explicit_string_tag.group("payload") or "").strip()
+        if not payload:
+            raise ValidationError(f"frontmatter field {field!r} is empty")
+        return payload
     if value.startswith(("[", "{", "&", "*", "!", "|", ">", "%", "@", "`", "#")):
         raise ValidationError(f"frontmatter field {field!r} is not a supported scalar")
     if re.search(r":(?:[ \t]|$)", value):
         raise ValidationError(f"frontmatter field {field!r} has unsupported mapping syntax")
-    if value.casefold() in {"null", "~", "true", "false", "yes", "no", "on", "off"}:
+    if value.casefold() in {"null", "~", "true", "false", "yes", "no", "on", "off", "y", "n"}:
         raise ValidationError(f"frontmatter field {field!r} is not a string scalar")
-    if re.fullmatch(r"[-+]?(?:0|[1-9][0-9_]*)(?:\.[0-9_]+)?(?:[eE][-+]?[0-9]+)?", value):
+    if re.fullmatch(r"[-+]?(?:0|[1-9][0-9_]*)(?:\.[0-9_]*)?(?:[eE][-+]?[0-9_]+)?", value):
+        raise ValidationError(f"frontmatter field {field!r} is not a string scalar")
+    if re.fullmatch(r"[-+]?\.[0-9_]+|[-+]?0_[0-9_]+|[-+]?\.(?:inf|nan)", value, re.IGNORECASE):
         raise ValidationError(f"frontmatter field {field!r} is not a string scalar")
     if re.fullmatch(r"[-+]?0x[0-9A-Fa-f_]+|[-+]?0o[0-7_]+|[-+]?0b[01_]+", value):
         raise ValidationError(f"frontmatter field {field!r} is not a string scalar")
@@ -310,6 +322,16 @@ def parse_frontmatter(text: str) -> Frontmatter:
         if required not in fields:
             raise ValidationError(f"frontmatter is missing {required}")
     return Frontmatter(fields, closing + 1)
+
+
+def required_frontmatter_errors(metadata: str) -> list[str]:
+    """Keep the small validation helper importable for skill-level tests."""
+
+    try:
+        parse_frontmatter(f"---\n{metadata.rstrip()}\n---\n")
+    except ValidationError as exc:
+        return [str(exc)]
+    return []
 
 
 def _reference_label(label: str) -> str:
