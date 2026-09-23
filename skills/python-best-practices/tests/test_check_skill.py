@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import copy
 import importlib.util
+import shutil
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -85,6 +89,13 @@ class RoutingRegressionTests(unittest.TestCase):
                 self.assertEqual(CHECKER.route_for_task(request), "unsafe")
 
         for request in (
+            "gcloud auth activate-service-account deployer@example.com",
+            "gcloud auth configure-docker",
+            "gcloud builds submit .",
+            "gcloud builds triggers run trigger",
+            "gcloud components install kubectl",
+            "gcloud config configurations activate production",
+            "gcloud container fleet memberships register membership",
             "gcloud dns record-sets transaction execute",
             "gcloud run jobs execute job",
             "gcloud scheduler jobs run job",
@@ -468,6 +479,12 @@ class DocumentIntegrityTests(unittest.TestCase):
                 "1.",
                 ".5",
                 "1_000",
+                "10",
+                "+10",
+                "-10",
+                "10.0",
+                "00.1",
+                "01.0",
                 "!<tag:yaml.org,2002:int> 1",
                 "!<tag:yaml.org,2002:float> .5",
                 "!<tag:yaml.org,2002:bool> true",
@@ -493,6 +510,7 @@ class DocumentIntegrityTests(unittest.TestCase):
                 '"1_000"',
                 '"!<tag:yaml.org,2002:int> 1"',
                 "!<tag:yaml.org,2002:str> 1",
+                "0o12",
             ):
                 with self.subTest(field=field, value=value):
                     candidate = self.skill_text.replace(
@@ -534,6 +552,13 @@ class DocumentIntegrityTests(unittest.TestCase):
             1,
         )
         self.assertFalse(CHECKER.check_documents(anchored, self.ledger))
+
+        malformed_block = self.skill_text.replace(
+            name_line,
+            "name: |\npython-best-practices",
+            1,
+        )
+        self.assertTrue(CHECKER.check_documents(malformed_block, self.ledger))
 
     def test_shared_port_boundary_rejects_non_scalar_required_frontmatter(self) -> None:
         for field in ("name", "description"):
@@ -723,6 +748,35 @@ class DocumentIntegrityTests(unittest.TestCase):
         wrong_rule["routing_cases"][7]["rule"] = "SP-FRONTEND-PACKAGES"
         errors = CHECKER.check_documents(self.skill_text, wrong_rule)
         self.assertTrue(any("rule is incompatible with task owners" in error for error in errors), errors)
+
+        wrong_safety_rule = copy.deepcopy(self.ledger)
+        django_case = next(
+            case for case in wrong_safety_rule["routing_cases"] if case["name"] == "django-orm"
+        )
+        django_case["rule"] = "SP-K8S-SAFETY"
+        errors = CHECKER.check_documents(self.skill_text, wrong_safety_rule)
+        self.assertTrue(any("rule is incompatible with task owners" in error for error in errors), errors)
+
+        ownerless_rule = copy.deepcopy(self.ledger)
+        production_case = next(
+            case for case in ownerless_rule["routing_cases"] if case["name"] == "generic-production"
+        )
+        production_case["rule"] = "SP-WEB-OWNERS"
+        errors = CHECKER.check_documents(self.skill_text, ownerless_rule)
+        self.assertTrue(any("rule requires a task owner" in error for error in errors), errors)
+
+    def test_copied_skill_checker_runs_without_repository_scripts(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="python-best-practices-copy-") as temporary:
+            copied_skill = Path(temporary) / "python-best-practices"
+            shutil.copytree(SKILL_DIR, copied_skill)
+            result = subprocess.run(
+                [sys.executable, str(copied_skill / "scripts" / "check_skill.py")],
+                cwd=temporary,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_scenario_checker_rejects_malformed_ledger_shapes(self) -> None:
         for field, value in (

@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 PORT_SCRIPTS_DIR = Path(__file__).resolve().parents[3] / "scripts"
-if str(PORT_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(PORT_SCRIPTS_DIR))
+SKILL_SCRIPTS_DIR = Path(__file__).resolve().parent
+for scripts_dir in (PORT_SCRIPTS_DIR, SKILL_SCRIPTS_DIR):
+    if str(scripts_dir) not in sys.path:
+        sys.path.insert(0, str(scripts_dir))
 
 from skill_frontmatter import required_frontmatter_errors
 
@@ -252,7 +254,12 @@ GCLOUD_MUTATION_RE = re.compile(
 )
 GCLOUD_EFFECTFUL_RE = re.compile(
     _real_token_expression("gcloud")
-    + r"[^\n]*?(?:dns\s+record-sets\s+transaction\s+execute|"
+    + r"[^\n]*?(?:auth\s+(?:activate-service-account|configure-docker)|"
+    + r"builds\s+(?:submit|triggers\s+run)|"
+    + r"components\s+install|"
+    + r"config\s+configurations\s+activate|"
+    + r"container\s+fleet\s+memberships\s+register|"
+    + r"dns\s+record-sets\s+transaction\s+execute|"
     + r"run\s+jobs\s+execute|scheduler\s+jobs\s+(?:run|pause)|"
     + r"workflows\s+run)(?![a-z0-9_-])"
 )
@@ -860,11 +867,15 @@ def _validate_routing_case_records(ledger: Dict[str, Any]) -> List[str]:
                 errors.append("%s.rule must be a non-empty source rule id" % context)
             elif rule not in known_rules:
                 errors.append("%s references unknown rule: %s" % (context, rule))
-            elif (
-                expected_repositories
-                and rule != "SP-K8S-SAFETY"
-                and EXPECTED_RULE_REPOSITORIES[rule] not in expected_repositories
-            ):
+            elif rule == "SP-K8S-SAFETY":
+                if safety == "safe" and expected_repositories and "web-k8s" not in expected_repositories:
+                    errors.append(
+                        "%s.rule is incompatible with task owners: expected one of %r, got %r"
+                        % (context, expected_repositories, EXPECTED_RULE_REPOSITORIES[rule])
+                    )
+            elif not expected_repositories:
+                errors.append("%s.rule requires a task owner" % context)
+            elif EXPECTED_RULE_REPOSITORIES[rule] not in expected_repositories:
                 errors.append(
                     "%s.rule is incompatible with task owners: expected one of %r, got %r"
                     % (context, expected_repositories, EXPECTED_RULE_REPOSITORIES[rule])

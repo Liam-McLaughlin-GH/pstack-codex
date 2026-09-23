@@ -13,14 +13,14 @@ YAML_OCTAL_DIGITS = r"[0-7]+(?:_[0-7]+)*"
 YAML_BINARY_DIGITS = r"[01]+(?:_[01]+)*"
 YAML_NUMBER_RE = re.compile(
     rf"""[-+]?(?:
-        (?:0|[1-9](?:_[0-9]+)*)(?:\.(?:{YAML_DECIMAL_DIGITS})?)?
+        (?:{YAML_DECIMAL_DIGITS})(?:\.(?:{YAML_DECIMAL_DIGITS})?)?
         (?:[eE][-+]?{YAML_DECIMAL_DIGITS})?
         |\.{YAML_DECIMAL_DIGITS}(?:[eE][-+]?{YAML_DECIMAL_DIGITS})?
     )""",
     re.VERBOSE,
 )
 YAML_BASE_PREFIX_RE = re.compile(
-    rf"[-+]?(?:0[xX]{YAML_HEX_DIGITS}|0[oO]{YAML_OCTAL_DIGITS}|0[bB]{YAML_BINARY_DIGITS})"
+    rf"[-+]?(?:0[xX]{YAML_HEX_DIGITS}|0[bB]{YAML_BINARY_DIGITS})"
 )
 YAML_LEGACY_OCTAL_RE = re.compile(rf"[-+]?0(?:{YAML_OCTAL_DIGITS}|_{YAML_OCTAL_DIGITS})")
 YAML_SEXAGESIMAL_RE = re.compile(
@@ -164,17 +164,36 @@ def required_frontmatter_errors(metadata: str) -> list[str]:
             continue
         raw_value = (match.group("value") or "").strip()
         indicator = _without_inline_comment(raw_value)
-        if re.fullmatch(r"[|>][1-9]?[+-]?", indicator):
+        block_match = re.fullmatch(
+            r"(?P<style>[|>])(?P<indent>[1-9]?)(?P<chomp>[+-]?)", indicator
+        )
+        if block_match:
             block_fields.add(field)
             index += 1
             content: list[str] = []
+            explicit_indent = block_match.group("indent")
+            block_indent = int(explicit_indent) if explicit_indent else None
+            invalid_indent = False
             while index < len(lines):
                 next_line = lines[index]
-                if next_line and not next_line[0].isspace() and re.match(r"^[^:#]+:", next_line):
-                    break
-                content.append(next_line.lstrip() if next_line else "")
+                if not next_line:
+                    content.append("")
+                    index += 1
+                    continue
+                leading = len(next_line) - len(next_line.lstrip())
+                if leading == 0:
+                    if re.match(r"^[A-Za-z_][A-Za-z0-9_-]*:", next_line):
+                        break
+                    invalid_indent = True
+                    index += 1
+                    continue
+                if block_indent is None:
+                    block_indent = leading
+                if leading < block_indent:
+                    invalid_indent = True
+                content.append(next_line[block_indent:])
                 index += 1
-            if not any(part.strip() for part in content):
+            if invalid_indent or not any(part.strip() for part in content):
                 errors.append(f"{field} must be a non-empty scalar string")
             continue
 
