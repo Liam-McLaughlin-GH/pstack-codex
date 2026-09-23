@@ -279,8 +279,15 @@ def _scalar(value: str, field: str) -> str:
     )
     if explicit_string_tag is not None:
         payload = (explicit_string_tag.group("payload") or "").strip()
+        anchor_match = re.fullmatch(r"&[A-Za-z_][A-Za-z0-9_-]*(?:[ \t]+(.*))?", payload)
+        if anchor_match is not None:
+            payload = (anchor_match.group(1) or "").strip()
         if not payload:
             raise ValidationError(f"frontmatter field {field!r} is empty")
+        if payload.startswith(("*", "!", "[", "{")):
+            raise ValidationError(f"frontmatter field {field!r} is not a supported scalar")
+        if payload[0] in {"'", '"'}:
+            return _scalar(payload, field)
         return payload
     if value.startswith(("[", "{", "&", "*", "!", "|", ">", "%", "@", "`", "#")):
         raise ValidationError(f"frontmatter field {field!r} is not a supported scalar")
