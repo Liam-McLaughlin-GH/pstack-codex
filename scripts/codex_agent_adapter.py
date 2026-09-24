@@ -125,6 +125,34 @@ def _non_empty_string(value: object, field: str, path: Path) -> str:
     return value
 
 
+def _resolve_path(path: Path, description: str) -> Path:
+    try:
+        return path.resolve()
+    except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
+        raise AdapterError(f"could not resolve {description}: {path}: {exc}") from exc
+
+
+def _path_is_symlink(path: Path, description: str) -> bool:
+    try:
+        return path.is_symlink()
+    except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
+        raise AdapterError(f"could not inspect {description}: {path}: {exc}") from exc
+
+
+def _path_is_dir(path: Path, description: str) -> bool:
+    try:
+        return path.is_dir()
+    except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
+        raise AdapterError(f"could not inspect {description}: {path}: {exc}") from exc
+
+
+def _path_is_file(path: Path, description: str) -> bool:
+    try:
+        return path.is_file()
+    except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
+        raise AdapterError(f"could not inspect {description}: {path}: {exc}") from exc
+
+
 def parse_role_file(path: Path) -> RoleDefinition:
     """Parse one current-format Codex role file and validate its required fields."""
 
@@ -133,7 +161,7 @@ def parse_role_file(path: Path) -> RoleDefinition:
     try:
         with path.open("rb") as stream:
             raw = tomllib.load(stream)
-    except (OSError, UnicodeError) as exc:
+    except (OSError, UnicodeError, ValueError) as exc:
         raise AdapterError(f"could not read role file: {path}: {exc}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise AdapterError(f"role file is not valid TOML: {path}: {exc}") from exc
@@ -170,7 +198,7 @@ def parse_role_file(path: Path) -> RoleDefinition:
             f"{path}: developer_instructions do not match the shipped {name} contract"
         )
     role = RoleDefinition(
-        path=path.resolve(),
+        path=_resolve_path(path, "role file"),
         name=name,
         description=description,
         developer_instructions=developer_instructions,
@@ -196,7 +224,7 @@ def _load_toml_table(path: Path) -> dict[str, Any]:
     try:
         with path.open("rb") as stream:
             raw = tomllib.load(stream)
-    except (OSError, UnicodeError) as exc:
+    except (OSError, UnicodeError, ValueError) as exc:
         raise AdapterError(f"could not read configuration file: {path}: {exc}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise AdapterError(f"configuration file is not valid TOML: {path}: {exc}") from exc
@@ -210,12 +238,16 @@ def load_explicit_roles(project_root: Path) -> dict[str, RoleDefinition]:
 
     if not isinstance(project_root, Path):
         raise AdapterError("project root must be a pathlib.Path")
-    project_root = project_root.resolve()
+    project_root = _resolve_path(project_root, "project root")
     codex_path = project_root / ".codex"
-    if codex_path.is_symlink() or not codex_path.is_dir():
+    if _path_is_symlink(codex_path, "explicit .codex directory") or not _path_is_dir(
+        codex_path, "explicit .codex directory"
+    ):
         raise AdapterError(f"{codex_path}: explicit .codex directory must be real")
     config_path = codex_path / "config.toml"
-    if config_path.is_symlink() or not config_path.is_file():
+    if _path_is_symlink(config_path, "explicit config") or not _path_is_file(
+        config_path, "explicit config"
+    ):
         raise AdapterError(f"{config_path}: explicit config must be a real file")
     raw = _load_toml_table(config_path)
     unknown_config_keys = set(raw) - {"agents"}
@@ -271,10 +303,10 @@ def load_explicit_roles(project_root: Path) -> dict[str, RoleDefinition]:
         while current != codex_root:
             if current == current.parent:
                 raise AdapterError(f"{config_path}: role path escapes .codex: {config_file}")
-            if current.is_symlink():
+            if _path_is_symlink(current, "role path"):
                 raise AdapterError(f"{config_path}: role path contains a symlink: {config_file}")
             current = current.parent
-        role_path = declared_role_path.resolve()
+        role_path = _resolve_path(declared_role_path, "role file")
         if not role_path.is_relative_to(codex_root):
             raise AdapterError(f"{config_path}: role file escapes .codex: {config_file}")
         role = parse_role_file(role_path)
@@ -555,10 +587,12 @@ def validate_comment_sicko_report(output: str) -> dict[str, str]:
 
 
 def _relative_path(path: Path, root: Path) -> str:
+    resolved_path = _resolve_path(path, "role file")
+    resolved_root = _resolve_path(root, "project root")
     try:
-        return str(path.resolve().relative_to(root.resolve()))
+        return str(resolved_path.relative_to(resolved_root))
     except ValueError:
-        return str(path.resolve())
+        return str(resolved_path)
 
 
 def _read_catalog_file(path: Path) -> str:
@@ -566,7 +600,7 @@ def _read_catalog_file(path: Path) -> str:
         raise AdapterError("catalog file path must be a pathlib.Path")
     try:
         return path.read_text(encoding="utf-8")
-    except (OSError, UnicodeError, TypeError) as exc:
+    except (OSError, UnicodeError, TypeError, ValueError) as exc:
         raise AdapterError(f"could not read model catalog file: {path}: {exc}") from exc
 
 
