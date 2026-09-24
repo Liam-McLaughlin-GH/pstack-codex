@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import tempfile
 import time
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -20,6 +22,16 @@ from typing import Any, Callable, Literal, Mapping, Protocol, Sequence
 
 class UnknownProviderData(ValueError):
     """A provider response was not part of the explicitly supported schema."""
+
+
+def _unsafe_symlink(path: Path) -> Path | None:
+    """Return a selected-path symlink, ignoring the host temp-dir alias."""
+
+    ambient_temp = Path(tempfile.gettempdir()).absolute()
+    for candidate in (path, *path.parents):
+        if candidate.is_symlink() and not ambient_temp.is_relative_to(candidate.absolute()):
+            return candidate
+    return None
 
 
 class QueryFailure(RuntimeError):
@@ -156,12 +168,18 @@ class PRFacts:
         _enum(self.review_decision, REVIEW_DECISIONS, "review decision")
         _enum(self.state, PR_STATES, "pull request state")
         _exact_bool(self.is_draft, "draft state")
+        if self.head_ref_oid is None and self.state == "OPEN":
+            raise UnknownProviderData("open pull requests require a head ref oid")
         if self.head_ref_oid is not None:
             _nonempty(self.head_ref_oid, "head ref oid")
         _nonempty(self.head_ref_name, "head ref name")
         _nonempty(self.base_ref_name, "base ref name")
         if self.merged_at is not None:
             _nonempty(self.merged_at, "merged timestamp")
+            if self.state == "OPEN":
+                raise UnknownProviderData("open pull requests cannot have merged_at")
+        elif self.state == "MERGED":
+            raise UnknownProviderData("merged pull requests require merged_at")
 
 
 @dataclass(frozen=True)
@@ -313,8 +331,12 @@ class PollOptions:
     def __post_init__(self) -> None:
         if self.interval <= 0 or self.sweep_interval <= 0:
             raise ValueError("poll intervals must be positive")
+        if not math.isfinite(self.interval) or not math.isfinite(self.sweep_interval):
+            raise ValueError("poll intervals must be finite")
         if self.timeout < 0:
             raise ValueError("timeout must be zero or positive")
+        if not math.isfinite(self.timeout):
+            raise ValueError("timeout must be finite")
         if self.max_query_errors <= 0:
             raise ValueError("max_query_errors must be positive")
 
@@ -405,7 +427,11 @@ class JsonProviderAdapter:
     @classmethod
     def from_file(cls, path: str | Path) -> "JsonProviderAdapter":
         fixture_path = Path(path).expanduser()
-        if fixture_path.is_symlink() or not fixture_path.is_file():
+        if _unsafe_symlink(fixture_path) is not None:
+            raise UnknownProviderData(
+                f"provider fixture path must not contain symlinks: {fixture_path}"
+            )
+        if not fixture_path.is_file():
             raise UnknownProviderData(
                 f"provider fixture must be an explicit regular file: {fixture_path}"
             )
@@ -435,14 +461,11 @@ class JsonProviderAdapter:
         missing = sorted(required - set(raw))
         if missing:
             raise UnknownProviderData(f"provider pull_request is missing {', '.join(missing)}")
-        review_decision = raw["review_decision"]
-        if review_decision == "":
-            review_decision = None
         return PRFacts(
             context=context,
             mergeable=raw["mergeable"],
             merge_state_status=raw["merge_state_status"],
-            review_decision=review_decision,
+            review_decision=raw["review_decision"],
             head_ref_oid=raw["head_ref_oid"],
             head_ref_name=raw["head_ref_name"],
             base_ref_name=raw["base_ref_name"],
@@ -453,7 +476,9 @@ class JsonProviderAdapter:
 
     def review_threads(self, context: PRContext) -> Sequence[ReviewThread]:
         self.calls.append(f"review_threads:{context.number}")
-        raw = self.payload.get("review_threads", [])
+        if "review_threads" not in self.payload:
+            raise UnknownProviderData("provider payload is missing review_threads")
+        raw = self.payload["review_threads"]
         if not isinstance(raw, list):
             raise UnknownProviderData("provider review_threads must be an array")
         result: list[ReviewThread] = []
@@ -522,7 +547,9 @@ class JsonProviderAdapter:
 
     def commit_rollups(self, context: PRContext) -> Sequence[CommitRollup]:
         self.calls.append(f"commit_rollups:{context.number}")
-        raw = self.payload.get("commit_rollups", [])
+        if "commit_rollups" not in self.payload:
+            raise UnknownProviderData("provider payload is missing commit_rollups")
+        raw = self.payload["commit_rollups"]
         if not isinstance(raw, list):
             raise UnknownProviderData("provider commit_rollups must be an array")
         result: list[CommitRollup] = []
@@ -840,7 +867,10 @@ def _handle_query_failure(
     )
     if options.timeout > 0 and clock.now() - started >= options.timeout:
         return _timeout(emitter, {"kind": "status-unavailable", "failure": failure.as_dict()}), failures
-    clock.sleep(retry)
+    remaining = retry
+    if options.timeout > 0:
+        remaining = min(remaining, max(0.0, options.timeout - (clock.now() - started)))
+    clock.sleep(remaining)
     return None, failures
 
 
@@ -919,7 +949,10 @@ def run_simple(
         reason = {"kind": "pending-checks", "pending": [asdict(check) for check in decision.pending]}
         if options.timeout > 0 and clock.now() - started >= options.timeout:
             return _timeout(emitter, reason)
-        clock.sleep(options.interval)
+        remaining = options.interval
+        if options.timeout > 0:
+            remaining = min(remaining, max(0.0, options.timeout - (clock.now() - started)))
+        clock.sleep(remaining)
 
 
 def run_queued(
@@ -1035,7 +1068,10 @@ def run_queued(
         if wait_key != last_wait_key:
             emitter.progress({"kind": "WAITING", "frontier": _context(frontier), "reason": reason})
             last_wait_key = wait_key
-        clock.sleep(options.interval)
+        remaining = options.interval
+        if options.timeout > 0:
+            remaining = min(remaining, max(0.0, options.timeout - (clock.now() - started)))
+        clock.sleep(remaining)
 
 
 def _json_default(value: Any) -> Any:
@@ -1058,7 +1094,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     context = PRContext(args.owner, args.repo, args.pr)
     reader = JsonProviderAdapter.from_file(args.fixture)
-    options = PollOptions(timeout=args.timeout)
+    if args.mode == "queued-stack" and args.status_only:
+        parser.error("--status-only is not supported with --mode queued-stack")
+    try:
+        options = PollOptions(timeout=args.timeout)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.mode == "queued-stack":
         result = run_queued(reader, [context], options=options)
     else:

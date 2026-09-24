@@ -11,9 +11,11 @@ store.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
+import tempfile
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -204,7 +206,8 @@ def _timestamp(clock: Callable[[], datetime]) -> str:
 
 def _safe_root(path: str | Path) -> Path:
     root = Path(path).expanduser()
-    if root.exists() and root.is_symlink():
+    ambient_temp = Path(tempfile.gettempdir()).absolute()
+    if any(candidate.is_symlink() and not ambient_temp.is_relative_to(candidate.absolute()) for candidate in (root, *root.parents)):
         raise StoreError(f"store root must not be a symlink: {root}")
     if root.exists() and not root.is_dir():
         raise StoreError(f"store root must be a directory: {root}")
@@ -312,6 +315,7 @@ class OrchestratorStore:
         self.stack_reader = stack_reader
         self._closed = False
         self._locked = False
+        self._lock_descriptor: int | None = None
 
     @property
     def units(self) -> "_UnitsApi":
@@ -343,7 +347,14 @@ class OrchestratorStore:
 
     @property
     def initialized(self) -> bool:
-        return (self.root / "units.tsv").is_file() and (self.root / "inbox").is_dir()
+        inbox = self.root / "inbox"
+        return (self.root / "units.tsv").is_file() and inbox.is_dir() and not inbox.is_symlink()
+
+    def _safe_inbox(self) -> Path:
+        inbox = self.root / "inbox"
+        if inbox.is_symlink() or not inbox.is_dir():
+            raise StoreError("inbox is missing or unsafe")
+        return inbox
 
     def _ensure_open(self) -> None:
         if self._closed:
@@ -356,32 +367,56 @@ class OrchestratorStore:
         self.root.mkdir(parents=True, exist_ok=True)
         lock = self.root / LOCK_NAME
         owner = str(self.pid)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
         try:
-            descriptor = os.open(lock, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
+            descriptor = os.open(lock, flags, 0o600)
+        except OSError as exc:
+            raise StoreError(f"could not open store lock: {exc}") from exc
+        try:
             try:
-                holder = lock.read_text(encoding="ascii").strip()
-            except OSError:
-                holder = "unknown"
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                try:
+                    holder = lock.read_text(encoding="ascii").strip()
+                except OSError:
+                    holder = "unknown"
+                raise StoreError(f"store lock held by pid {holder or 'unknown'}") from exc
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            holder = os.read(descriptor, 128).decode("ascii", errors="replace").strip()
             is_stale = bool(re.fullmatch(r"[1-9][0-9]*", holder)) and not self.pid_alive(int(holder))
-            if not is_stale and not self.force:
-                raise StoreError(f"store lock held by pid {holder or 'unknown'}")
-            _atomic_write(lock, f"{owner}\n")
-            descriptor = None
-        if descriptor is not None:
-            with os.fdopen(descriptor, "w", encoding="ascii") as handle:
-                handle.write(f"{owner}\n")
-        self._locked = True
+            if holder and not is_stale and not self.force:
+                raise StoreError(f"store lock held by pid {holder}")
+            os.ftruncate(descriptor, 0)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            os.write(descriptor, f"{owner}\n".encode("ascii"))
+            os.fsync(descriptor)
+            self._lock_descriptor = descriptor
+            self._locked = True
+            return
+        except Exception:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+            finally:
+                os.close(descriptor)
+            raise
 
     def _release(self) -> None:
         lock = self.root / LOCK_NAME
+        descriptor = self._lock_descriptor
         try:
-            if lock.read_text(encoding="ascii").strip() == str(self.pid):
+            if descriptor is not None:
                 lock.unlink()
         except FileNotFoundError:
             pass
         except OSError as exc:
             raise StoreError(f"could not release store lock: {exc}") from exc
+        finally:
+            if descriptor is not None:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+                finally:
+                    os.close(descriptor)
+                self._lock_descriptor = None
         self._locked = False
 
     def _begin_write(self) -> None:
@@ -394,9 +429,13 @@ class OrchestratorStore:
         self._ensure_open()
         self.root.mkdir(parents=True, exist_ok=True)
         self._acquire()
+        inbox = self.root / "inbox"
+        if inbox.is_symlink() or (inbox.exists() and not inbox.is_dir()):
+            self._release()
+            raise StoreError("inbox is missing or unsafe")
         _write_if_missing(self.root / "units.tsv", f"{UNIT_HEADER}\n")
         _write_if_missing(self.root / "ledger.tsv", f"{LEDGER_HEADER}\n")
-        (self.root / "inbox").mkdir(exist_ok=True)
+        inbox.mkdir(exist_ok=True)
         _write_if_missing(self.root / "gates.md", "")
         _write_if_missing(self.root / "preferences.md", "")
         _write_if_missing(self.root / "frontier.json", "{}\n")
@@ -544,14 +583,13 @@ class OrchestratorStore:
             _required_cell(status, "status"),
             _clean_cell(report, "report"),
         )
-        inbox = self.root / "inbox"
-        inbox.mkdir(exist_ok=True)
+        inbox = self._safe_inbox()
         filename = f"{pointer.ts.replace(':', '-').replace('.', '-')}-{self.pid}-{uuid.uuid4().hex}.tsv"
         _atomic_write(inbox / filename, "\t".join(asdict(pointer).values()) + "\n")
         return pointer, filename
 
     def _read_inbox(self, directory: Path | None = None) -> list[InboxPointer]:
-        inbox = self.root / "inbox" if directory is None else directory
+        inbox = self._safe_inbox() if directory is None else directory
         if not inbox.is_dir() or inbox.is_symlink():
             raise StoreError("inbox is missing or unsafe")
         result: list[InboxPointer] = []

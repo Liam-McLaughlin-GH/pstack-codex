@@ -38,6 +38,7 @@ from pstack_g3_helpers.orch import (  # noqa: E402
 )
 from pstack_g3_helpers.plan_checker import (  # noqa: E402
     FileRule,
+    PlanInputError,
     PlanProfile,
     check_plan,
     completion_profile,
@@ -61,10 +62,11 @@ from pstack_g3_helpers.watch import (  # noqa: E402
     run_simple,
 )
 from pstack_g3_helpers.worktree_audit import (  # noqa: E402
+    AuditInputError,
     audit_worktrees,
     load_metadata,
 )
-from log import AuditLogError, append_row  # noqa: E402
+from log import AuditLogError, append_row, sanitize_cell  # noqa: E402
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -105,6 +107,40 @@ class G3WatcherTests(unittest.TestCase):
             with self.assertRaises(UnknownProviderData):
                 JsonProviderAdapter.from_file(link)
 
+    def test_provider_fixture_symlink_parent_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "link").symlink_to(FIXTURES, target_is_directory=True)
+            with self.assertRaises(UnknownProviderData):
+                JsonProviderAdapter.from_file(root / "link" / "provider-ready.json")
+
+    def test_provider_incomplete_or_contradictory_facts_are_refused(self) -> None:
+        payload = json.loads((FIXTURES / "provider-ready.json").read_text())
+        for field in ("review_threads", "commit_rollups"):
+            candidate = dict(payload)
+            candidate.pop(field)
+            with self.subTest(field=field), self.assertRaises(UnknownProviderData):
+                read_snapshot(JsonProviderAdapter(candidate), PRContext("owner", "repo", 24))
+        for field, value in (("review_decision", ""), ("head_ref_oid", None), ("merged_at", "2026-01-01T00:00:00Z")):
+            candidate = json.loads(json.dumps(payload))
+            candidate["pull_request"][field] = value
+            with self.subTest(field=field), self.assertRaises(UnknownProviderData):
+                read_snapshot(JsonProviderAdapter(candidate), PRContext("owner", "repo", 24))
+
+    def test_queued_status_only_is_rejected_in_public_cli(self) -> None:
+        from pstack_g3_helpers import watch
+
+        with self.assertRaises(SystemExit):
+            watch.main(
+                [
+                    "--fixture",
+                    str(FIXTURES / "provider-ready.json"),
+                    "--mode",
+                    "queued-stack",
+                    "--status-only",
+                ]
+            )
+
     def test_recorded_fast_path_falls_back_to_rollup_pages(self) -> None:
         payload = json.loads((FIXTURES / "provider-ready.json").read_text())
         payload["checks"] = {
@@ -130,7 +166,24 @@ class G3WatcherTests(unittest.TestCase):
             clock=clock,
         )
         self.assertEqual(result["kind"], "TIMEOUT")
-        self.assertEqual(clock.sleeps, [2, 2, 2])
+        self.assertEqual(clock.sleeps, [2, 2, 1])
+
+    def test_timeout_rejects_non_finite_values_and_bounds_sleep(self) -> None:
+        with self.assertRaises(ValueError):
+            PollOptions(timeout=float("nan"))
+        with self.assertRaises(ValueError):
+            PollOptions(timeout=float("inf"))
+        context = PRContext("owner", "repo", 24)
+        reader = FakeReader(checks=CheckRead("recorded", (pending_check("ci"),)))
+        clock = DeterministicClock()
+        result = run_simple(
+            reader,
+            [context],
+            options=PollOptions(interval=10, timeout=1),
+            clock=clock,
+        )
+        self.assertEqual(result["kind"], "TIMEOUT")
+        self.assertEqual(clock.sleeps, [1])
 
     def test_queued_complete_reads_state_without_merging(self) -> None:
         contexts = [PRContext("owner", "repo", 23), PRContext("owner", "repo", 24)]
@@ -208,6 +261,27 @@ class G3StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_store_inbox_symlink_is_refused_for_init(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "outside"
+            target.mkdir()
+            (root / "inbox").symlink_to(target, target_is_directory=True)
+            store = OrchestratorStore(root, pid=4100, pid_alive=lambda pid: False)
+            with self.assertRaises(StoreError):
+                store.init()
+            store.close()
+
+    def test_store_root_symlink_parent_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.mkdir()
+            link = root / "link"
+            link.symlink_to(target, target_is_directory=True)
+            with self.assertRaises(StoreError):
+                OrchestratorStore(link / "nested")
+
     def test_malformed_tsv_and_unsupported_side_effect_are_visible(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -255,6 +329,16 @@ class G3PlanAndAuditTests(unittest.TestCase):
             self.assertFalse(report.ok)
             self.assertIn("required file pattern has no matches", report.issues[0].message)
 
+    def test_plan_root_symlink_parent_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.mkdir()
+            link = root / "link"
+            link.symlink_to(target, target_is_directory=True)
+            with self.assertRaises(PlanInputError):
+                check_plan(link / "nested", completion_profile())
+
 
 class G3WorktreeAndLogTests(unittest.TestCase):
     def test_worktree_audit_reports_unknown_activity_without_fetch_or_scan(self) -> None:
@@ -269,6 +353,13 @@ class G3WorktreeAndLogTests(unittest.TestCase):
         self.assertIn("activity", rows["/fixtures/repo-g3"].unknowns)
         self.assertEqual(rows["/fixtures/repo-g3"].bucket, "hold-wip")
         self.assertEqual(rows["/fixtures/repo-old"].bucket, "unknown-activity")
+
+    def test_metadata_symlink_parent_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "link").symlink_to(FIXTURES, target_is_directory=True)
+            with self.assertRaises(AuditInputError):
+                load_metadata(root / "link" / "worktrees.json")
 
     def test_log_appends_utc_rows_and_sanitizes_controls_and_formulas(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -296,6 +387,31 @@ class G3WorktreeAndLogTests(unittest.TestCase):
             (root / "link").symlink_to(target, target_is_directory=True)
             with self.assertRaises(AuditLogError):
                 append_row(root / "link" / "audit.tsv", "phase", "ok", "why", "proof", "PASS")
+
+    def test_log_nested_symlink_parent_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.mkdir()
+            (root / "link").symlink_to(target, target_is_directory=True)
+            with self.assertRaises(AuditLogError):
+                append_row(
+                    root / "link" / "nested" / "audit.tsv",
+                    "phase",
+                    "ok",
+                    "why",
+                    "proof",
+                    "PASS",
+                )
+
+    def test_log_sanitizes_controls_and_rejects_invalid_existing_shape(self) -> None:
+        self.assertEqual(sanitize_cell("a\x00\x1b\u2028b"), "a   b")
+        self.assertEqual(sanitize_cell(" =1"), "' =1")
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "audit.tsv"
+            path.write_text("not the expected header\n", encoding="utf-8")
+            with self.assertRaises(AuditLogError):
+                append_row(path, "phase", "ok", "why", "proof", "PASS")
 
 
 if __name__ == "__main__":

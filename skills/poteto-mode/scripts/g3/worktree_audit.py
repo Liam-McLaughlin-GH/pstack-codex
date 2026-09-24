@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,6 +19,14 @@ from typing import Any, Mapping, Sequence
 
 class AuditInputError(ValueError):
     """Explicit metadata is malformed or outside the supported schema."""
+
+
+def _unsafe_symlink(path: Path) -> Path | None:
+    ambient_temp = Path(tempfile.gettempdir()).absolute()
+    for candidate in (path, *path.parents):
+        if candidate.is_symlink() and not ambient_temp.is_relative_to(candidate.absolute()):
+            return candidate
+    return None
 
 
 def _text(value: Any, label: str, *, empty: bool = False) -> str:
@@ -246,7 +255,9 @@ def audit_worktrees(
 
 def load_metadata(path: str | Path) -> tuple[WorktreeMetadata, ...]:
     metadata_path = Path(path).expanduser()
-    if metadata_path.is_symlink() or not metadata_path.is_file():
+    if _unsafe_symlink(metadata_path) is not None:
+        raise AuditInputError(f"metadata path must not contain symlinks: {metadata_path}")
+    if not metadata_path.is_file():
         raise AuditInputError(f"metadata must be an explicit regular file: {metadata_path}")
     try:
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))

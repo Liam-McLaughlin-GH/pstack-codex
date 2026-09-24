@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import tempfile
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Sequence
@@ -16,13 +18,38 @@ class AuditLogError(ValueError):
     """The log path or row cannot satisfy the local audit contract."""
 
 
+def _unsafe_symlink(path: Path) -> Path | None:
+    ambient_temp = Path(tempfile.gettempdir()).absolute()
+    for candidate in (path, *path.parents):
+        if candidate.is_symlink() and not ambient_temp.is_relative_to(candidate.absolute()):
+            return candidate
+    return None
+
+
 def sanitize_cell(value: str) -> str:
     """Keep a cell on one row and neutralize spreadsheet formula prefixes."""
 
     if not isinstance(value, str):
         raise AuditLogError("audit log fields must be strings")
-    cleaned = value.replace("\t", " ").replace("\n", " ").replace("\r", " ")
-    return f"'{cleaned}" if cleaned.startswith(("=", "+", "-", "@")) else cleaned
+    cleaned = "".join(
+        " " if unicodedata.category(character).startswith("C") or character in {"\u2028", "\u2029"} else character
+        for character in value
+    )
+    if cleaned.lstrip().startswith(("=", "+", "-", "@")):
+        return f"'{cleaned}"
+    return cleaned
+
+
+def _validate_existing(path: Path) -> None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise AuditLogError(f"could not read existing audit log: {path}: {exc}") from exc
+    if not lines or lines[0].split("\t") != list(HEADER):
+        raise AuditLogError(f"audit log has an invalid header: {path}")
+    for row in lines[1:]:
+        if row and len(row.split("\t")) != len(HEADER):
+            raise AuditLogError(f"audit log has a malformed row: {path}")
 
 
 def _timestamp(clock: Callable[[], datetime] | None) -> str:
@@ -55,13 +82,13 @@ def append_row(
     """Append one row and return its rendered TSV line."""
 
     path = Path(logfile)
-    if path.is_symlink():
-        raise AuditLogError(f"audit log must not be a symlink: {path}")
-    if path.parent.is_symlink():
-        raise AuditLogError(f"audit log parent must not be a symlink: {path.parent}")
+    if _unsafe_symlink(path) is not None:
+        raise AuditLogError(f"audit log path must not contain symlinks: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and not path.is_file():
         raise AuditLogError(f"audit log must be a regular file: {path}")
+    if path.exists():
+        _validate_existing(path)
     if not path.exists():
         try:
             descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -70,6 +97,8 @@ def append_row(
         if descriptor != -1:
             with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
                 handle.write("\t".join(HEADER) + "\n")
+        else:
+            _validate_existing(path)
     fields = (
         _timestamp(clock),
         sanitize_cell(phase),

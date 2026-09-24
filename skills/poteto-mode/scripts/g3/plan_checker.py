@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -143,7 +144,10 @@ def load_profile(path: str | Path) -> PlanProfile:
 
 def _safe_root(path: str | Path) -> Path:
     root = Path(path).expanduser()
-    if root.is_symlink() or not root.is_dir():
+    ambient_temp = Path(tempfile.gettempdir()).absolute()
+    if any(candidate.is_symlink() and not ambient_temp.is_relative_to(candidate.absolute()) for candidate in (root, *root.parents)):
+        raise PlanInputError(f"plan root path must not contain symlinks: {root}")
+    if not root.is_dir():
         raise PlanInputError(f"plan root must be a real directory: {root}")
     return root.resolve()
 
