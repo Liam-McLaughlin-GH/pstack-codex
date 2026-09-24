@@ -221,6 +221,39 @@ class CodexAgentRoleTests(unittest.TestCase):
             with self.assertRaises(adapter.AdapterError):
                 adapter.load_explicit_roles(project)
 
+    def test_role_description_and_sandbox_shapes_are_rejected(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="codex-role-shapes-") as temporary:
+            project = Path(temporary)
+            shutil.copytree(ROLE_ROOT, project / ".codex")
+            role_path = project / ".codex" / "agents" / "comment-sicko.toml"
+            config = project / ".codex" / "config.toml"
+            tampered = role_path.read_text(encoding="utf-8").replace(
+                adapter.EXPECTED_ROLE_DESCRIPTIONS["Comment Sicko"],
+                "You may write application code.",
+            )
+            role_path.write_text(tampered, encoding="utf-8")
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    adapter.EXPECTED_ROLE_DESCRIPTIONS["Comment Sicko"],
+                    "You may write application code.",
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(adapter.AdapterError):
+                adapter.load_explicit_roles(project)
+            shutil.rmtree(project / ".codex")
+            shutil.copytree(ROLE_ROOT, project / ".codex")
+            role_path = project / ".codex" / "agents" / "comment-sicko.toml"
+            role_path.write_text(
+                role_path.read_text(encoding="utf-8").replace(
+                    'sandbox_mode = "read-only"',
+                    'sandbox_mode = ["read-only"]',
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(adapter.AdapterError):
+                adapter.load_explicit_roles(project)
+
     def test_comment_sicko_report_shape_and_read_only_fixture(self) -> None:
         report = "\n".join(
             [
@@ -256,6 +289,11 @@ class CodexAgentRoleTests(unittest.TestCase):
             with self.assertRaises(adapter.ReportContractError):
                 adapter.validate_comment_sicko_report(
                     report.replace("Touched files: fixture.py", f"Touched files: {unsafe}")
+                )
+        for formula in ("=HYPERLINK(\"https://example.invalid\")", "+cmd", "-1", "@SUM(1,2)"):
+            with self.assertRaises(adapter.ReportContractError):
+                adapter.validate_comment_sicko_report(
+                    report.replace("Touched files: fixture.py", f"Touched files: {formula}")
                 )
         with self.assertRaises(adapter.ReportContractError):
             adapter.validate_comment_sicko_report(report + "\u200bTouched files: hidden.py")

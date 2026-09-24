@@ -35,6 +35,10 @@ DIRECT_SKILL_FALLBACKS = {
     "Comment Sicko": "no-comments",
 }
 EXPECTED_ROLE_NAMES = {"poteto-agent", "Comment Sicko"}
+EXPECTED_ROLE_DESCRIPTIONS = {
+    "poteto-agent": "Routing target for /poteto-mode and requests for poteto's style.",
+    "Comment Sicko": "A deranged comment-hater that savors deletion and condemns workaround code.",
+}
 
 
 class AdapterError(ValueError):
@@ -129,10 +133,14 @@ def parse_role_file(path: Path) -> RoleDefinition:
         if character in {"\r", "\n"}
         or (character.isprintable() and unicodedata.category(character) not in {"Cf", "Mn"})
     )
-    if canonical_instructions != role.developer_instructions:
+    if canonical_instructions != role.developer_instructions or any(
+        ord(character) > 127 for character in role.developer_instructions
+    ):
         raise AdapterError(f"{path}: developer_instructions contain hidden or non-canonical text")
     sandbox_mode = role.settings.get("sandbox_mode")
-    if sandbox_mode is not None and sandbox_mode not in VALID_SANDBOX_MODES:
+    if sandbox_mode is not None and (
+        not isinstance(sandbox_mode, str) or sandbox_mode not in VALID_SANDBOX_MODES
+    ):
         raise AdapterError(
             f"{path}: sandbox_mode must be one of {', '.join(sorted(VALID_SANDBOX_MODES))}"
         )
@@ -195,6 +203,9 @@ def parse_role_file(path: Path) -> RoleDefinition:
                 f"{path}: Comment Sicko contains write-capable instructions: "
                 + unsafe_match.group(0)
             )
+    expected_description = EXPECTED_ROLE_DESCRIPTIONS.get(role.name)
+    if expected_description is not None and role.description != expected_description:
+        raise AdapterError(f"{path}: {role.name} description does not match the shipped role contract")
     return role
 
 
@@ -468,6 +479,10 @@ def validate_comment_sicko_report(output: str) -> dict[str, str]:
                     sections[field] = f"{sections[field]}\n{value}"
                 else:
                     sections[field] = value
+                if value.startswith(("=", "+", "-", "@")):
+                    raise ReportContractError(
+                        f"Comment Sicko report leaves {field!r} vulnerable to formula interpretation"
+                    )
                 if not value or not any(
                     character.isprintable()
                     and not character.isspace()
