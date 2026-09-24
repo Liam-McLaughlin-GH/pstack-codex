@@ -77,6 +77,12 @@ def contract_data() -> dict[str, list[str]]:
     )
 
 
+def side_effect_contract_data() -> dict[str, list[str]]:
+    return json.loads(
+        (FIXTURES / "side_effect_contracts.json").read_text(encoding="utf-8")
+    )
+
+
 class FakeSideEffectGate:
     """Fixture-only adapter that makes authorization observable."""
 
@@ -168,6 +174,22 @@ class G1ParityTests(unittest.TestCase):
 
         self.assertTrue(gate.request("merge", authorized=True))
         self.assertEqual(gate.calls, ["merge"])
+
+    def test_side_effect_fixture_binds_named_playbooks_to_the_gate(self) -> None:
+        contracts = side_effect_contract_data()
+        self.assertEqual(set(contracts), {"forge", "watcher", "deployment", "merge", "deletion"})
+        for operation, filenames in contracts.items():
+            self.assertTrue(filenames, operation)
+            for filename in filenames:
+                text = (PLAYBOOK_DIR / filename).read_text(encoding="utf-8").casefold()
+                self.assertIn("unsupported-seam:", text, filename)
+                self.assertTrue(
+                    "fixture" in text or "fake adapter" in text,
+                    f"{filename} lacks fixture boundary for {operation}",
+                )
+            gate = FakeSideEffectGate()
+            self.assertFalse(gate.request(operation, authorized=False))
+            self.assertEqual(gate.calls, [])
 
     def test_contract_fixture_checks_the_actual_playbooks(self) -> None:
         contracts = contract_data()

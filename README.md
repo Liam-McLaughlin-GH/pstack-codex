@@ -68,7 +68,7 @@ The source and MIT attribution remain in the source and license section above.
 
 The remaining upstream runtime pieces are not ported as live services.
 
-- Automatic project-local role discovery is not claimed; use the explicit `.codex/config.toml` registration.
+- Automatic project-local role discovery is not claimed; use the explicit agent registration described in `skills/setup-pstack/SKILL.md` and the generated `.codex/agents` files when that setup is applied.
 - The live provider and host wrappers from the pstack scripts remain unsupported; the offline helper subset is tracked as a separate parity item and does not add a live provider dependency to these playbooks.
 - `automations/benny/` is not copied. It is a Cursor automation pack with Cursor UI adapters.
 - Cursor model names and model-specific routing are not preserved.

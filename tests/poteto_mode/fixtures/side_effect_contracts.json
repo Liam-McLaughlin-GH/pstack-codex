@@ -1,0 +1,7 @@
+{
+  "forge": ["opening-a-pr.md", "shipping.md", "feature.md"],
+  "watcher": ["autonomous-run.md", "babysit.md", "investigation.md"],
+  "deployment": ["shipping.md", "autopilot-stack.md"],
+  "merge": ["shipping.md", "autopilot-full.md", "autopilot-stack.md"],
+  "deletion": ["worktree-cleanup.md"]
+}
