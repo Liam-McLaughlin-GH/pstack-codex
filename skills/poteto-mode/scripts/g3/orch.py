@@ -184,7 +184,13 @@ def _required_cell(value: Any, label: str) -> str:
 def _required_line(value: Any, label: str) -> str:
     if not isinstance(value, str):
         raise StoreError(f"{label} must be a string")
-    cleaned = value.replace("\n", " ").replace("\r", " ").strip()
+    if any(
+        unicodedata.category(character).startswith("C")
+        or character in {"\u2028", "\u2029"}
+        for character in value
+    ):
+        raise StoreError(f"{label} contains an unsafe control")
+    cleaned = value.strip()
     if any(
         unicodedata.category(character).startswith("C")
         or character in {"\u2028", "\u2029"}

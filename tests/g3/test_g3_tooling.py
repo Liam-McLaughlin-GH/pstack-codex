@@ -605,6 +605,10 @@ class G3StoreTests(unittest.TestCase):
                     store.gate_park("gate", "bad\x00question", "options", "default")
                 with self.assertRaises(StoreError):
                     store.standing_add("bad\x00standing")
+                with self.assertRaises(StoreError):
+                    store.gate_park("gate-newline", "bad\nquestion", "options", "default")
+                with self.assertRaises(StoreError):
+                    store.standing_add("bad\tstanding")
             finally:
                 store.close()
 
