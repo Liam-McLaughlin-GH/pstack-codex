@@ -427,7 +427,7 @@ def read_model_catalog(codex_binary: str = "codex", cwd: Path | None = None) -> 
 def _normalize_optional_model(value: object, field: str) -> str | None:
     if value is None:
         return None
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise AdapterError(f"{field} must be a string or None")
     normalized = value.strip()
     return normalized or None
@@ -443,7 +443,7 @@ def _normalize_available_models(available_models: Iterable[str]) -> tuple[str, .
     normalized: list[str] = []
     try:
         for model in iterator:
-            if not isinstance(model, str):
+            if type(model) is not str:
                 raise AdapterError("available_models must contain only strings")
             model = model.strip()
             if model:
