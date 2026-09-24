@@ -71,6 +71,12 @@ def fixture_data() -> dict[str, object]:
     )
 
 
+def contract_data() -> dict[str, list[str]]:
+    return json.loads(
+        (FIXTURES / "playbook_contracts.json").read_text(encoding="utf-8")
+    )
+
+
 class FakeSideEffectGate:
     """Fixture-only adapter that makes authorization observable."""
 
@@ -164,8 +170,9 @@ class G1ParityTests(unittest.TestCase):
         self.assertEqual(gate.calls, ["merge"])
 
     def test_contract_fixture_checks_the_actual_playbooks(self) -> None:
-        contracts = fixture_data()["playbook_contracts"]
-        self.assertGreaterEqual(len(contracts), 11)
+        contracts = contract_data()
+        self.assertEqual(set(contracts), PLAYBOOK_NAMES)
+        self.assertEqual(len(contracts), 23)
         for filename, markers in contracts.items():
             text = (PLAYBOOK_DIR / filename).read_text(encoding="utf-8")
             for marker in markers:

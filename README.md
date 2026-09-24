@@ -42,6 +42,18 @@ The following skills are present as Codex-native rewrites.
 | `make-bot-ui` | Builds and verifies a UI relay with explicit local and remote boundaries. |
 | `repo-best-practices` | Routes Showpass repository work using source-backed ownership, safe command boundaries, and explicit drift limits. |
 
+The following seven issue-focused skills are also active Codex-native ports:
+
+| Skill | Codex port |
+| --- | --- |
+| `automate-me` | Runs bounded local automation with explicit fixture and side-effect boundaries. |
+| `create-verification-skill` | Builds verification skills from a local feature map and saved evidence. |
+| `figure-it-out` | Routes structured investigation and records lifecycle state locally. |
+| `maintain-verification-skill` | Maintains verification artifacts without assuming Cursor layout. |
+| `python-best-practices` | Checks Python structure and review boundaries with local tooling. |
+| `recall` | Reconstructs supplied local history without scanning private transcripts. |
+| `setup-pstack` | Prepares Codex-local activation through temporary and explicit configuration. |
+
 The port preserves the names of these workflows where possible. In Codex, invoke them as skills such as `$poteto-mode`, `$how`, `$architect`, or `$tdd`.
 
 The 23 poteto-mode playbooks are active under
@@ -54,20 +66,10 @@ The source and MIT attribution remain in the source and license section above.
 
 ## What is missing
 
-The following 7 upstream skills are not active in the port.
+The remaining upstream runtime pieces are not ported as live services.
 
-- `automate-me`. It depends on Cursor's built-in skill-authoring flow and transcript paths.
-- `create-verification-skill`. Its feature-map workflow assumes Cursor control skills and `.cursor/skills`.
-- `figure-it-out`. Its playbook routing and subagent instructions need a Codex-specific rewrite.
-- `maintain-verification-skill`. It assumes the same Cursor verification-skill layout.
-- `recall`. It reads Cursor agent transcripts.
-- `setup-pstack`. It writes Cursor model configuration to `~/.cursor/rules/pstack-models.mdc`.
-
-The upstream agent and runtime pieces are also not ported.
-
-- `agents/poteto-agent.md` is not converted to a Codex agent configuration.
-- `agents/comment-sicko.md` is not converted to a Codex agent configuration.
-- The 20 pstack scripts are not copied. This includes the PR watcher, worktree audit, plan checker, and orchestration helper.
+- Automatic project-local role discovery is not claimed; use the explicit `.codex/config.toml` registration.
+- The live provider and host wrappers from the pstack scripts remain unsupported; the useful offline subset and file-by-file dispositions are in `skills/poteto-mode/scripts/g3/DISPOSITION.md`.
 - `automations/benny/` is not copied. It is a Cursor automation pack with Cursor UI adapters.
 - Cursor model names and model-specific routing are not preserved.
 - Cursor transcript paths under `~/.cursor/projects/.../agent-transcripts` are not preserved.

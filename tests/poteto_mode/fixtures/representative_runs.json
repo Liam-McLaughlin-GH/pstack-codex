@@ -39,18 +39,5 @@
     ],
     "expected_proposals": ["clean-merged"],
     "expected_deletions": 0
-  },
-  "playbook_contracts": {
-    "feature.md": ["Sequence", "$interrogate", "Opening a PR"],
-    "bug-fix.md": ["failing", "passing", "Opening a PR"],
-    "investigation.md": ["BLOCKED", "INCONCLUSIVE", "NOT RUN", "evidence report"],
-    "runtime-forensics.md": ["BLOCKED", "INCONCLUSIVE", "NOT RUN", "diagnostic report"],
-    "trace-forensics.md": ["BLOCKED", "INCONCLUSIVE", "NOT RUN", "trace report"],
-    "opening-a-pr.md": ["$technical-writing", "$unslop", "$no-comments", "NOT RUN"],
-    "multi-phase-plan.md": ["playbook_contracts.json", "owner", "acceptance evidence", "final gate"],
-    "autonomous-run.md": ["predicate", "BLOCKED", "fixture adapter"],
-    "shipping.md": ["authorized", "NOT RUN", "next unverified item"],
-    "visual-parity.md": ["Capture", "Opening a PR"],
-    "session-pickup.md": ["verification performed", "BLOCKED"]
   }
 }
