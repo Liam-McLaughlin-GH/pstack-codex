@@ -46,30 +46,42 @@
     "expected_status": "BLOCKED",
     "expected_changes": 0
   },
+  "pr_handoff_contract": {
+    "target": "pr:24",
+    "head_sha": "abc123",
+    "checks": "pass"
+  },
   "pr_handoff_without_authorization": {
     "change_retained": true,
     "authorized": false,
-    "evidence": {"diff": "diff", "head_sha": "abc123", "checks": "pass", "body": "body"},
+    "evidence": {"target": "pr:24", "diff": "diff", "head_sha": "abc123", "checks": "pass", "body": "body"},
     "expected_status": "NOT RUN",
     "expected_local_handoff_ready": true
   },
   "pr_handoff_with_authorization": {
     "change_retained": true,
     "authorized": true,
-    "evidence": {"diff": "diff", "head_sha": "abc123", "checks": "pass", "body": "body"},
+    "evidence": {"target": "pr:24", "diff": "diff", "head_sha": "abc123", "checks": "pass", "body": "body"},
     "expected_status": "PASS",
     "expected_local_handoff_ready": true
   },
+  "pr_handoff_invalid_cases": [
+    {"name": "failing-checks", "evidence": {"target": "pr:24", "diff": "diff", "head_sha": "abc123", "checks": "FAIL", "body": "body"}, "expected_status": "BLOCKED"},
+    {"name": "wrong-head", "evidence": {"target": "pr:24", "diff": "diff", "head_sha": "not-the-head", "checks": "pass", "body": "body"}, "expected_status": "BLOCKED"},
+    {"name": "wrong-target", "evidence": {"target": "pr:25", "diff": "diff", "head_sha": "abc123", "checks": "pass", "body": "body"}, "expected_status": "BLOCKED"},
+    {"name": "missing-head", "evidence": {"target": "pr:24", "diff": "diff", "checks": "pass", "body": "body"}, "expected_status": "BLOCKED"},
+    {"name": "missing-checks", "evidence": {"target": "pr:24", "diff": "diff", "head_sha": "abc123", "body": "body"}, "expected_status": "BLOCKED"}
+  ],
   "diagnostic_states": [
-    {"workflow": "investigation", "capability": false, "artifact_required": true, "artifact": false, "matches": false, "authorized": true, "capture_ready": true, "expected": "BLOCKED"},
-    {"workflow": "investigation", "capability": true, "artifact_required": true, "artifact": false, "matches": false, "authorized": true, "capture_ready": true, "expected": "BLOCKED"},
-    {"workflow": "runtime-forensics", "capability": true, "artifact_required": true, "artifact": true, "matches": false, "authorized": true, "capture_ready": true, "expected": "INCONCLUSIVE"},
-    {"workflow": "runtime-forensics", "capability": true, "artifact_required": true, "artifact": false, "matches": false, "authorized": true, "capture_ready": true, "expected": "BLOCKED"},
-    {"workflow": "trace-forensics", "capability": true, "artifact_required": true, "artifact": true, "matches": true, "authorized": false, "capture_ready": true, "expected": "NOT RUN"},
-    {"workflow": "trace-forensics", "capability": true, "artifact_required": true, "artifact": false, "matches": false, "authorized": true, "capture_ready": true, "expected": "BLOCKED"},
-    {"workflow": "perf-issue", "capability": true, "artifact_required": true, "artifact": true, "matches": true, "authorized": true, "capture_ready": true, "expected": "PASS"},
-    {"workflow": "perf-issue", "capability": true, "artifact_required": true, "artifact": false, "matches": false, "authorized": true, "capture_ready": true, "expected": "BLOCKED"},
-    {"workflow": "perf-issue", "capability": true, "artifact_required": true, "artifact": true, "matches": true, "authorized": true, "capture_ready": false, "expected": "NOT RUN"}
+    {"workflow": "investigation", "capability": false, "artifact": false, "matches": false, "authorized": true, "capture_ready": true, "expected": "BLOCKED"},
+    {"workflow": "investigation", "capability": true, "artifact": false, "matches": false, "authorized": true, "capture_ready": true, "expected": "BLOCKED"},
+    {"workflow": "runtime-forensics", "capability": true, "artifact": true, "matches": false, "authorized": true, "capture_ready": true, "expected": "INCONCLUSIVE"},
+    {"workflow": "runtime-forensics", "capability": true, "artifact": false, "matches": false, "authorized": true, "capture_ready": true, "expected": "BLOCKED"},
+    {"workflow": "trace-forensics", "capability": true, "artifact": true, "matches": true, "authorized": false, "capture_ready": true, "expected": "NOT RUN"},
+    {"workflow": "trace-forensics", "capability": true, "artifact": false, "matches": false, "authorized": true, "capture_ready": true, "expected": "BLOCKED"},
+    {"workflow": "perf-issue", "capability": true, "artifact": true, "matches": true, "authorized": true, "capture_ready": true, "expected": "PASS"},
+    {"workflow": "perf-issue", "capability": true, "artifact": false, "matches": false, "authorized": true, "capture_ready": true, "expected": "BLOCKED"},
+    {"workflow": "perf-issue", "capability": true, "artifact": true, "matches": true, "authorized": true, "capture_ready": false, "expected": "NOT RUN"}
   ],
   "cleanup_dry_run": {
     "candidates": [

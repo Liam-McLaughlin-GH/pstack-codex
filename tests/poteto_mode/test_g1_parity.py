@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import posixpath
 import sys
 import tempfile
 import unittest
@@ -62,12 +63,21 @@ def side_effect_contract_data() -> dict[str, dict[str, object]]:
     )
 
 
+def diagnostic_contract_data() -> dict[str, dict[str, object]]:
+    return json.loads(
+        (FIXTURES / "diagnostic_contracts.json").read_text(encoding="utf-8")
+    )
+
+
 class FakeSideEffectGate:
     """Fixture-only adapter that makes authorization observable."""
 
     OPERATIONS = {
         "pr-create", "pr-edit", "pr-ready", "push", "comment", "merge",
         "auto-merge", "deployment", "message", "watcher", "agent-spawn",
+        "worktree-removal", "simulator", "cache", "runtime", "repository",
+    }
+    DELETION_OPERATIONS = {
         "worktree-removal", "simulator", "cache", "runtime", "repository",
     }
 
@@ -85,22 +95,33 @@ class FakeSideEffectGate:
     ) -> bool:
         if operation not in self.OPERATIONS:
             raise ValueError(f"unsupported fixture operation: {operation}")
-        if not authorized:
+        if authorized is not True:
             return False
-        if not target or not evidence:
+        if not isinstance(target, str) or not target:
+            raise ValueError(f"{operation} requires an exact target and evidence")
+        if not isinstance(evidence, str) or not evidence:
             raise ValueError(f"{operation} requires an exact target and evidence")
         contract = self.contracts[operation]
-        target_prefix = str(contract["target_prefix"])
-        evidence_prefix = str(contract["evidence_prefix"])
-        if not target.startswith(target_prefix):
-            raise ValueError(f"{operation} target must start with {target_prefix!r}")
-        if not evidence.startswith(evidence_prefix):
-            raise ValueError(
-                f"{operation} evidence must start with {evidence_prefix!r}"
-            )
-        for field in contract["evidence_fields"]:
-            if f"{field}=" not in evidence:
-                raise ValueError(f"{operation} evidence lacks {field!r}")
+        valid_target = str(contract["valid_target"])
+        valid_evidence = str(contract["valid_evidence"])
+        if operation in self.DELETION_OPERATIONS:
+            target_prefix = str(contract["target_prefix"])
+            if not target.startswith(target_prefix):
+                raise ValueError(f"{operation} target has the wrong kind")
+            target_path = target[len(target_prefix):]
+            if ".." in target_path.split("/"):
+                raise ValueError(f"{operation} target may not traverse directories")
+            normalized_target = posixpath.normpath(target_path)
+            inventory_paths = {
+                posixpath.normpath(str(path))
+                for path in contract["inventory_paths"]
+            }
+            if normalized_target not in inventory_paths:
+                raise ValueError(f"{operation} target is outside the fixture inventory")
+        if target != valid_target:
+            raise ValueError(f"{operation} target is not the exact fixture target")
+        if evidence != valid_evidence:
+            raise ValueError(f"{operation} evidence is not the exact fixture receipt")
         self.calls.append(operation)
         return True
 
@@ -146,15 +167,23 @@ def perf_status(surface_available: bool) -> tuple[str, int]:
     return ("RUN", 1) if surface_available else ("BLOCKED", 0)
 
 
+DIAGNOSTIC_CONTRACTS = diagnostic_contract_data()
+
+
 def diagnostic_state(
+    workflow: str,
     capability_available: bool,
     artifact_supplied: bool,
     artifact_matches: bool,
     authorized: bool,
+    gate: FakeSideEffectGate,
     *,
-    artifact_required: bool = True,
     capture_ready: bool = True,
 ) -> tuple[str, int]:
+    contract = DIAGNOSTIC_CONTRACTS.get(workflow)
+    if contract is None:
+        raise ValueError(f"unsupported diagnostic workflow: {workflow}")
+    artifact_required = contract["artifact_required"]
     if not authorized or not capture_ready:
         return "NOT RUN", 0
     if not capability_available:
@@ -169,14 +198,27 @@ def diagnostic_state(
 def pr_handoff(
     change_retained: bool,
     authorized: bool,
-    evidence: dict[str, str],
+    evidence: dict[str, object],
+    *,
+    expected_target: str,
+    expected_head_sha: str,
+    expected_checks: str,
 ) -> dict[str, object]:
-    if not change_retained:
+    if change_retained is not True:
         return {"status": "NOT RUN", "local_handoff_ready": False}
-    if any(not evidence.get(field) for field in ("diff", "head_sha", "checks", "body")):
+    local_handoff_ready = all(
+        isinstance(evidence.get(field), str) and bool(evidence.get(field))
+        for field in ("diff", "head_sha", "checks", "body", "target")
+    )
+    local_handoff_ready = local_handoff_ready and (
+        evidence["target"] == expected_target
+        and evidence["head_sha"] == expected_head_sha
+        and evidence["checks"] == expected_checks
+    )
+    if not local_handoff_ready:
         return {"status": "BLOCKED", "local_handoff_ready": False}
     return {
-        "status": "PASS" if authorized else "NOT RUN",
+        "status": "PASS" if authorized is True else "NOT RUN",
         "local_handoff_ready": True,
     }
 
@@ -270,6 +312,58 @@ class G1ParityTests(unittest.TestCase):
                     )
                 self.assertEqual(gate.calls, [], operation)
 
+    def test_side_effect_gate_rejects_same_prefix_and_empty_values(self) -> None:
+        for operation, contract in side_effect_contract_data().items():
+            target_prefix = str(contract["target_prefix"])
+            evidence_prefix = str(contract["evidence_prefix"])
+            fields = [str(field) for field in contract["evidence_fields"]]
+            attacker_evidence = evidence_prefix + ";".join(
+                f"{field}=ATTACKER-VALUE" for field in fields
+            )
+            empty_evidence = evidence_prefix + ";".join(
+                f"{field}=" for field in fields
+            )
+            for target, evidence in (
+                (target_prefix + "ATTACKER-TARGET", str(contract["valid_evidence"])),
+                (str(contract["valid_target"]), attacker_evidence),
+                (str(contract["valid_target"]), empty_evidence),
+            ):
+                gate = FakeSideEffectGate()
+                with self.assertRaises(ValueError, msg=operation):
+                    gate.request(
+                        operation,
+                        authorized=True,
+                        target=target,
+                        evidence=evidence,
+                    )
+                self.assertEqual(gate.calls, [], operation)
+
+    def test_deletion_gate_rejects_traversal_and_uninventoried_paths(self) -> None:
+        deletion_operations = {
+            "worktree-removal",
+            "simulator",
+            "cache",
+            "runtime",
+            "repository",
+        }
+        for operation in deletion_operations:
+            contract = side_effect_contract_data()[operation]
+            target_prefix = str(contract["target_prefix"])
+            evidence = str(contract["valid_evidence"])
+            for target in (
+                target_prefix + "/tmp/fixture/../../etc/passwd",
+                target_prefix + "/tmp/not-in-inventory",
+            ):
+                gate = FakeSideEffectGate()
+                with self.assertRaises(ValueError, msg=operation):
+                    gate.request(
+                        operation,
+                        authorized=True,
+                        target=target,
+                        evidence=evidence,
+                    )
+                self.assertEqual(gate.calls, [], operation)
+
     def test_side_effect_fixture_binds_named_playbooks_to_the_gate(self) -> None:
         contracts = side_effect_contract_data()
         expected_operations = {
@@ -306,6 +400,61 @@ class G1ParityTests(unittest.TestCase):
             for marker in markers:
                 self.assertIn(marker, text, f"{filename} is missing {marker!r}")
             self.assertIn("UNSUPPORTED-SEAM:", text, filename)
+
+    def test_diagnostic_contract_requires_artifacts_for_every_workflow(self) -> None:
+        contracts = diagnostic_contract_data()
+        self.assertEqual(
+            set(contracts),
+            {"investigation", "runtime-forensics", "trace-forensics", "perf-issue"},
+        )
+        for workflow, contract in contracts.items():
+            self.assertIs(contract["artifact_required"], True, workflow)
+            self.assertEqual(contract["playbook"], f"{workflow}.md", workflow)
+            gate = FakeSideEffectGate()
+            self.assertEqual(
+                diagnostic_state(workflow, True, False, False, True, gate),
+                ("BLOCKED", 0),
+                workflow,
+            )
+            self.assertEqual(gate.calls, [], workflow)
+
+    def test_pr_handoff_rejects_failing_or_wrong_identity_evidence(self) -> None:
+        valid = {
+            "target": "pr:24",
+            "diff": "diff",
+            "head_sha": "abc123",
+            "checks": "pass",
+            "body": "body",
+        }
+        for evidence in (
+            {**valid, "checks": "FAIL"},
+            {**valid, "head_sha": "not-the-head"},
+            {**valid, "target": "pr:25"},
+            {**valid, "head_sha": ""},
+            {**valid, "checks": ""},
+        ):
+            self.assertEqual(
+                pr_handoff(
+                    True,
+                    True,
+                    evidence,
+                    expected_target="pr:24",
+                    expected_head_sha="abc123",
+                    expected_checks="pass",
+                ),
+                {"status": "BLOCKED", "local_handoff_ready": False},
+            )
+        self.assertEqual(
+            pr_handoff(
+                True,
+                "authorized",
+                valid,
+                expected_target="pr:24",
+                expected_head_sha="abc123",
+                expected_checks="pass",
+            ),
+            {"status": "NOT RUN", "local_handoff_ready": True},
+        )
 
     def test_representative_state_and_stop_paths(self) -> None:
         cases = fixture_data()
@@ -357,32 +506,64 @@ class G1ParityTests(unittest.TestCase):
             (perf["expected_status"], perf["expected_changes"]),
         )
         for case in cases["diagnostic_states"]:
+            gate = FakeSideEffectGate()
             self.assertEqual(
                 diagnostic_state(
+                    case["workflow"],
                     case["capability"],
                     case["artifact"],
                     case["matches"],
                     case["authorized"],
-                    artifact_required=case["artifact_required"],
+                    gate,
                     capture_ready=case["capture_ready"],
                 ),
                 (case["expected"], 0),
                 case["workflow"],
             )
+            self.assertEqual(gate.calls, [], case["workflow"])
+        handoff_contract = cases["pr_handoff_contract"]
         for name in ("pr_handoff_without_authorization", "pr_handoff_with_authorization"):
             case = cases[name]
             result = pr_handoff(
-                case["change_retained"], case["authorized"], case["evidence"]
+                case["change_retained"],
+                case["authorized"],
+                case["evidence"],
+                expected_target=handoff_contract["target"],
+                expected_head_sha=handoff_contract["head_sha"],
+                expected_checks=handoff_contract["checks"],
             )
             self.assertEqual(result["status"], case["expected_status"])
             self.assertEqual(
                 result["local_handoff_ready"], case["expected_local_handoff_ready"]
             )
+        for case in cases["pr_handoff_invalid_cases"]:
+            result = pr_handoff(
+                True,
+                True,
+                case["evidence"],
+                expected_target=handoff_contract["target"],
+                expected_head_sha=handoff_contract["head_sha"],
+                expected_checks=handoff_contract["checks"],
+            )
+            self.assertEqual(
+                result,
+                {"status": case["expected_status"], "local_handoff_ready": False},
+                case["name"],
+            )
         self.assertEqual(
             pr_handoff(
                 True,
                 False,
-                {"diff": "", "head_sha": "abc", "checks": "ok", "body": "body"},
+                {
+                    "target": "pr:24",
+                    "diff": "",
+                    "head_sha": "abc",
+                    "checks": "ok",
+                    "body": "body",
+                },
+                expected_target=handoff_contract["target"],
+                expected_head_sha=handoff_contract["head_sha"],
+                expected_checks=handoff_contract["checks"],
             ),
             {"status": "BLOCKED", "local_handoff_ready": False},
         )
