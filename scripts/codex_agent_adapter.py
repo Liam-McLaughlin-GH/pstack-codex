@@ -364,7 +364,7 @@ def resolve_role(project_root: Path, role_name: str) -> RoleDefinition:
 def parse_model_catalog(payload: str | bytes | Mapping[str, Any]) -> tuple[str, ...]:
     """Extract stable model slugs from ``codex debug models`` JSON."""
 
-    if isinstance(payload, (str, bytes)):
+    if type(payload) in (str, bytes):
         try:
             decoded = json.loads(payload)
         except (json.JSONDecodeError, UnicodeError, TypeError) as exc:
@@ -412,12 +412,12 @@ def read_model_catalog(codex_binary: str = "codex", cwd: Path | None = None) -> 
         stderr = completed.stderr
     except (AttributeError, TypeError, ValueError) as exc:
         raise AdapterError(f"model catalog command returned an invalid result: {exc}") from exc
-    if not isinstance(returncode, int):
+    if type(returncode) is not int:
         raise AdapterError("model catalog command returned a non-integer exit status")
     if returncode != 0:
-        if stderr is not None and not isinstance(stderr, (str, bytes)):
+        if stderr is not None and type(stderr) not in (str, bytes):
             raise AdapterError("model catalog command returned a non-text diagnostic")
-        if stdout is not None and not isinstance(stdout, (str, bytes)):
+        if stdout is not None and type(stdout) not in (str, bytes):
             raise AdapterError("model catalog command returned non-text output")
         detail = (stderr.strip() if stderr else "") or (stdout.strip() if stdout else "") or "no diagnostic"
         raise AdapterError(f"model catalog command failed: {detail}")

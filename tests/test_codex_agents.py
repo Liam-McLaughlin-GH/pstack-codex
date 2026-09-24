@@ -533,6 +533,23 @@ class CodexAgentRoleTests(unittest.TestCase):
         with self.assertRaises(adapter.AdapterError):
             adapter.read_model_catalog(UnhashableRoleName("codex"))
 
+        class UnhashableCatalogText(str):
+            __hash__ = None
+
+        with self.assertRaises(adapter.AdapterError):
+            adapter.parse_model_catalog(UnhashableCatalogText('{"models": []}'))
+
+        class HostileDiagnostic(str):
+            def strip(self, *args: object, **kwargs: object) -> str:
+                raise RuntimeError("hostile diagnostic")
+
+        completed = subprocess.CompletedProcess(
+            ["codex"], 1, stdout="", stderr=HostileDiagnostic("failed")
+        )
+        with mock.patch.object(adapter.subprocess, "run", return_value=completed):
+            with self.assertRaises(adapter.AdapterError):
+                adapter.read_model_catalog("codex")
+
     def test_cli_catalog_file_failures_serialize_adapter_error(self) -> None:
         with tempfile.TemporaryDirectory(prefix="codex-role-catalog-errors-") as temporary:
             project = Path(temporary)
