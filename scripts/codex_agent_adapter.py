@@ -122,6 +122,15 @@ def parse_role_file(path: Path) -> RoleDefinition:
         developer_instructions=developer_instructions,
         settings=settings,
     )
+    canonical_instructions = unicodedata.normalize("NFKC", role.developer_instructions)
+    canonical_instructions = "".join(
+        character
+        for character in canonical_instructions
+        if character in {"\r", "\n"}
+        or (character.isprintable() and unicodedata.category(character) not in {"Cf", "Mn"})
+    )
+    if canonical_instructions != role.developer_instructions:
+        raise AdapterError(f"{path}: developer_instructions contain hidden or non-canonical text")
     sandbox_mode = role.settings.get("sandbox_mode")
     if sandbox_mode is not None and sandbox_mode not in VALID_SANDBOX_MODES:
         raise AdapterError(
@@ -162,20 +171,25 @@ def parse_role_file(path: Path) -> RoleDefinition:
             r"|\b(?:application code|source code|code|files?|repository|repo|data|patch|directory|output|disk)\b.{0,120}"
             r"\b(?:writ\w*|rewrit\w*|overwrit\w*|edit\w*|modif\w*|creat\w*|delet\w*|remov\w*|chang\w*|mutat\w*|appl\w*|updat\w*)\b"
         )
-        unsafe_match = next(
-            (
-                match
-                for line in instruction_lines
-                if (
-                    match := re.search(
-                        unsafe_pattern,
-                        _visible_text(line).replace("Do not write application code.", ""),
-                        re.IGNORECASE,
-                    )
-                )
+        scan_lines: list[str] = []
+        for line in instruction_lines:
+            content = line
+            for field in COMMENT_SICKO_REPORT_FIELDS:
+                if content == field:
+                    content = ""
+                    break
+                if content.startswith(field):
+                    content = content[len(field) :].lstrip()
+                    break
+            scan_lines.append(content)
+        normalized_instructions = re.sub(
+            r"\s+",
+            " ",
+            _visible_text(" ".join(scan_lines)).replace(
+                "Do not write application code.", ""
             ),
-            None,
         )
+        unsafe_match = re.search(unsafe_pattern, normalized_instructions, re.IGNORECASE)
         if unsafe_match:
             raise AdapterError(
                 f"{path}: Comment Sicko contains write-capable instructions: "
