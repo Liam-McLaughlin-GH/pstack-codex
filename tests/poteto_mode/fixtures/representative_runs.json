@@ -1,0 +1,95 @@
+{
+  "autonomous": {
+    "predicate_after": 2,
+    "outcomes": ["no-progress", "predicate-met"],
+    "expected_status": "PASS",
+    "expected_iterations": 2
+  },
+  "autonomous_dead_end": {
+    "predicate_after": null,
+    "outcomes": ["no-progress", "no-progress"],
+    "expected_status": "BLOCKED",
+    "expected_iterations": 2
+  },
+  "shipping_without_authorization": {
+    "verified": true,
+    "authorized": false,
+    "expected_status": "NOT RUN",
+    "expected_merge_calls": 0
+  },
+  "shipping_with_authorization": {
+    "verified": true,
+    "authorized": true,
+    "expected_status": "PASS",
+    "expected_merge_calls": 1
+  },
+  "pause": {
+    "explicit_pause": true,
+    "expected_checkpoint": true
+  },
+  "normal_continuation": {
+    "explicit_pause": false,
+    "expected_checkpoint": false
+  },
+  "autopilot_without_go": {
+    "go": false,
+    "expected_status": "NOT RUN",
+    "expected_owner_starts": 0
+  },
+  "autopilot_with_go": {
+    "go": true,
+    "expected_status": "RUN",
+    "expected_owner_starts": 1
+  },
+  "perf_missing_surface": {
+    "surface_available": false,
+    "expected_status": "BLOCKED",
+    "expected_changes": 0
+  },
+  "pr_handoff_contract": {
+    "target": "pr:24",
+    "head_sha": "abc123",
+    "checks": "pass"
+  },
+  "pr_handoff_without_authorization": {
+    "change_retained": true,
+    "authorized": false,
+    "evidence": {"target": "pr:24", "diff": "diff", "head_sha": "abc123", "checks": "pass", "body": "body"},
+    "expected_status": "NOT RUN",
+    "expected_local_handoff_ready": true
+  },
+  "pr_handoff_with_authorization": {
+    "change_retained": true,
+    "authorized": true,
+    "evidence": {"target": "pr:24", "diff": "diff", "head_sha": "abc123", "checks": "pass", "body": "body"},
+    "expected_status": "PASS",
+    "expected_local_handoff_ready": true
+  },
+  "pr_handoff_invalid_cases": [
+    {"name": "failing-checks", "evidence": {"target": "pr:24", "diff": "diff", "head_sha": "abc123", "checks": "FAIL", "body": "body"}, "expected_status": "BLOCKED"},
+    {"name": "wrong-head", "evidence": {"target": "pr:24", "diff": "diff", "head_sha": "not-the-head", "checks": "pass", "body": "body"}, "expected_status": "BLOCKED"},
+    {"name": "wrong-target", "evidence": {"target": "pr:25", "diff": "diff", "head_sha": "abc123", "checks": "pass", "body": "body"}, "expected_status": "BLOCKED"},
+    {"name": "missing-head", "evidence": {"target": "pr:24", "diff": "diff", "checks": "pass", "body": "body"}, "expected_status": "BLOCKED"},
+    {"name": "missing-checks", "evidence": {"target": "pr:24", "diff": "diff", "head_sha": "abc123", "body": "body"}, "expected_status": "BLOCKED"}
+  ],
+  "diagnostic_states": [
+    {"workflow": "investigation", "capability": false, "artifact": false, "matches": false, "authorized": true, "capture_ready": true, "expected": "BLOCKED"},
+    {"workflow": "investigation", "capability": true, "artifact": false, "matches": false, "authorized": true, "capture_ready": true, "expected": "BLOCKED"},
+    {"workflow": "runtime-forensics", "capability": true, "artifact": true, "matches": false, "authorized": true, "capture_ready": true, "expected": "INCONCLUSIVE"},
+    {"workflow": "runtime-forensics", "capability": true, "artifact": false, "matches": false, "authorized": true, "capture_ready": true, "expected": "BLOCKED"},
+    {"workflow": "trace-forensics", "capability": true, "artifact": true, "matches": true, "authorized": false, "capture_ready": true, "expected": "NOT RUN"},
+    {"workflow": "trace-forensics", "capability": true, "artifact": false, "matches": false, "authorized": true, "capture_ready": true, "expected": "BLOCKED"},
+    {"workflow": "perf-issue", "capability": true, "artifact": true, "matches": true, "authorized": true, "capture_ready": true, "expected": "PASS"},
+    {"workflow": "perf-issue", "capability": true, "artifact": false, "matches": false, "authorized": true, "capture_ready": true, "expected": "BLOCKED"},
+    {"workflow": "perf-issue", "capability": true, "artifact": true, "matches": true, "authorized": true, "capture_ready": false, "expected": "NOT RUN"}
+  ],
+  "cleanup_dry_run": {
+    "candidates": [
+      {"path": "clean-merged", "merged": true, "dirty": false, "active": false},
+      {"path": "dirty-merged", "merged": true, "dirty": true, "active": false},
+      {"path": "active-merged", "merged": true, "dirty": false, "active": true}
+    ],
+    "expected_proposals": ["clean-merged"],
+    "expected_deletions": 0
+  }
+}

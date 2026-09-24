@@ -1,0 +1,18 @@
+{
+  "investigation": {
+    "playbook": "investigation.md",
+    "artifact_required": true
+  },
+  "runtime-forensics": {
+    "playbook": "runtime-forensics.md",
+    "artifact_required": true
+  },
+  "trace-forensics": {
+    "playbook": "trace-forensics.md",
+    "artifact_required": true
+  },
+  "perf-issue": {
+    "playbook": "perf-issue.md",
+    "artifact_required": true
+  }
+}

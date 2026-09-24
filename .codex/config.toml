@@ -1,0 +1,7 @@
+[agents."poteto-agent"]
+description = "Routing target for /poteto-mode and requests for poteto's style."
+config_file = "agents/poteto-agent.toml"
+
+[agents."Comment Sicko"]
+description = "A deranged comment-hater that savors deletion and condemns workaround code."
+config_file = "agents/comment-sicko.toml"

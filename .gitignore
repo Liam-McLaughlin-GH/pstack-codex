@@ -2,5 +2,10 @@
 __pycache__/
 *.pyc
 .audit/
-.codex/
+.codex/*
+!.codex/
+!.codex/agents/
+!.codex/agents/*.toml
+!.codex/config.toml
+!.codex/README.md
 decisions.tsv
