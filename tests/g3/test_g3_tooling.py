@@ -61,6 +61,7 @@ from pstack_g3_helpers.watch import (  # noqa: E402
     QueryFailure,
     ReviewThread,
     UnknownProviderData,
+    classify_pr,
     failed_check,
     pending_check,
     read_snapshot,
@@ -87,6 +88,42 @@ class G3WatcherTests(unittest.TestCase):
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(clock.sleeps, [])
         self.assertEqual(reader.calls, ["pull_request:24", "review_threads:24", "checks:24", "commit_rollups:24"])
+
+    def test_open_pr_requires_an_approved_review_decision(self) -> None:
+        context = PRContext("owner", "repo", 24)
+        for decision in (None, "REVIEW_REQUIRED", "CHANGES_REQUESTED"):
+            with self.subTest(decision=decision):
+                reader = FakeReader(
+                    facts=PRFacts(context, review_decision=decision),
+                    commits=(CommitRollup("head", "SUCCESS"),),
+                )
+                result = run_simple(reader, [context], clock=DeterministicClock())
+                self.assertEqual(result["kind"], "BLOCKER")
+                self.assertEqual(result["blocker"]["kind"], "merge-gate")
+                self.assertNotEqual(result["kind"], "READY")
+
+    def test_code_review_gate_non_success_states_are_not_ready(self) -> None:
+        context = PRContext("owner", "repo", 24)
+        for state in ("PENDING", "FAILURE", "ERROR"):
+            with self.subTest(state=state):
+                reader = FakeReader(
+                    checks=CheckRead("recorded", (Check("code-review-gate", "review", state),)),
+                    commits=(CommitRollup("head", "SUCCESS"),),
+                )
+                if state == "PENDING":
+                    snapshot = read_snapshot(reader, context)
+                    self.assertEqual(snapshot.ci.kind, "ci-pending")
+                    result = run_simple(
+                        reader,
+                        [context],
+                        options=PollOptions(timeout=1, interval=1),
+                        clock=DeterministicClock(),
+                    )
+                    self.assertEqual(result["kind"], "TIMEOUT")
+                else:
+                    result = run_simple(reader, [context], clock=DeterministicClock())
+                    self.assertEqual(result["kind"], "BLOCKER")
+                    self.assertEqual(result["blocker"]["kind"], "failing-checks")
 
     def test_conflict_precedes_review_and_ci_blockers(self) -> None:
         context = PRContext("owner", "repo", 24)
@@ -185,6 +222,18 @@ class G3WatcherTests(unittest.TestCase):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 result = watch.main(["--fixture", str(fixture)])
+        self.assertEqual(result, 2)
+        rendered = json.loads(output.getvalue())
+        self.assertEqual(rendered["error"], "UnknownProviderData")
+
+    def test_public_cli_normalizes_value_errors_as_json_domain_errors(self) -> None:
+        from pstack_g3_helpers import watch
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = watch.main(
+                ["--fixture", str(FIXTURES / "provider-ready.json"), "--timeout", "nan"]
+            )
         self.assertEqual(result, 2)
         rendered = json.loads(output.getvalue())
         self.assertEqual(rendered["error"], "UnknownProviderData")
@@ -444,6 +493,11 @@ class G3WatcherTests(unittest.TestCase):
 
         mutations = {
             "PR state": lambda facts, thread, check_read, commit: object.__setattr__(facts, "state", "ALIEN"),
+            "merged state": lambda facts, thread, check_read, commit: object.__setattr__(facts, "state", "MERGED"),
+            "facts context owner": lambda facts, thread, check_read, commit: (
+                object.__setattr__(facts, "context", PRContext("owner", "repo", 24)),
+                object.__setattr__(facts.context, "owner", []),
+            ),
             "review decision": lambda facts, thread, check_read, commit: object.__setattr__(facts, "review_decision", "ALIEN"),
             "draft flag": lambda facts, thread, check_read, commit: object.__setattr__(facts, "is_draft", []),
             "head ref oid": lambda facts, thread, check_read, commit: object.__setattr__(facts, "head_ref_oid", []),
@@ -453,6 +507,7 @@ class G3WatcherTests(unittest.TestCase):
             "review thread": lambda facts, thread, check_read, commit: object.__setattr__(thread, "id", ""),
             "check source": lambda facts, thread, check_read, commit: object.__setattr__(check_read, "source", []),
             "current head oid": lambda facts, thread, check_read, commit: object.__setattr__(commit, "oid", []),
+            "current head state": lambda facts, thread, check_read, commit: object.__setattr__(commit, "state", "ALIEN"),
         }
         for label, mutate in mutations.items():
             with self.subTest(label=label):
@@ -463,6 +518,24 @@ class G3WatcherTests(unittest.TestCase):
                 mutate(facts, thread, check_read, commit)
                 with self.assertRaises(UnknownProviderData):
                     read_snapshot(StaticReader(facts, thread, check_read, commit), context)
+
+    def test_classification_revalidates_mutated_snapshot_records(self) -> None:
+        context = PRContext("owner", "repo", 24)
+        snapshot = read_snapshot(
+            FakeReader(commits=(CommitRollup("head", "SUCCESS"),)),
+            context,
+        )
+        object.__setattr__(snapshot.facts, "state", "MERGED")
+        with self.assertRaises(UnknownProviderData):
+            classify_pr(snapshot)
+
+    def test_queue_rejects_unhashable_mutated_identity_fields(self) -> None:
+        for field in ("owner", "repo", "number"):
+            with self.subTest(field=field):
+                context = PRContext("owner", "repo", 24)
+                object.__setattr__(context, field, [])
+                with self.assertRaises(UnknownProviderData):
+                    run_queued(FakeReader(), [context], clock=DeterministicClock())
 
     def test_queued_complete_reads_state_without_merging(self) -> None:
         contexts = [PRContext("owner", "repo", 23), PRContext("owner", "repo", 24)]
@@ -555,6 +628,22 @@ class G3StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_frontier_reader_revalidates_entries_before_identity_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            repo = root / "repo"
+            repo.mkdir()
+            store = self.make_store(root / "store")
+            try:
+                for field in ("pr", "branches", "sha", "state"):
+                    entry = FrontierEntry(23, "feature/23", "a" * 40, "MERGED")
+                    object.__setattr__(entry, field, [])
+                    store.stack_reader = StaticStackReader((entry,))
+                    with self.subTest(field=field), self.assertRaises(StoreError):
+                        store.frontier_set(repo)
+            finally:
+                store.close()
+
     def test_store_inbox_symlink_is_refused_for_init(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -623,6 +712,20 @@ class G3StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_store_rejects_blank_units_and_ledger_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = self.make_store(root)
+            try:
+                (root / "units.tsv").write_text(f"{UNIT_HEADER}\n\n", encoding="utf-8")
+                with self.assertRaises(StoreError):
+                    store.units_counts()
+                (root / "ledger.tsv").write_text(f"{LEDGER_HEADER}\n\n", encoding="utf-8")
+                with self.assertRaises(StoreError):
+                    store.ledger_summary()
+            finally:
+                store.close()
+
     def test_store_rejects_semantically_malformed_ledger_rows(self) -> None:
         invalid_rows = (
             "0\tsha\tunit-test-verified\tevidence\tverifier\t2026-01-01T00:00:00Z",
@@ -642,6 +745,43 @@ class G3StoreTests(unittest.TestCase):
                         (root / "ledger.tsv").write_text(f"{LEDGER_HEADER}\n{row}\n", encoding="utf-8")
                         with self.assertRaises(StoreError):
                             store.ledger_summary()
+            finally:
+                store.close()
+
+    def test_store_rejects_malformed_inbox_rows_and_preserves_pending_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = self.make_store(root)
+            try:
+                pending, filename = store.inbox_push("agent-a", "unit-a", "pending", "report.txt")
+                self.assertEqual(store.inbox_peek(), [pending])
+                valid_timestamp = "2026-01-01T00:00:00Z"
+                invalid_rows = (
+                    "",
+                    "\n",
+                    f"{valid_timestamp}\tagent\tunit\tstatus",
+                    f"{valid_timestamp}\tagent\tunit\tstatus\textra\textra\n",
+                    f"{valid_timestamp}\tagent\x00\tunit\tstatus\treport\n",
+                    f"\tagent\tunit\tstatus\treport\n",
+                    f"{valid_timestamp}\t\tunit\tstatus\treport\n",
+                    f"{valid_timestamp}\tagent\t\tstatus\treport\n",
+                    f"{valid_timestamp}\tagent\tunit\t\treport\n",
+                    f"not-a-timestamp\tagent\tunit\tstatus\treport\n",
+                    f"2026-01-01T01:00:00+01:00\tagent\tunit\tstatus\treport\n",
+                )
+                bad_path = root / "inbox" / "bad.tsv"
+                for row in invalid_rows:
+                    with self.subTest(row=repr(row)):
+                        bad_path.write_text(row, encoding="utf-8")
+                        with self.assertRaises(StoreError):
+                            store.inbox_peek()
+                        with self.assertRaises(StoreError):
+                            store.inbox_drain()
+                        self.assertTrue(bad_path.exists())
+                bad_path.unlink()
+                self.assertEqual(store.inbox_peek(), [pending])
+                self.assertEqual(store.inbox_drain(), [pending])
+                self.assertFalse((root / "inbox" / filename).exists())
             finally:
                 store.close()
 

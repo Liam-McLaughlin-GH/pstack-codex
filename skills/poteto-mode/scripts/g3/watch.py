@@ -69,8 +69,10 @@ CHECK_REPORTED_STATES = {
     "failed": {"", "FAILURE", "ERROR"},
     "pending": {"PENDING"},
     "skipped": {"", "SKIPPED", "SUCCESS"},
-    "code-review-gate": {"", "PENDING", "FAILURE", "ERROR", "SUCCESS"},
+    "code-review-gate": {"PENDING", "FAILURE", "ERROR", "SUCCESS"},
 }
+SNAPSHOT_KINDS = {"open", "merged", "closed"}
+CI_KINDS = {"ci-clean", "ci-pending", "ci-failing", "ci-github-rejected"}
 
 
 def _nonempty(value: Any, label: str) -> str:
@@ -202,7 +204,7 @@ class PRFacts:
     def __post_init__(self) -> None:
         if not isinstance(self.context, PRContext):
             raise UnknownProviderData("pull request context is invalid")
-        self.context.__post_init__()
+        _revalidate(self.context, "pull request context")
         _enum(self.mergeable, MERGEABLE, "mergeable")
         _enum(self.merge_state_status, MERGE_STATES, "merge state status")
         _enum(self.review_decision, REVIEW_DECISIONS, "review decision")
@@ -641,6 +643,99 @@ def _merge_assessment(facts: PRFacts, commits: Sequence[CommitRollup]) -> tuple[
     return previous_success, assessment
 
 
+def _ci_check_groups(checks: Sequence[Check]) -> tuple[tuple[Check, ...], tuple[Check, ...]]:
+    failed = tuple(
+        check
+        for check in checks
+        if check.kind == "failed"
+        or (check.kind == "code-review-gate" and check.reported_state in {"FAILURE", "ERROR"})
+    )
+    pending = tuple(
+        check
+        for check in checks
+        if check.kind == "pending"
+        or (check.kind == "code-review-gate" and check.reported_state == "PENDING")
+    )
+    return failed, pending
+
+
+def _validate_merge_assessment(value: Any, label: str) -> None:
+    if not isinstance(value, MergeAssessment):
+        raise UnknownProviderData(f"{label} is invalid")
+    _enum(value.kind, {"allowed", "refused"}, f"{label} kind")
+    _enum(value.basis, {"merge-state", "rollup"}, f"{label} basis")
+    _enum(value.merge_state_status, MERGE_STATES, f"{label} merge state status")
+    if value.head_rollup_state is not None:
+        _enum(value.head_rollup_state, ROLLUP_STATES, f"{label} head rollup state")
+
+
+def _validate_ci_state(value: Any, label: str = "CI state") -> None:
+    if not isinstance(value, CIState):
+        raise UnknownProviderData(f"{label} is invalid")
+    _enum(value.kind, CI_KINDS, f"{label} kind")
+    _enum(value.source, CHECK_SOURCES, f"{label} source")
+    check_groups: dict[str, tuple[Check, ...]] = {}
+    for name, checks in (("all", value.all), ("failed", value.failed), ("pending", value.pending)):
+        if not isinstance(checks, tuple):
+            raise UnknownProviderData(f"{label} {name} checks must be a tuple")
+        for index, check in enumerate(checks):
+            if not isinstance(check, Check):
+                raise UnknownProviderData(f"{label} {name} check {index} is invalid")
+            _revalidate(check, f"{label} {name} check {index}")
+        check_groups[name] = checks
+    _exact_bool(value.had_previous_passing_ci, f"{label} previous passing CI flag")
+    if value.github is not None:
+        _validate_merge_assessment(value.github, f"{label} GitHub assessment")
+
+    expected_failed, expected_pending = _ci_check_groups(check_groups["all"])
+    if check_groups["failed"] != expected_failed or check_groups["pending"] != expected_pending:
+        raise UnknownProviderData(f"{label} failed or pending checks are inconsistent")
+    if value.kind == "ci-clean" and (value.failed or value.pending):
+        raise UnknownProviderData("clean CI contains failed or pending checks")
+    if value.kind == "ci-pending" and (value.failed or not value.pending):
+        raise UnknownProviderData("pending CI has inconsistent check state")
+    if value.kind == "ci-failing" and not value.failed:
+        raise UnknownProviderData("failing CI has no failed checks")
+    if value.kind == "ci-github-rejected":
+        if value.failed or value.github is None or value.github.kind != "refused":
+            raise UnknownProviderData("GitHub-rejected CI has inconsistent assessment")
+    elif value.github is not None and value.github.kind == "refused":
+        raise UnknownProviderData("CI has a refused GitHub assessment but is not rejected")
+
+
+def _validate_snapshot(value: Any, label: str = "snapshot") -> None:
+    if not isinstance(value, PRSnapshot):
+        raise UnknownProviderData(f"{label} is invalid")
+    _enum(value.kind, SNAPSHOT_KINDS, f"{label} kind")
+    if not isinstance(value.context, PRContext):
+        raise UnknownProviderData(f"{label} context is invalid")
+    _revalidate(value.context, f"{label} context")
+    if not isinstance(value.facts, PRFacts):
+        raise UnknownProviderData(f"{label} facts are invalid")
+    _revalidate(value.facts, f"{label} facts")
+    if value.facts.context != value.context:
+        raise UnknownProviderData(f"{label} facts belong to another identity")
+    if not isinstance(value.threads, tuple):
+        raise UnknownProviderData(f"{label} review threads must be a tuple")
+    for index, thread in enumerate(value.threads):
+        if not isinstance(thread, ReviewThread):
+            raise UnknownProviderData(f"{label} review thread {index} is invalid")
+        _revalidate(thread, f"{label} review thread {index}")
+    if value.ci is not None:
+        _validate_ci_state(value.ci, f"{label} CI state")
+
+    if value.kind == "open" and (value.facts.state != "OPEN" or value.facts.merged_at is not None):
+        raise UnknownProviderData("open snapshot has merged or non-open facts")
+    if value.kind == "closed" and (value.facts.state != "CLOSED" or value.facts.merged_at is not None):
+        raise UnknownProviderData("closed snapshot has inconsistent facts")
+    if value.kind != "open" and (value.threads or value.ci is not None):
+        raise UnknownProviderData("non-open snapshot contains open pull request data")
+    if value.kind == "open" and value.ci is None:
+        raise UnknownProviderData("open snapshot has no CI state")
+    if value.kind == "merged" and value.facts.state != "MERGED" and value.facts.merged_at is None:
+        raise UnknownProviderData("merged snapshot has inconsistent facts")
+
+
 def read_snapshot(
     reader: WatcherReader,
     context: PRContext,
@@ -648,10 +743,22 @@ def read_snapshot(
     pending_history: Literal["include", "omit"] = "include",
     before_read: Callable[[], None] | None = None,
 ) -> PRSnapshot:
+    if not isinstance(context, PRContext):
+        raise UnknownProviderData("reader request context is invalid")
+    _revalidate(context, "reader request context")
+
     def read(method: Callable[[PRContext], Any]) -> Any:
+        _revalidate(context, "reader request context")
         if before_read is not None:
             before_read()
-        return method(context)
+        try:
+            value = method(context)
+        except (UnknownProviderData, QueryFailure):
+            raise
+        except (TypeError, ValueError) as exc:
+            raise UnknownProviderData("reader returned an invalid domain value") from exc
+        _revalidate(context, "reader request context")
+        return value
 
     facts = read(reader.pull_request)
     if not isinstance(facts, PRFacts):
@@ -662,9 +769,13 @@ def read_snapshot(
     _enum(facts.mergeable, MERGEABLE, "mergeable")
     _enum(facts.merge_state_status, MERGE_STATES, "merge state status")
     if facts.state == "MERGED" or facts.merged_at is not None:
-        return PRSnapshot("merged", context, facts)
+        snapshot = PRSnapshot("merged", context, facts)
+        _validate_snapshot(snapshot)
+        return snapshot
     if facts.state == "CLOSED":
-        return PRSnapshot("closed", context, facts)
+        snapshot = PRSnapshot("closed", context, facts)
+        _validate_snapshot(snapshot)
+        return snapshot
 
     threads = read(reader.review_threads)
     if not isinstance(threads, Sequence) or isinstance(threads, (str, bytes)):
@@ -683,8 +794,7 @@ def read_snapshot(
         _revalidate(check, f"reader returned check {index}")
     if not check_read.checks:
         raise QueryFailure("provider returned no checks", kind="checks-unavailable")
-    failed = tuple(check for check in check_read.checks if check.kind == "failed")
-    pending = tuple(check for check in check_read.checks if check.kind == "pending")
+    failed, pending = _ci_check_groups(check_read.checks)
     if pending and not failed and pending_history == "omit":
         ci = CIState(
             "ci-pending",
@@ -747,10 +857,16 @@ def read_snapshot(
     for index, check in enumerate(check_read.checks):
         _revalidate(check, f"reader returned check {index}")
     if facts.state == "MERGED" or facts.merged_at is not None:
-        return PRSnapshot("merged", context, facts)
+        snapshot = PRSnapshot("merged", context, facts)
+        _validate_snapshot(snapshot)
+        return snapshot
     if facts.state == "CLOSED":
-        return PRSnapshot("closed", context, facts)
-    return PRSnapshot("open", context, facts, tuple(threads), ci)
+        snapshot = PRSnapshot("closed", context, facts)
+        _validate_snapshot(snapshot)
+        return snapshot
+    snapshot = PRSnapshot("open", context, facts, tuple(threads), ci)
+    _validate_snapshot(snapshot)
+    return snapshot
 
 
 def _conflict(snapshot: PRSnapshot) -> bool:
@@ -769,6 +885,8 @@ def _gate_reason(snapshot: PRSnapshot, allow_draft: bool) -> str | None:
         return "draft-pr"
     if snapshot.facts.review_decision == "CHANGES_REQUESTED":
         return "changes-requested"
+    if snapshot.facts.review_decision in {None, "REVIEW_REQUIRED"}:
+        return "review-required"
     return None
 
 
@@ -784,6 +902,7 @@ def _gate_blocker(snapshot: PRSnapshot, allow_draft: bool) -> Blocker | None:
 def classify_pr(snapshot: PRSnapshot, *, allow_draft: bool = False) -> Decision:
     """Classify one snapshot using conflict > review > CI > gate precedence."""
 
+    _validate_snapshot(snapshot)
     if _conflict(snapshot):
         return Decision("blocker", blocker=Blocker("merge-conflicts", snapshot.context))
     if snapshot.kind == "open" and snapshot.threads:
@@ -820,8 +939,14 @@ def select_stack_decision(
 ) -> Decision:
     """Apply blocker tiers across a bottom-to-top stack before waiting."""
 
+    try:
+        snapshots = tuple(snapshots)
+    except (TypeError, ValueError) as exc:
+        raise UnknownProviderData("stack snapshots are not a valid sequence") from exc
     if not snapshots:
         raise ValueError("stack must contain at least one pull request")
+    for index, snapshot in enumerate(snapshots):
+        _validate_snapshot(snapshot, f"stack snapshot {index}")
     for snapshot in snapshots:
         if _conflict(snapshot):
             return Decision("blocker", blocker=Blocker("merge-conflicts", snapshot.context))
@@ -1075,6 +1200,13 @@ def run_simple(
             return _timeout(emitter, reason)
 
 
+def _queue_context_key(context: PRContext, index: int) -> tuple[str, str, int]:
+    if not isinstance(context, PRContext):
+        raise ValueError(f"queue item {index} is not a pull request identity")
+    _revalidate(context, f"queue item {index} identity")
+    return (context.owner, context.repo, context.number)
+
+
 def run_queued(
     reader: WatcherReader,
     contexts: Sequence[PRContext],
@@ -1085,13 +1217,15 @@ def run_queued(
 ) -> dict[str, Any]:
     """Watch a frozen bottom-to-top queue; no merge is attempted."""
 
+    try:
+        contexts = tuple(contexts)
+    except (TypeError, ValueError) as exc:
+        raise UnknownProviderData("queue is not a valid sequence") from exc
     if not contexts:
         raise ValueError("queue cannot be empty")
     queue_keys = []
-    for context in contexts:
-        if not isinstance(context, PRContext):
-            raise ValueError("queue contains an invalid pull request identity")
-        queue_keys.append((context.owner, context.repo, context.number))
+    for index, context in enumerate(contexts):
+        queue_keys.append(_queue_context_key(context, index))
     if len(set(queue_keys)) != len(queue_keys):
         raise ValueError("queue contains duplicate pull request identities")
     options = options or PollOptions()
@@ -1145,6 +1279,8 @@ def run_queued(
                     if terminal is not None:
                         return terminal
                     continue
+                _queue_context_key(context, sweep_index)
+                _validate_snapshot(snapshot, "queue reader snapshot")
                 if snapshot.context != context:
                     raise UnknownProviderData("queue reader returned another pull request identity")
                 snapshots[context] = snapshot
@@ -1177,6 +1313,12 @@ def run_queued(
                 if terminal is not None:
                     return terminal
                 continue
+            frontier_index = next(
+                (index for index, item in enumerate(contexts) if item is frontier_context),
+                0,
+            )
+            _queue_context_key(frontier_context, frontier_index)
+            _validate_snapshot(snapshot, "queue reader snapshot")
             if snapshot.context != frontier_context:
                 raise UnknownProviderData("queue reader returned another pull request identity")
             snapshots[frontier_context] = snapshot
@@ -1261,9 +1403,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = run_queued(reader, [context], options=options)
         else:
             result = run_simple(reader, [context], mode=args.mode, status_only=args.status_only, options=options)
+        rendered = json.dumps(result, default=_json_default, sort_keys=True)
     except SystemExit:
         raise
-    except (UnknownProviderData, QueryFailure, ValueError) as exc:
+    except (UnknownProviderData, QueryFailure, TypeError, ValueError) as exc:
+        if isinstance(exc, (TypeError, ValueError)) and not isinstance(exc, UnknownProviderData):
+            exc = UnknownProviderData(f"watcher input is invalid: {exc}")
         print(
             json.dumps(
                 {
@@ -1278,7 +1423,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         return 2
-    print(json.dumps(result, default=_json_default, sort_keys=True))
+    print(rendered)
     return int(result.get("exit_code", 1))
 
 

@@ -16,6 +16,7 @@ import json
 import os
 import re
 import tempfile
+import unicodedata
 import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -198,6 +199,12 @@ def _stored_cell(value: Any, label: str, *, required: bool = False) -> str:
     cleaned = _clean_cell(value, label)
     if cleaned != value:
         raise StoreError(f"{label} is not safely encoded")
+    if any(
+        unicodedata.category(character).startswith("C")
+        or character in {"\u2028", "\u2029"}
+        for character in cleaned
+    ):
+        raise StoreError(f"{label} contains an unsafe control")
     if required and not cleaned.strip():
         raise StoreError(f"{label} must not be empty")
     return cleaned
@@ -222,6 +229,17 @@ def _validate_utc_timestamp(value: Any, label: str) -> str:
     if parsed.tzinfo is None or offset != timezone.utc.utcoffset(parsed):
         raise StoreError(f"{label} must be a UTC timestamp")
     return value
+
+
+def _revalidate_frontier_entry(value: Any, label: str) -> None:
+    if not isinstance(value, FrontierEntry):
+        raise StoreError(f"{label} is invalid")
+    try:
+        value.__post_init__()
+    except StoreError:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise StoreError(f"{label} is invalid") from exc
 
 
 def parse_verdict(value: str) -> str:
@@ -311,10 +329,12 @@ def _read_tsv(path: Path, header: str, width: int) -> list[list[str]]:
     lines = _read_required(path).replace("\r", "").split("\n")
     if not lines or lines.pop(0) != header:
         raise StoreError(f"{path.name} has an invalid header")
+    if lines and lines[-1] == "":
+        lines.pop()
     rows: list[list[str]] = []
     for line in lines:
         if not line:
-            continue
+            raise StoreError(f"{path.name} has a blank row")
         cells = line.split("\t")
         if len(cells) != width:
             raise StoreError(f"{path.name} has a malformed row")
@@ -687,13 +707,26 @@ class OrchestratorStore:
             raise StoreError("inbox is missing or unsafe")
         result: list[InboxPointer] = []
         for path in sorted(inbox.glob("*.tsv")):
-            raw = _read_required(path).rstrip("\n")
+            raw = _read_required(path)
+            if raw.endswith("\n"):
+                raw = raw[:-1]
+                if raw.endswith("\n"):
+                    raise StoreError(f"inbox pointer {path.name} has a blank row")
             if "\n" in raw or "\r" in raw:
                 raise StoreError(f"inbox pointer {path.name} is malformed")
             row = raw.split("\t")
             if len(row) != 5:
                 raise StoreError(f"inbox pointer {path.name} is malformed")
-            result.append(InboxPointer(*row))
+            prefix = f"inbox pointer {path.name}"
+            timestamp = _validate_utc_timestamp(
+                _stored_cell(row[0], f"{prefix} timestamp", required=True),
+                f"{prefix} timestamp",
+            )
+            agent = _stored_cell(row[1], f"{prefix} agent", required=True)
+            unit = _stored_cell(row[2], f"{prefix} unit", required=True)
+            status = _stored_cell(row[3], f"{prefix} status", required=True)
+            report = _stored_cell(row[4], f"{prefix} report")
+            result.append(InboxPointer(timestamp, agent, unit, status, report))
         return result
 
     def inbox_peek(self) -> list[InboxPointer]:
@@ -832,12 +865,28 @@ class OrchestratorStore:
         self._begin_write()
         if self.stack_reader is None:
             raise StoreError("frontier set requires an injected stack reader")
-        repo_path = Path(repo).expanduser()
+        try:
+            repo_path = Path(repo).expanduser()
+        except (TypeError, ValueError, OSError) as exc:
+            raise StoreError("frontier repo is not a usable path") from exc
         if _unsafe_symlink(repo_path) is not None or not repo_path.is_dir():
             raise StoreError(f"frontier repo is not a real directory: {repo_path}")
-        entries = tuple(self.stack_reader.read_frontier(repo_path))
-        if any(not isinstance(entry, FrontierEntry) for entry in entries):
-            raise StoreError("stack reader returned invalid frontier data")
+        try:
+            entries = tuple(self.stack_reader.read_frontier(repo_path))
+        except StoreError:
+            raise
+        except (TypeError, ValueError, OSError) as exc:
+            raise StoreError("stack reader returned invalid frontier data") from exc
+        validated_entries: list[FrontierEntry] = []
+        for index, entry in enumerate(entries):
+            _revalidate_frontier_entry(entry, f"stack reader frontier row {index}")
+            try:
+                validated_entries.append(FrontierEntry(entry.pr, entry.branches, entry.sha, entry.state))
+            except StoreError:
+                raise
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise StoreError(f"stack reader frontier row {index} is invalid") from exc
+        entries = tuple(validated_entries)
         if len({entry.pr for entry in entries}) != len(entries):
             raise StoreError("stack reader returned duplicate pull requests")
         actual = [entry.pr for entry in entries]
