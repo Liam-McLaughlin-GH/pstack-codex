@@ -128,6 +128,8 @@ def _non_empty_string(value: object, field: str, path: Path) -> str:
 def _resolve_path(path: Path, description: str) -> Path:
     if not isinstance(path, Path):
         raise AdapterError(f"{description} must be a pathlib.Path")
+    if "\x00" in str(path):
+        raise AdapterError(f"{description} contains an invalid NUL character")
     try:
         return path.resolve()
     except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
@@ -137,6 +139,8 @@ def _resolve_path(path: Path, description: str) -> Path:
 def _path_is_symlink(path: Path, description: str) -> bool:
     if not isinstance(path, Path):
         raise AdapterError(f"{description} must be a pathlib.Path")
+    if "\x00" in str(path):
+        raise AdapterError(f"{description} contains an invalid NUL character")
     try:
         return path.is_symlink()
     except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
@@ -146,6 +150,8 @@ def _path_is_symlink(path: Path, description: str) -> bool:
 def _path_is_dir(path: Path, description: str) -> bool:
     if not isinstance(path, Path):
         raise AdapterError(f"{description} must be a pathlib.Path")
+    if "\x00" in str(path):
+        raise AdapterError(f"{description} contains an invalid NUL character")
     try:
         return path.is_dir()
     except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
@@ -155,6 +161,8 @@ def _path_is_dir(path: Path, description: str) -> bool:
 def _path_is_file(path: Path, description: str) -> bool:
     if not isinstance(path, Path):
         raise AdapterError(f"{description} must be a pathlib.Path")
+    if "\x00" in str(path):
+        raise AdapterError(f"{description} contains an invalid NUL character")
     try:
         return path.is_file()
     except (OSError, UnicodeError, ValueError, RuntimeError) as exc:

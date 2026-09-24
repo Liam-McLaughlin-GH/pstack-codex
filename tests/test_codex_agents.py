@@ -491,6 +491,9 @@ class CodexAgentRoleTests(unittest.TestCase):
             ("resolve_role", lambda: adapter.resolve_role(invalid_path, "Comment Sicko")),
             ("_relative_path", lambda: adapter._relative_path(invalid_path, Path.cwd())),
             ("_read_catalog_file", lambda: adapter._read_catalog_file(invalid_path)),
+            ("_path_is_symlink", lambda: adapter._path_is_symlink(invalid_path, "path")),
+            ("_path_is_dir", lambda: adapter._path_is_dir(invalid_path, "path")),
+            ("_path_is_file", lambda: adapter._path_is_file(invalid_path, "path")),
             (
                 "read_model_catalog",
                 lambda: adapter.read_model_catalog("codex", cwd=invalid_path),
