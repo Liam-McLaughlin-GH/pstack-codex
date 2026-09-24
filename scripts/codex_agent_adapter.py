@@ -126,6 +126,8 @@ def _non_empty_string(value: object, field: str, path: Path) -> str:
 
 
 def _resolve_path(path: Path, description: str) -> Path:
+    if not isinstance(path, Path):
+        raise AdapterError(f"{description} must be a pathlib.Path")
     try:
         return path.resolve()
     except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
@@ -133,6 +135,8 @@ def _resolve_path(path: Path, description: str) -> Path:
 
 
 def _path_is_symlink(path: Path, description: str) -> bool:
+    if not isinstance(path, Path):
+        raise AdapterError(f"{description} must be a pathlib.Path")
     try:
         return path.is_symlink()
     except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
@@ -140,6 +144,8 @@ def _path_is_symlink(path: Path, description: str) -> bool:
 
 
 def _path_is_dir(path: Path, description: str) -> bool:
+    if not isinstance(path, Path):
+        raise AdapterError(f"{description} must be a pathlib.Path")
     try:
         return path.is_dir()
     except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
@@ -147,6 +153,8 @@ def _path_is_dir(path: Path, description: str) -> bool:
 
 
 def _path_is_file(path: Path, description: str) -> bool:
+    if not isinstance(path, Path):
+        raise AdapterError(f"{description} must be a pathlib.Path")
     try:
         return path.is_file()
     except (OSError, UnicodeError, ValueError, RuntimeError) as exc:
@@ -327,6 +335,8 @@ def load_explicit_roles(project_root: Path) -> dict[str, RoleDefinition]:
 def resolve_role(project_root: Path, role_name: str) -> RoleDefinition:
     """Resolve an exact role name without replacing it with a generic worker."""
 
+    if not isinstance(role_name, str) or not role_name.strip():
+        raise AdapterError("role name must be a non-empty string")
     roles = load_explicit_roles(project_root)
     try:
         return roles[role_name]
@@ -386,7 +396,7 @@ def read_model_catalog(codex_binary: str = "codex", cwd: Path | None = None) -> 
             text=True,
             check=False,
         )
-    except (OSError, subprocess.SubprocessError, TypeError, ValueError, UnicodeError) as exc:
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError, UnicodeError, RuntimeError) as exc:
         raise AdapterError(f"could not run {codex_binary!r} to read the model catalog: {exc}") from exc
     try:
         returncode = completed.returncode

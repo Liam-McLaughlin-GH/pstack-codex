@@ -474,6 +474,13 @@ class CodexAgentRoleTests(unittest.TestCase):
         ):
             with self.assertRaises(adapter.AdapterError):
                 adapter.read_model_catalog("codex")
+        with mock.patch.object(
+            adapter.subprocess,
+            "run",
+            side_effect=RuntimeError("unexpected runner failure"),
+        ):
+            with self.assertRaises(adapter.AdapterError):
+                adapter.read_model_catalog("codex")
 
     def test_direct_path_failures_normalize_to_adapter_errors(self) -> None:
         invalid_path = Path("\x00pstack-invalid")
@@ -494,6 +501,19 @@ class CodexAgentRoleTests(unittest.TestCase):
                 with self.assertRaises(adapter.AdapterError) as raised:
                     call()
                 self.assertIs(type(raised.exception), adapter.AdapterError)
+        for name, call in (
+            ("parse_role_file wrong type", lambda: adapter.parse_role_file(1)),
+            ("_load_toml_table wrong type", lambda: adapter._load_toml_table(1)),
+            ("load_explicit_roles wrong type", lambda: adapter.load_explicit_roles(1)),
+            ("_relative_path wrong type", lambda: adapter._relative_path(1, Path.cwd())),
+            ("_read_catalog_file wrong type", lambda: adapter._read_catalog_file(1)),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(adapter.AdapterError) as raised:
+                    call()
+                self.assertIs(type(raised.exception), adapter.AdapterError)
+        with self.assertRaises(adapter.AdapterError):
+            adapter.resolve_role(Path.cwd(), [])
 
     def test_cli_catalog_file_failures_serialize_adapter_error(self) -> None:
         with tempfile.TemporaryDirectory(prefix="codex-role-catalog-errors-") as temporary:
