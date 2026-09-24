@@ -591,14 +591,14 @@ class G3StoreTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             store = self.make_store(Path(temporary))
             try:
-                for value in ("bad\x00brief", "bad\u2028brief"):
+                for value in ("bad\x00brief", "bad\tbrief", "bad\rbrief", "bad\u2028brief"):
                     with self.subTest(value=repr(value)), self.assertRaises(StoreError):
                         store.units_add("unit-1", "track", value)
                 store.units_add("unit-1", "track", "safe")
                 with self.assertRaises(StoreError):
                     store.units_set("unit-1", "verified", branch="bad\x00branch")
                 with self.assertRaises(StoreError):
-                    store.inbox_push("agent", "unit", "done", "bad\x00report")
+                    store.inbox_push("agent", "unit", "done", "bad\treport")
                 with self.assertRaises(StoreError):
                     store.ledger_record(1, "sha", "unit-test-verified", "evidence", "bad\x00verifier")
                 with self.assertRaises(StoreError):

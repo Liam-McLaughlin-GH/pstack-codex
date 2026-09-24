@@ -164,6 +164,14 @@ def _clean_cell(value: Any, label: str = "value") -> str:
 
 
 def _write_cell(value: Any, label: str = "value") -> str:
+    if not isinstance(value, str):
+        raise StoreError(f"{label} must be a string")
+    if any(
+        unicodedata.category(character).startswith("C")
+        or character in {"\u2028", "\u2029"}
+        for character in value
+    ):
+        raise StoreError(f"{label} contains an unsafe control")
     cleaned = _clean_cell(value, label)
     if any(
         unicodedata.category(character).startswith("C")
