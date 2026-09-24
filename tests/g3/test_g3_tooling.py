@@ -1050,6 +1050,48 @@ class G3WorktreeAndLogTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(target.read_text(encoding="utf-8"), "untouched\n")
 
+    def test_shell_log_refuses_symlink_parent_and_sanitizes_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            outside = root / "outside"
+            outside.mkdir()
+            linked = root / "linked"
+            linked.symlink_to(outside, target_is_directory=True)
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(LOG_ROOT / "log.sh"),
+                    str(linked / "audit.tsv"),
+                    "phase",
+                    "decision",
+                    "why",
+                    "evidence",
+                    "PASS",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse((outside / "audit.tsv").exists())
+
+            safe_path = root / "safe.tsv"
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(LOG_ROOT / "log.sh"),
+                    str(safe_path),
+                    "phase",
+                    "decision",
+                    "bad\x1bcontrol",
+                    "evidence",
+                    "PASS",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertNotIn("\x1b", safe_path.read_text(encoding="utf-8"))
+
     def test_log_sanitizes_controls_and_rejects_invalid_existing_shape(self) -> None:
         self.assertEqual(sanitize_cell("a\x00\x1b\u2028b"), "a   b")
         self.assertEqual(sanitize_cell(" =1"), "' =1")
