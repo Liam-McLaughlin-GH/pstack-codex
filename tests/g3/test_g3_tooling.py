@@ -599,6 +599,12 @@ class G3StoreTests(unittest.TestCase):
                     store.units_set("unit-1", "verified", branch="bad\x00branch")
                 with self.assertRaises(StoreError):
                     store.inbox_push("agent", "unit", "done", "bad\x00report")
+                with self.assertRaises(StoreError):
+                    store.ledger_record(1, "sha", "unit-test-verified", "evidence", "bad\x00verifier")
+                with self.assertRaises(StoreError):
+                    store.gate_park("gate", "bad\x00question", "options", "default")
+                with self.assertRaises(StoreError):
+                    store.standing_add("bad\x00standing")
             finally:
                 store.close()
 

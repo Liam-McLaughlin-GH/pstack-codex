@@ -185,6 +185,12 @@ def _required_line(value: Any, label: str) -> str:
     if not isinstance(value, str):
         raise StoreError(f"{label} must be a string")
     cleaned = value.replace("\n", " ").replace("\r", " ").strip()
+    if any(
+        unicodedata.category(character).startswith("C")
+        or character in {"\u2028", "\u2029"}
+        for character in cleaned
+    ):
+        raise StoreError(f"{label} contains an unsafe control")
     if not cleaned:
         raise StoreError(f"{label} must not be empty")
     return cleaned
@@ -354,7 +360,7 @@ def _read_tsv(path: Path, header: str, width: int) -> list[list[str]]:
 
 
 def _write_tsv(path: Path, header: str, rows: Sequence[Sequence[str]]) -> None:
-    body = "\n".join("\t".join(_clean_cell(cell) for cell in row) for row in rows)
+    body = "\n".join("\t".join(_write_cell(cell) for cell in row) for row in rows)
     _atomic_write(path, f"{header}\n{body}{'\n' if body else ''}")
 
 
@@ -653,7 +659,7 @@ class OrchestratorStore:
             _required_cell(sha, "SHA"),
             verdict,
             _required_cell(evidence, "evidence"),
-            _clean_cell(verifier, "verifier"),
+            _write_cell(verifier, "verifier"),
             _timestamp(self.clock),
         )
         rows = self._read_ledger()
