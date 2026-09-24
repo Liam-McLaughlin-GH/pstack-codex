@@ -1130,20 +1130,25 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
                     published_residue_name = staging_name
                     staging_name = None
                     sync_directory(parent_handle.fd)
-                    if outcome.status == "published":
+                    if outcome.status in {"published", "published_cleanup_pending"}:
                         if staging_metadata is None:
                             raise ConfigurationError("published generation has no identity")
                         for _verification in range(2):
+                            recheck_residue_name = (
+                                outcome.residue.name if outcome.residue is not None else published_residue_name
+                            )
                             outcome = _publication_state(
                                 parent_handle.fd,
                                 parent_handle.path,
                                 agents_root.name,
-                                published_residue_name,
+                                recheck_residue_name,
                                 staging_metadata,
                                 root_metadata,
                                 published_snapshot,
+                                outcome.recovery_receipt,
+                                outcome.recovery_state,
                             )
-                            if outcome.status != "published":
+                            if outcome.status not in {"published", "published_cleanup_pending"}:
                                 break
                     completed = True
                     return outcome
