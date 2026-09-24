@@ -142,6 +142,13 @@ class G3WatcherTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(UnknownProviderData):
                 read_snapshot(JsonProviderAdapter(candidate), PRContext("owner", "repo", 24))
 
+    def test_merged_provider_timestamp_is_validated(self) -> None:
+        payload = json.loads((FIXTURES / "provider-ready.json").read_text())
+        payload["pull_request"]["state"] = "MERGED"
+        payload["pull_request"]["merged_at"] = "not-a-timestamp"
+        with self.assertRaises(UnknownProviderData):
+            JsonProviderAdapter(payload).pull_request(PRContext("owner", "repo", 24))
+
     def test_queued_status_only_is_rejected_in_public_cli(self) -> None:
         from pstack_g3_helpers import watch
 
@@ -257,6 +264,27 @@ class G3WatcherTests(unittest.TestCase):
         self.assertEqual(result["kind"], "TIMEOUT")
         self.assertEqual(reader.attempts, 1)
         self.assertEqual(clock.sleeps, [1])
+
+    def test_query_failure_after_deadline_is_timeout_even_when_terminal(self) -> None:
+        context = PRContext("owner", "repo", 24)
+        for retryable, max_query_errors in ((False, 5), (True, 1)):
+            with self.subTest(retryable=retryable, max_query_errors=max_query_errors):
+                clock = DeterministicClock()
+
+                class LateFailureReader(FakeReader):
+                    def pull_request(self, context: PRContext) -> PRFacts:
+                        del context
+                        clock.elapsed = 2
+                        raise QueryFailure("provider failed", retryable=retryable)
+
+                result = run_simple(
+                    LateFailureReader(),
+                    [context],
+                    options=PollOptions(timeout=1, max_query_errors=max_query_errors),
+                    clock=clock,
+                )
+                self.assertEqual(result["kind"], "TIMEOUT")
+                self.assertEqual(result["exit_code"], 5)
 
     def test_simple_poll_does_not_read_or_return_ready_after_deadline(self) -> None:
         context = PRContext("owner", "repo", 24)
@@ -387,6 +415,54 @@ class G3WatcherTests(unittest.TestCase):
         reader = FakeReader(checks=CheckRead("recorded", (check,)))
         with self.assertRaises(UnknownProviderData):
             read_snapshot(reader, PRContext("owner", "repo", 24))
+
+    def test_reader_seams_revalidate_all_typed_records(self) -> None:
+        context = PRContext("owner", "repo", 24)
+
+        class StaticReader:
+            def __init__(self, facts: PRFacts, thread: ReviewThread, check_read: CheckRead, commit: CommitRollup) -> None:
+                self.facts = facts
+                self.thread = thread
+                self.check_read = check_read
+                self.commit = commit
+
+            def pull_request(self, context: PRContext) -> PRFacts:
+                del context
+                return self.facts
+
+            def review_threads(self, context: PRContext) -> tuple[ReviewThread, ...]:
+                del context
+                return (self.thread,)
+
+            def checks(self, context: PRContext) -> CheckRead:
+                del context
+                return self.check_read
+
+            def commit_rollups(self, context: PRContext) -> tuple[CommitRollup, ...]:
+                del context
+                return (self.commit,)
+
+        mutations = {
+            "PR state": lambda facts, thread, check_read, commit: object.__setattr__(facts, "state", "ALIEN"),
+            "review decision": lambda facts, thread, check_read, commit: object.__setattr__(facts, "review_decision", "ALIEN"),
+            "draft flag": lambda facts, thread, check_read, commit: object.__setattr__(facts, "is_draft", []),
+            "head ref oid": lambda facts, thread, check_read, commit: object.__setattr__(facts, "head_ref_oid", []),
+            "head ref name": lambda facts, thread, check_read, commit: object.__setattr__(facts, "head_ref_name", ""),
+            "base ref name": lambda facts, thread, check_read, commit: object.__setattr__(facts, "base_ref_name", []),
+            "merged timestamp": lambda facts, thread, check_read, commit: object.__setattr__(facts, "merged_at", "not-a-timestamp"),
+            "review thread": lambda facts, thread, check_read, commit: object.__setattr__(thread, "id", ""),
+            "check source": lambda facts, thread, check_read, commit: object.__setattr__(check_read, "source", []),
+            "current head oid": lambda facts, thread, check_read, commit: object.__setattr__(commit, "oid", []),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                facts = PRFacts(context)
+                thread = ReviewThread("thread-1")
+                check_read = CheckRead("recorded", (Check("passed", "ci", "SUCCESS"),))
+                commit = CommitRollup("head", "SUCCESS")
+                mutate(facts, thread, check_read, commit)
+                with self.assertRaises(UnknownProviderData):
+                    read_snapshot(StaticReader(facts, thread, check_read, commit), context)
 
     def test_queued_complete_reads_state_without_merging(self) -> None:
         contexts = [PRContext("owner", "repo", 23), PRContext("owner", "repo", 24)]
@@ -527,6 +603,59 @@ class G3StoreTests(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_store_rejects_semantically_malformed_unit_rows(self) -> None:
+        invalid_rows = (
+            "\ttrack\tpending\t\t\t\tbrief",
+            "unit\t\tpending\t\t\t\tbrief",
+            "unit\ttrack\tBOGUS\t\t\t\tbrief",
+            "unit\ttrack\tpending\tbranch\t0\tsha\tbrief",
+            "unit\ttrack\tpending\tbranch\t24\t \tbrief",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = self.make_store(root)
+            try:
+                for row in invalid_rows:
+                    with self.subTest(row=row):
+                        (root / "units.tsv").write_text(f"{UNIT_HEADER}\n{row}\n", encoding="utf-8")
+                        with self.assertRaises(StoreError):
+                            store.units_counts()
+            finally:
+                store.close()
+
+    def test_store_rejects_semantically_malformed_ledger_rows(self) -> None:
+        invalid_rows = (
+            "0\tsha\tunit-test-verified\tevidence\tverifier\t2026-01-01T00:00:00Z",
+            "24\t\tunit-test-verified\tevidence\tverifier\t2026-01-01T00:00:00Z",
+            "24\tsha\tBOGUS\tevidence\tverifier\t2026-01-01T00:00:00Z",
+            "24\tsha\tunit-test-verified\t\tverifier\t2026-01-01T00:00:00Z",
+            "24\t=sha\tunit-test-verified\tevidence\tverifier\t2026-01-01T00:00:00Z",
+            "24\tsha\tunit-test-verified\tevidence\tverifier\tbad-ts",
+            "24\tsha\tunit-test-verified\tevidence\tverifier\t2026-01-01T01:00:00+01:00",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = self.make_store(root)
+            try:
+                for row in invalid_rows:
+                    with self.subTest(row=row):
+                        (root / "ledger.tsv").write_text(f"{LEDGER_HEADER}\n{row}\n", encoding="utf-8")
+                        with self.assertRaises(StoreError):
+                            store.ledger_summary()
+            finally:
+                store.close()
+
+    def test_store_normalizes_malformed_utf8_before_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = self.make_store(root)
+            try:
+                (root / "units.tsv").write_bytes(UNIT_HEADER.encode("utf-8") + b"\nunit\ttrack\tpending\t\t\t\t\xff\n")
+                with self.assertRaises(StoreError):
+                    store.units_counts()
+            finally:
+                store.close()
+
     def test_store_root_symlink_parent_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -605,6 +734,13 @@ class G3PlanAndAuditTests(unittest.TestCase):
             with self.assertRaises(PlanInputError):
                 load_profile(root / "link" / "profile.json")
 
+    def test_profile_normalizes_malformed_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "profile.json"
+            path.write_bytes(b"{\xff")
+            with self.assertRaises(PlanInputError):
+                load_profile(path)
+
 
 class G3WorktreeAndLogTests(unittest.TestCase):
     def test_worktree_audit_reports_unknown_activity_without_fetch_or_scan(self) -> None:
@@ -642,6 +778,13 @@ class G3WorktreeAndLogTests(unittest.TestCase):
                 path.write_text(json.dumps(malformed), encoding="utf-8")
                 with self.subTest(value=value), self.assertRaises(AuditInputError):
                     load_metadata(path)
+
+    def test_metadata_normalizes_malformed_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "metadata.json"
+            path.write_bytes(b"{\xff")
+            with self.assertRaises(AuditInputError):
+                load_metadata(path)
 
     def test_metadata_hostile_enum_shapes_are_normalized(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -721,6 +864,18 @@ class G3WorktreeAndLogTests(unittest.TestCase):
             with self.assertRaises(AuditLogError):
                 append_row(invalid, "phase", "ok", "why", None, "PASS")
             self.assertFalse(invalid.exists())
+
+    def test_log_rejects_existing_row_without_terminal_newline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "audit.tsv"
+            original = (
+                "ts\tphase\tdecision\twhy\tevidence\tresult\n"
+                "2026-01-01T00:00:00Z\tp\tok\twhy\tproof\tPASS"
+            )
+            path.write_text(original, encoding="utf-8")
+            with self.assertRaises(AuditLogError):
+                append_row(path, "phase-2", "ok", "why", "proof-2", "PASS")
+            self.assertEqual(path.read_text(encoding="utf-8"), original)
 
     def test_log_rejects_raw_splitlines_controls_and_invalid_timestamps(self) -> None:
         controls = ("\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")

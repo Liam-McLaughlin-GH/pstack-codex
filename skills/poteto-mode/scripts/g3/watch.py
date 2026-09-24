@@ -93,6 +93,30 @@ def _exact_bool(value: Any, label: str) -> bool:
     return value
 
 
+def _validate_utc_timestamp(value: Any, label: str) -> None:
+    if not isinstance(value, str):
+        raise UnknownProviderData(f"{label} must be an ISO timestamp")
+    try:
+        normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+        parsed = datetime.fromisoformat(normalized)
+        offset = parsed.utcoffset()
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise UnknownProviderData(f"{label} is not an ISO timestamp") from exc
+    if parsed.tzinfo is None or offset != timedelta(0):
+        raise UnknownProviderData(f"{label} must be UTC-aware")
+
+
+def _revalidate(value: Any, label: str) -> None:
+    """Re-run a frozen record's constructor validation at a reader seam."""
+
+    try:
+        value.__post_init__()
+    except UnknownProviderData:
+        raise
+    except (AttributeError, KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise UnknownProviderData(f"{label} is invalid") from exc
+
+
 def _enum(value: Any, values: set[Any], label: str) -> Any:
     try:
         supported = value in values
@@ -178,6 +202,7 @@ class PRFacts:
     def __post_init__(self) -> None:
         if not isinstance(self.context, PRContext):
             raise UnknownProviderData("pull request context is invalid")
+        self.context.__post_init__()
         _enum(self.mergeable, MERGEABLE, "mergeable")
         _enum(self.merge_state_status, MERGE_STATES, "merge state status")
         _enum(self.review_decision, REVIEW_DECISIONS, "review decision")
@@ -191,6 +216,7 @@ class PRFacts:
         _nonempty(self.base_ref_name, "base ref name")
         if self.merged_at is not None:
             _nonempty(self.merged_at, "merged timestamp")
+            _validate_utc_timestamp(self.merged_at, "merged timestamp")
             if self.state == "OPEN":
                 raise UnknownProviderData("open pull requests cannot have merged_at")
         elif self.state == "MERGED":
@@ -461,7 +487,7 @@ class JsonProviderAdapter:
             )
         try:
             value = json.loads(fixture_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
             raise UnknownProviderData(f"provider fixture could not be read: {exc}") from exc
         return cls(_mapping(value, "provider payload"))
 
@@ -586,6 +612,7 @@ class JsonProviderAdapter:
 
 
 def _merge_assessment(facts: PRFacts, commits: Sequence[CommitRollup]) -> tuple[bool, MergeAssessment]:
+    _revalidate(facts, "pull request facts")
     _enum(facts.mergeable, MERGEABLE, "mergeable")
     _enum(facts.merge_state_status, MERGE_STATES, "merge state status")
     if not isinstance(commits, Sequence) or isinstance(commits, (str, bytes)):
@@ -593,7 +620,7 @@ def _merge_assessment(facts: PRFacts, commits: Sequence[CommitRollup]) -> tuple[
     for index, commit in enumerate(commits):
         if not isinstance(commit, CommitRollup):
             raise UnknownProviderData("commit rollups contain an invalid row")
-        _enum(commit.state, ROLLUP_STATES, f"commit rollups[{index}] state")
+        _revalidate(commit, f"commit rollups[{index}]")
     if len({commit.oid for commit in commits}) != len(commits):
         raise UnknownProviderData("commit rollups contain duplicate oids")
     matching = [commit for commit in commits if commit.oid == facts.head_ref_oid]
@@ -629,6 +656,7 @@ def read_snapshot(
     facts = read(reader.pull_request)
     if not isinstance(facts, PRFacts):
         raise UnknownProviderData("reader returned invalid pull request facts")
+    _revalidate(facts, "reader returned pull request facts")
     if facts.context != context:
         raise UnknownProviderData("reader returned pull request facts for another identity")
     _enum(facts.mergeable, MERGEABLE, "mergeable")
@@ -641,18 +669,18 @@ def read_snapshot(
     threads = read(reader.review_threads)
     if not isinstance(threads, Sequence) or isinstance(threads, (str, bytes)):
         raise UnknownProviderData("reader returned invalid review threads")
-    if any(not isinstance(thread, ReviewThread) for thread in threads):
-        raise UnknownProviderData("reader returned an invalid review thread")
+    for index, thread in enumerate(threads):
+        if not isinstance(thread, ReviewThread):
+            raise UnknownProviderData(f"reader returned an invalid review thread {index}")
+        _revalidate(thread, f"reader returned review thread {index}")
     check_read = read(reader.checks)
     if not isinstance(check_read, CheckRead):
         raise UnknownProviderData("reader returned invalid check data")
+    _revalidate(check_read, "reader returned check data")
     for index, check in enumerate(check_read.checks):
         if not isinstance(check, Check):
             raise UnknownProviderData(f"reader returned invalid check {index}")
-        _enum(check.kind, CHECK_KINDS, f"check {index} kind")
-        if not isinstance(check.reported_state, str):
-            raise UnknownProviderData(f"check {index} reported state must be a string")
-        _validate_check_state(check.kind, check.reported_state, f"check {index}")
+        _revalidate(check, f"reader returned check {index}")
     if not check_read.checks:
         raise QueryFailure("provider returned no checks", kind="checks-unavailable")
     failed = tuple(check for check in check_read.checks if check.kind == "failed")
@@ -710,6 +738,18 @@ def read_snapshot(
                 previous_success,
                 github,
             )
+    _revalidate(facts, "reader returned pull request facts")
+    if facts.context != context:
+        raise UnknownProviderData("reader returned pull request facts for another identity")
+    for index, thread in enumerate(threads):
+        _revalidate(thread, f"reader returned review thread {index}")
+    _revalidate(check_read, "reader returned check data")
+    for index, check in enumerate(check_read.checks):
+        _revalidate(check, f"reader returned check {index}")
+    if facts.state == "MERGED" or facts.merged_at is not None:
+        return PRSnapshot("merged", context, facts)
+    if facts.state == "CLOSED":
+        return PRSnapshot("closed", context, facts)
     return PRSnapshot("open", context, facts, tuple(threads), ci)
 
 
@@ -915,6 +955,8 @@ def _handle_query_failure(
     failure: QueryFailure,
     failures: int,
 ) -> tuple[dict[str, Any] | None, int]:
+    if _deadline_reached(clock, started, options):
+        return _timeout(emitter, {"kind": "status-unavailable", "failure": failure.as_dict()}), failures
     if not failure.retryable or failures >= options.max_query_errors:
         return _status_query(emitter, failure, failures), failures
     retry = query_backoff_seconds(options.interval, failures)

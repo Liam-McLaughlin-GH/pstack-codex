@@ -33,6 +33,7 @@ VERDICTS = {
     "verifier-blocked",
     "verifier-failed",
 }
+UNIT_STATES = {"pending", "verified"}
 FRONTIER_STATES = {"OPEN", "MERGED", "CLOSED"}
 STORE_FILES = ("units.tsv", "ledger.tsv", "gates.md", "preferences.md", "frontier.json")
 
@@ -193,6 +194,36 @@ def _enum(value: Any, values: set[str], label: str) -> str:
     return value
 
 
+def _stored_cell(value: Any, label: str, *, required: bool = False) -> str:
+    cleaned = _clean_cell(value, label)
+    if cleaned != value:
+        raise StoreError(f"{label} is not safely encoded")
+    if required and not cleaned.strip():
+        raise StoreError(f"{label} must not be empty")
+    return cleaned
+
+
+def _parse_positive_text(value: str, label: str) -> str:
+    if not re.fullmatch(r"[0-9]+", value):
+        raise StoreError(f"{label} must be a positive integer")
+    number = _positive(int(value), label)
+    return str(number)
+
+
+def _validate_utc_timestamp(value: Any, label: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise StoreError(f"{label} must be a UTC timestamp")
+    try:
+        normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+        parsed = datetime.fromisoformat(normalized)
+        offset = parsed.utcoffset()
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise StoreError(f"{label} must be a UTC timestamp") from exc
+    if parsed.tzinfo is None or offset != timezone.utc.utcoffset(parsed):
+        raise StoreError(f"{label} must be a UTC timestamp")
+    return value
+
+
 def parse_verdict(value: str) -> str:
     _enum(value, VERDICTS, "verdict")
     return value
@@ -272,7 +303,7 @@ def _read_required(path: Path) -> str:
         raise StoreError(f"store file is missing or unsafe: {path.name}")
     try:
         return path.read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise StoreError(f"could not read {path.name}: {exc}") from exc
 
 
@@ -514,10 +545,12 @@ class OrchestratorStore:
         if index < 0:
             raise NotFoundError(f"unit {clean_id} not found")
         old = rows[index]
+        clean_state = _required_cell(state, "state")
+        _enum(clean_state, UNIT_STATES, "state")
         row = Unit(
             old.id,
             old.track,
-            _required_cell(state, "state"),
+            clean_state,
             old.branch if branch is None else _required_cell(branch, "branch"),
             old.pr if pr is None else str(_positive(pr, "PR")),
             old.sha if sha is None else _required_cell(sha, "SHA"),
@@ -529,10 +562,24 @@ class OrchestratorStore:
 
     def _read_units(self) -> list[Unit]:
         rows = _read_tsv(self.root / "units.tsv", UNIT_HEADER, 7)
-        identities = [row[0] for row in rows]
+        parsed: list[Unit] = []
+        for index, row in enumerate(rows, 1):
+            unit_id = _stored_cell(row[0], f"units.tsv row {index} id", required=True)
+            track = _stored_cell(row[1], f"units.tsv row {index} track", required=True)
+            state = _enum(row[2], UNIT_STATES, f"units.tsv row {index} state")
+            branch = _stored_cell(row[3], f"units.tsv row {index} branch")
+            pr = _stored_cell(row[4], f"units.tsv row {index} PR")
+            if pr:
+                pr = _parse_positive_text(pr, f"units.tsv row {index} PR")
+            sha = _stored_cell(row[5], f"units.tsv row {index} SHA")
+            if sha and not sha.strip():
+                raise StoreError(f"units.tsv row {index} SHA must not be empty")
+            brief = _stored_cell(row[6], f"units.tsv row {index} brief")
+            parsed.append(Unit(unit_id, track, state, branch, pr, sha, brief))
+        identities = [row.id for row in parsed]
         if len(set(identities)) != len(identities):
             raise StoreError("units.tsv contains duplicate unit ids")
-        return [Unit(*row) for row in rows]
+        return parsed
 
     def _save_units(self, rows: Sequence[Unit]) -> None:
         _write_tsv(self.root / "units.tsv", UNIT_HEADER, [asdict(row).values() for row in rows])
@@ -590,14 +637,18 @@ class OrchestratorStore:
     def _read_ledger(self) -> list[LedgerEntry]:
         result: list[LedgerEntry] = []
         identities: set[tuple[str, str]] = set()
-        for row in _read_tsv(self.root / "ledger.tsv", LEDGER_HEADER, 6):
-            if row[2] not in VERDICTS:
-                raise StoreError(f"ledger.tsv has invalid verdict {row[2]}")
-            identity = (row[0], row[1])
+        for index, row in enumerate(_read_tsv(self.root / "ledger.tsv", LEDGER_HEADER, 6), 1):
+            pr = _parse_positive_text(_stored_cell(row[0], f"ledger.tsv row {index} PR", required=True), f"ledger.tsv row {index} PR")
+            sha = _stored_cell(row[1], f"ledger.tsv row {index} SHA", required=True)
+            verdict = _enum(row[2], VERDICTS, f"ledger.tsv row {index} verdict")
+            evidence = _stored_cell(row[3], f"ledger.tsv row {index} evidence", required=True)
+            verifier = _stored_cell(row[4], f"ledger.tsv row {index} verifier")
+            timestamp = _validate_utc_timestamp(_stored_cell(row[5], f"ledger.tsv row {index} timestamp", required=True), f"ledger.tsv row {index} timestamp")
+            identity = (pr, sha)
             if identity in identities:
                 raise StoreError("ledger.tsv contains duplicate PR and SHA identities")
             identities.add(identity)
-            result.append(LedgerEntry(*row))
+            result.append(LedgerEntry(pr, sha, verdict, evidence, verifier, timestamp))
         return result
 
     def _save_ledger(self, rows: Sequence[LedgerEntry]) -> None:
@@ -836,7 +887,11 @@ class OrchestratorStore:
         status_path = self.root / "status.md"
         before: dict[str, Any] | None = None
         if status_path.is_file() and not status_path.is_symlink():
-            match = re.search(r"<!-- orch-summary (.+) -->", status_path.read_text(encoding="utf-8"))
+            try:
+                status_text = status_path.read_text(encoding="utf-8")
+            except (OSError, UnicodeError) as exc:
+                raise StoreError(f"could not read status.md: {exc}") from exc
+            match = re.search(r"<!-- orch-summary (.+) -->", status_text)
             if match:
                 try:
                     value = json.loads(match.group(1))

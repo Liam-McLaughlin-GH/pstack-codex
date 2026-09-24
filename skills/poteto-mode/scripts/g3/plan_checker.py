@@ -147,7 +147,7 @@ def load_profile(path: str | Path) -> PlanProfile:
         raise PlanInputError(f"profile path must not contain symlinks: {profile_path}")
     try:
         value = json.loads(profile_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise PlanInputError(f"could not read profile {profile_path}: {exc}") from exc
     return PlanProfile.from_mapping(value)
 
@@ -183,7 +183,7 @@ def _relative_files(root: Path, pattern: str) -> list[Path]:
 def _lines_without_frontmatter(path: Path) -> list[tuple[int, str, bool]]:
     try:
         raw = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise PlanInputError(f"could not read plan document {path}: {exc}") from exc
     start = 0
     if raw and raw[0].strip() == "---":

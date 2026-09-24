@@ -275,7 +275,7 @@ def load_metadata(path: str | Path) -> tuple[WorktreeMetadata, ...]:
         raise AuditInputError(f"metadata must be an explicit regular file: {metadata_path}")
     try:
         payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise AuditInputError(f"could not read metadata: {exc}") from exc
     if not isinstance(payload, Mapping) or not isinstance(payload.get("worktrees"), list):
         raise AuditInputError("metadata must contain a worktrees array")

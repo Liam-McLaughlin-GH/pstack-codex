@@ -57,6 +57,8 @@ def _validate_existing(path: Path) -> None:
             raw = handle.read()
     except (OSError, UnicodeError) as exc:
         raise AuditLogError(f"could not read existing audit log: {path}: {exc}") from exc
+    if raw and not raw.endswith("\n"):
+        raise AuditLogError(f"audit log must end with a newline: {path}")
     if any(
         (unicodedata.category(character).startswith("C") and character not in {"\t", "\n"})
         or character in {"\u2028", "\u2029"}
@@ -70,7 +72,7 @@ def _validate_existing(path: Path) -> None:
         raise AuditLogError(f"audit log has an invalid header: {path}")
     for row in lines[1:]:
         if not row:
-            continue
+            raise AuditLogError(f"audit log has an empty row: {path}")
         cells = row.split("\t")
         if len(cells) != len(HEADER):
             raise AuditLogError(f"audit log has a malformed row: {path}")
