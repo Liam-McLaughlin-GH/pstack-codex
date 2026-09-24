@@ -54,6 +54,11 @@ The following seven issue-focused skills are also active Codex-native ports:
 | `recall` | Reconstructs supplied local history without scanning private transcripts. |
 | `setup-pstack` | Prepares Codex-local activation through temporary and explicit configuration. |
 
+The two portable agent roles are also included under `.codex/agents/`.
+`poteto-agent` requires the complete poteto-mode and leaf-principle skill reads.
+`Comment Sicko` keeps its exact role name, first-output line, report-only policy,
+and read-only sandbox. `.codex/config.toml` registers both roles explicitly.
+
 The port preserves the names of these workflows where possible. In Codex, invoke them as skills such as `$poteto-mode`, `$how`, `$architect`, or `$tdd`.
 
 The 23 poteto-mode playbooks are active under
@@ -83,6 +88,11 @@ These are omissions, not hidden dependencies. A future port should add each feat
 The port uses Codex skill folders with a `SKILL.md` file. It does not copy Cursor frontmatter such as `mode`, `icon`, `color`, or `reminder`.
 
 The port does not hard-code a model name. Codex model selection belongs to the Codex session or project configuration, not to this skill package.
+
+The agent adapter reads the active local model catalog before selecting a model.
+An unavailable requested model requires an explicit available fallback, and the
+result records both requested and effective models. It does not silently choose
+a replacement.
 
 The port treats delegation as a capability. `reflect` accepts a bounded Codex
 delegation manifest with reviewer and synthesizer identity when exposed. It
