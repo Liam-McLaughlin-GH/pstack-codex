@@ -12,8 +12,9 @@ from evidence. Do not implement the planned change.
    Each finding returns file pointers, conventions, entry points, and checks.
    Use a local fallback when delegation is unavailable.
 4. Write one section per PR. Include dependencies, file boundaries, data
-   shape, build steps, user-observable result, unit checks, live checks, perf
-   checks, review gates, and merge or handoff rules.
+   shape, build steps, user-observable result, acceptance evidence, unit
+   checks, live checks, perf checks, review gates, final gate, and merge or
+   handoff rules.
 5. State the execution playbook in the plan. Use Autopilot full for independent
    items with landing authorization, Autopilot stack for a reviewed chain, or
    Orchestrate for a standing program.
@@ -21,10 +22,11 @@ from evidence. Do not implement the planned change.
    enough. A live check must name its matching local surface or say BLOCKED.
    A perf block names a metric, unit, baseline, probe, and failure number.
 7. Run the available local plan checker. If it is not installed, use the
-   structural contract in
-   `tests/poteto_mode/fixtures/playbook_contracts.json`: every phase must name
-   an owner, inputs, acceptance evidence, dependencies, and a final gate.
-   Record the fixture result and fix every printed issue before handoff.
+   structural coverage fixture in
+   `tests/poteto_mode/fixtures/playbook_contracts.json`: verify that all 23
+   playbooks are present and that each listed document marker is present in
+   its playbook. Record the fixture result and fix every missing marker before
+   handoff.
 8. Stop after returning the plan path and checks. Execution starts only on an
    explicit go and still follows the side-effect gate.
 

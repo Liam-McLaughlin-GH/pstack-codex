@@ -26,6 +26,10 @@ predicate.
 7. If the run reaches a forge, deployment, external message, or deletion
    boundary, keep the operation in the fixture adapter until the user names
    the exact action.
+8. A code-changing run is not complete at a local predicate. Return the diff,
+   checks, reviewer result, and PR handoff state. Create or update a PR only
+   after the operator gives explicit authorization; otherwise stop at
+   merge-ready with the handoff recorded.
 
 Use the state shape in [the capability contract](../references/capability-boundaries.md)
 and the local audit trail from $show-me-your-work.
