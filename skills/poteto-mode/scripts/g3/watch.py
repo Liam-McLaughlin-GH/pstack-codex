@@ -48,7 +48,7 @@ class QueryFailure(RuntimeError):
         return {"kind": self.kind, "retryable": self.retryable, "detail": self.detail}
 
 
-MERGEABLE = {"MERGEABLE", "CONFLICTING", "UNKNOWN"}
+MERGEABLE = {"MERGEABLE", "CONFLICTING"}
 MERGE_STATES = {
     "BEHIND",
     "BLOCKED",
@@ -57,14 +57,20 @@ MERGE_STATES = {
     "DIRTY",
     "DRAFT",
     "HAS_HOOKS",
-    "UNKNOWN",
     "UNSTABLE",
 }
 REVIEW_DECISIONS = {None, "APPROVED", "CHANGES_REQUESTED", "REVIEW_REQUIRED"}
 PR_STATES = {"OPEN", "CLOSED", "MERGED"}
 CHECK_KINDS = {"passed", "skipped", "failed", "pending", "code-review-gate"}
-ROLLUP_STATES = {None, "ERROR", "EXPECTED", "FAILURE", "PENDING", "SUCCESS"}
+ROLLUP_STATES = {"ERROR", "EXPECTED", "FAILURE", "PENDING", "SUCCESS"}
 CHECK_SOURCES = {"gh-pr-checks", "graphql-rollup", "recorded"}
+CHECK_REPORTED_STATES = {
+    "passed": {"", "SUCCESS"},
+    "failed": {"", "FAILURE", "ERROR"},
+    "pending": {"PENDING"},
+    "skipped": {"", "SKIPPED", "SUCCESS"},
+    "code-review-gate": {"", "PENDING", "FAILURE", "ERROR", "SUCCESS"},
+}
 
 
 def _nonempty(value: Any, label: str) -> str:
@@ -95,6 +101,13 @@ def _enum(value: Any, values: set[Any], label: str) -> Any:
     if not supported:
         raise UnknownProviderData(f"{label} has unsupported value {value!r}")
     return value
+
+
+def _validate_check_state(kind: str, reported_state: str, label: str = "check") -> None:
+    if reported_state not in CHECK_REPORTED_STATES[kind]:
+        raise UnknownProviderData(
+            f"{label} reported_state contradicts kind {kind!r}"
+        )
 
 
 @dataclass(frozen=True, order=True)
@@ -133,6 +146,7 @@ class Check:
         ):
             if not isinstance(value, str):
                 raise UnknownProviderData(f"{label} must be a string")
+        _validate_check_state(self.kind, self.reported_state)
 
 
 @dataclass(frozen=True)
@@ -143,7 +157,7 @@ class CheckRead:
     def __post_init__(self) -> None:
         _enum(self.source, CHECK_SOURCES, "check source")
         if not isinstance(self.checks, tuple):
-            raise TypeError("checks must be a tuple")
+            raise UnknownProviderData("checks must be a tuple")
         if any(not isinstance(check, Check) for check in self.checks):
             raise UnknownProviderData("check read contains an invalid check")
 
@@ -206,7 +220,7 @@ class ReviewThread:
 @dataclass(frozen=True)
 class CommitRollup:
     oid: str
-    state: str | None
+    state: str
 
     def __post_init__(self) -> None:
         _nonempty(self.oid, "commit oid")
@@ -330,16 +344,25 @@ class PollOptions:
     allow_draft: bool = False
 
     def __post_init__(self) -> None:
-        if self.interval <= 0 or self.sweep_interval <= 0:
-            raise ValueError("poll intervals must be positive")
-        if not math.isfinite(self.interval) or not math.isfinite(self.sweep_interval):
-            raise ValueError("poll intervals must be finite")
-        if self.timeout < 0:
-            raise ValueError("timeout must be zero or positive")
-        if not math.isfinite(self.timeout):
-            raise ValueError("timeout must be finite")
+        for value, label, minimum, message in (
+            (self.interval, "interval", 0, "poll intervals must be positive"),
+            (self.sweep_interval, "sweep_interval", 0, "poll intervals must be positive"),
+            (self.timeout, "timeout", -1, "timeout must be zero or positive"),
+        ):
+            if type(value) not in {int, float}:
+                raise ValueError(f"{label} must be a finite number")
+            try:
+                finite = math.isfinite(value)
+            except (TypeError, OverflowError) as exc:
+                raise ValueError(f"{label} must be finite") from exc
+            if not finite:
+                raise ValueError(f"{label} must be finite")
+            if (minimum == 0 and value <= 0) or (minimum == -1 and value < 0):
+                raise ValueError(message)
         if type(self.max_query_errors) is not int or self.max_query_errors <= 0:
             raise ValueError("max_query_errors must be positive")
+        if type(self.allow_draft) is not bool:
+            raise ValueError("allow_draft must be a boolean")
 
 
 def passing_check(name: str = "ci") -> Check:
@@ -536,17 +559,6 @@ class JsonProviderAdapter:
             value = _mapping(item, f"{label}[{index}]")
             kind = value.get("kind")
             reported_state = value.get("reported_state", "")
-            expected_states = {
-                "passed": {"", "SUCCESS"},
-                "failed": {"", "FAILURE", "ERROR"},
-                "pending": {"", "PENDING"},
-                "skipped": {"", "SKIPPED", "SUCCESS"},
-                "code-review-gate": {"", "PENDING", "FAILURE", "ERROR", "SUCCESS"},
-            }
-            if kind in expected_states and reported_state not in expected_states[kind]:
-                raise UnknownProviderData(
-                    f"{label}[{index}] reported_state contradicts kind {kind!r}"
-                )
             checks.append(
                 Check(
                     kind=kind,
@@ -574,11 +586,14 @@ class JsonProviderAdapter:
 
 
 def _merge_assessment(facts: PRFacts, commits: Sequence[CommitRollup]) -> tuple[bool, MergeAssessment]:
+    _enum(facts.mergeable, MERGEABLE, "mergeable")
+    _enum(facts.merge_state_status, MERGE_STATES, "merge state status")
     if not isinstance(commits, Sequence) or isinstance(commits, (str, bytes)):
         raise UnknownProviderData("commit rollups must be an array")
-    for commit in commits:
+    for index, commit in enumerate(commits):
         if not isinstance(commit, CommitRollup):
             raise UnknownProviderData("commit rollups contain an invalid row")
+        _enum(commit.state, ROLLUP_STATES, f"commit rollups[{index}] state")
     if len({commit.oid for commit in commits}) != len(commits):
         raise UnknownProviderData("commit rollups contain duplicate oids")
     matching = [commit for commit in commits if commit.oid == facts.head_ref_oid]
@@ -604,23 +619,40 @@ def read_snapshot(
     context: PRContext,
     *,
     pending_history: Literal["include", "omit"] = "include",
+    before_read: Callable[[], None] | None = None,
 ) -> PRSnapshot:
-    facts = reader.pull_request(context)
+    def read(method: Callable[[PRContext], Any]) -> Any:
+        if before_read is not None:
+            before_read()
+        return method(context)
+
+    facts = read(reader.pull_request)
     if not isinstance(facts, PRFacts):
         raise UnknownProviderData("reader returned invalid pull request facts")
+    if facts.context != context:
+        raise UnknownProviderData("reader returned pull request facts for another identity")
+    _enum(facts.mergeable, MERGEABLE, "mergeable")
+    _enum(facts.merge_state_status, MERGE_STATES, "merge state status")
     if facts.state == "MERGED" or facts.merged_at is not None:
         return PRSnapshot("merged", context, facts)
     if facts.state == "CLOSED":
         return PRSnapshot("closed", context, facts)
 
-    threads = reader.review_threads(context)
+    threads = read(reader.review_threads)
     if not isinstance(threads, Sequence) or isinstance(threads, (str, bytes)):
         raise UnknownProviderData("reader returned invalid review threads")
     if any(not isinstance(thread, ReviewThread) for thread in threads):
         raise UnknownProviderData("reader returned an invalid review thread")
-    check_read = reader.checks(context)
+    check_read = read(reader.checks)
     if not isinstance(check_read, CheckRead):
         raise UnknownProviderData("reader returned invalid check data")
+    for index, check in enumerate(check_read.checks):
+        if not isinstance(check, Check):
+            raise UnknownProviderData(f"reader returned invalid check {index}")
+        _enum(check.kind, CHECK_KINDS, f"check {index} kind")
+        if not isinstance(check.reported_state, str):
+            raise UnknownProviderData(f"check {index} reported state must be a string")
+        _validate_check_state(check.kind, check.reported_state, f"check {index}")
     if not check_read.checks:
         raise QueryFailure("provider returned no checks", kind="checks-unavailable")
     failed = tuple(check for check in check_read.checks if check.kind == "failed")
@@ -636,7 +668,7 @@ def read_snapshot(
             None,
         )
     else:
-        commits = reader.commit_rollups(context)
+        commits = read(reader.commit_rollups)
         previous_success, github = _merge_assessment(facts, commits)
         if failed:
             ci = CIState(
@@ -847,6 +879,19 @@ def _timeout(emitter: _Emitter, reason: dict[str, Any]) -> dict[str, Any]:
     return emitter.stamp({"kind": "TIMEOUT", "reason": reason}, terminal=True, exit_code=5)
 
 
+class _DeadlineReached(Exception):
+    """Internal control flow used to stop before a provider read."""
+
+
+def _deadline_reached(clock: WatchClock, started: float, options: PollOptions) -> bool:
+    return options.timeout > 0 and clock.now() - started >= options.timeout
+
+
+def _guard_deadline(clock: WatchClock, started: float, options: PollOptions) -> None:
+    if _deadline_reached(clock, started, options):
+        raise _DeadlineReached
+
+
 def _status_query(emitter: _Emitter, failure: QueryFailure, failures: int) -> dict[str, Any]:
     return emitter.stamp(
         {
@@ -914,15 +959,28 @@ def run_simple(
     started = clock.now()
     failures = 0
     while True:
+        if _deadline_reached(clock, started, options):
+            return _timeout(emitter, {"kind": "deadline"})
         try:
-            rows = tuple(read_snapshot(reader, context) for context in contexts)
+            rows = tuple(
+                read_snapshot(
+                    reader,
+                    context,
+                    before_read=lambda: _guard_deadline(clock, started, options),
+                )
+                for context in contexts
+            )
             failures = 0
+        except _DeadlineReached:
+            return _timeout(emitter, {"kind": "deadline"})
         except QueryFailure as failure:
             failures += 1
             terminal, _ = _handle_query_failure(emitter, clock, options, started, failure, failures)
             if terminal is not None:
                 return terminal
             continue
+        if _deadline_reached(clock, started, options):
+            return _timeout(emitter, {"kind": "deadline"})
         if status_only:
             return emitter.stamp(
                 {"kind": "STATUS", "reason": "status-only", "rows": [_snapshot(row) for row in rows]},
@@ -971,6 +1029,8 @@ def run_simple(
         if options.timeout > 0:
             remaining = min(remaining, max(0.0, options.timeout - (clock.now() - started)))
         clock.sleep(remaining)
+        if _deadline_reached(clock, started, options):
+            return _timeout(emitter, reason)
 
 
 def run_queued(
@@ -985,11 +1045,18 @@ def run_queued(
 
     if not contexts:
         raise ValueError("queue cannot be empty")
+    queue_keys = []
+    for context in contexts:
+        if not isinstance(context, PRContext):
+            raise ValueError("queue contains an invalid pull request identity")
+        queue_keys.append((context.owner, context.repo, context.number))
+    if len(set(queue_keys)) != len(queue_keys):
+        raise ValueError("queue contains duplicate pull request identities")
     options = options or PollOptions()
     clock = clock or SystemClock()
     emitter = _Emitter(clock, "queued-stack", emit)
     started = clock.now()
-    snapshots: dict[int, PRSnapshot] = {}
+    snapshots: dict[PRContext, PRSnapshot] = {}
     sweep_index = 0
     next_sweep_at = started
     last_frontier: PRContext | None = None
@@ -998,9 +1065,15 @@ def run_queued(
     emitter.progress({"kind": "QUEUE", "queue": [_context(context) for context in contexts]})
 
     while True:
-        active_contexts = tuple(context for context in contexts if snapshots.get(context.number, None) is None or snapshots[context.number].kind != "merged")
+        if _deadline_reached(clock, started, options):
+            return _timeout(emitter, {"kind": "queued-stack", "reason": "deadline"})
+        active_contexts = tuple(
+            context
+            for context in contexts
+            if snapshots.get(context) is None or snapshots[context].kind != "merged"
+        )
         if not active_contexts:
-            merged = [snapshots[context.number] for context in contexts if snapshots[context.number].kind == "merged"]
+            merged = [snapshots[context] for context in contexts if snapshots[context].kind == "merged"]
             return emitter.stamp(
                 {"kind": "COMPLETE", "queue": [_context(context) for context in contexts], "merged": [_snapshot(row) for row in merged]},
                 terminal=True,
@@ -1010,19 +1083,29 @@ def run_queued(
         if not snapshots or clock.now() >= next_sweep_at:
             while sweep_index < len(contexts):
                 context = contexts[sweep_index]
-                if snapshots.get(context.number, None) is not None and snapshots[context.number].kind == "merged":
+                if snapshots.get(context) is not None and snapshots[context].kind == "merged":
                     sweep_index += 1
                     continue
                 try:
-                    snapshot = read_snapshot(reader, context, pending_history="omit")
+                    snapshot = read_snapshot(
+                        reader,
+                        context,
+                        pending_history="omit",
+                        before_read=lambda: _guard_deadline(clock, started, options),
+                    )
+                    _guard_deadline(clock, started, options)
                     failures = 0
+                except _DeadlineReached:
+                    return _timeout(emitter, {"kind": "queued-stack", "reason": "deadline"})
                 except QueryFailure as failure:
                     failures += 1
                     terminal, _ = _handle_query_failure(emitter, clock, options, started, failure, failures)
                     if terminal is not None:
                         return terminal
                     continue
-                snapshots[context.number] = snapshot
+                if snapshot.context != context:
+                    raise UnknownProviderData("queue reader returned another pull request identity")
+                snapshots[context] = snapshot
                 sweep_index += 1
             sweep_index = 0
             next_sweep_at = clock.now() + options.sweep_interval
@@ -1030,22 +1113,33 @@ def run_queued(
                 {
                     "kind": "STATUS",
                     "reason": "whole-stack-sweep",
-                    "rows": [_snapshot(snapshots[context.number]) for context in contexts],
+                    "rows": [_snapshot(snapshots[context]) for context in contexts],
                 }
             )
         else:
             frontier_context = next(context for context in active_contexts)
             try:
-                snapshots[frontier_context.number] = read_snapshot(reader, frontier_context, pending_history="omit")
+                snapshot = read_snapshot(
+                    reader,
+                    frontier_context,
+                    pending_history="omit",
+                    before_read=lambda: _guard_deadline(clock, started, options),
+                )
+                _guard_deadline(clock, started, options)
                 failures = 0
+            except _DeadlineReached:
+                return _timeout(emitter, {"kind": "queued-stack", "reason": "deadline"})
             except QueryFailure as failure:
                 failures += 1
                 terminal, _ = _handle_query_failure(emitter, clock, options, started, failure, failures)
                 if terminal is not None:
                     return terminal
                 continue
+            if snapshot.context != frontier_context:
+                raise UnknownProviderData("queue reader returned another pull request identity")
+            snapshots[frontier_context] = snapshot
 
-        active_rows = tuple(snapshots[context.number] for context in contexts if snapshots[context.number].kind != "merged")
+        active_rows = tuple(snapshots[context] for context in contexts if snapshots[context].kind != "merged")
         if not active_rows:
             continue
         decision = select_stack_decision(active_rows, allow_draft=options.allow_draft)
@@ -1056,7 +1150,7 @@ def run_queued(
                 exit_code=_blocker_code(decision.blocker),
             )
         frontier = active_rows[0].context
-        if last_frontier is not None and frontier.number != last_frontier.number:
+        if last_frontier is not None and frontier != last_frontier:
             emitter.progress(
                 {
                     "kind": "ADVANCE",
@@ -1079,10 +1173,10 @@ def run_queued(
                 "kind": "pending-checks",
                 "pending": [asdict(check) for check in decision.pending],
             }
-            wait_key = ("pending", frontier.number, len(decision.pending))
+            wait_key = ("pending", frontier.owner, frontier.repo, frontier.number, len(decision.pending))
         else:
             reason = {"kind": "merge-queue", "unmerged_count": len(active_rows)}
-            wait_key = ("queue", frontier.number, len(active_rows))
+            wait_key = ("queue", frontier.owner, frontier.repo, frontier.number, len(active_rows))
         if wait_key != last_wait_key:
             emitter.progress({"kind": "WAITING", "frontier": _context(frontier), "reason": reason})
             last_wait_key = wait_key
@@ -1090,6 +1184,11 @@ def run_queued(
         if options.timeout > 0:
             remaining = min(remaining, max(0.0, options.timeout - (clock.now() - started)))
         clock.sleep(remaining)
+        if _deadline_reached(clock, started, options):
+            return _timeout(
+                emitter,
+                {"kind": "queued-stack", "frontier": _context(frontier), "unmerged_count": len(active_rows)},
+            )
 
 
 def _json_default(value: Any) -> Any:

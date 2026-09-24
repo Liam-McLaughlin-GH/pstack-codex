@@ -37,6 +37,16 @@ def _text(value: Any, label: str, *, empty: bool = False) -> str:
     return value
 
 
+def _enum(value: Any, values: set[str], label: str) -> str:
+    try:
+        supported = value in values
+    except TypeError:
+        supported = False
+    if not supported:
+        raise AuditInputError(f"{label} is unsupported")
+    return value
+
+
 def _parse_time(value: Any, label: str) -> datetime:
     if not isinstance(value, str):
         raise AuditInputError(f"{label} must be an ISO timestamp")
@@ -62,8 +72,7 @@ class Activity:
         if not isinstance(value, Mapping):
             raise AuditInputError(f"{label} must be an object or null")
         status = value.get("status", "unknown")
-        if status not in {"known", "unknown"}:
-            raise AuditInputError(f"{label}.status must be known or unknown")
+        _enum(status, {"known", "unknown"}, f"{label}.status")
         source = value.get("source")
         if source is not None:
             source = _text(source, f"{label}.source")
@@ -97,8 +106,7 @@ class WorktreeMetadata:
         if head is not None:
             head = _text(head, f"{label}.head")
         dirty = value.get("dirty", "unknown")
-        if dirty not in {"clean", "wip", "scratch", "unknown"}:
-            raise AuditInputError(f"{label}.dirty is unsupported")
+        _enum(dirty, {"clean", "wip", "scratch", "unknown"}, f"{label}.dirty")
         remote = value.get("remote")
         if remote is not None:
             remote = _text(remote, f"{label}.remote")
@@ -109,8 +117,9 @@ class WorktreeMetadata:
         elif isinstance(pr_value, Mapping):
             number = pr_value.get("number")
             state = pr_value.get("state")
-            if type(number) is not int or number <= 0 or state not in {"OPEN", "MERGED", "CLOSED"}:
+            if type(number) is not int or number <= 0:
                 raise AuditInputError(f"{label}.pr is malformed")
+            _enum(state, {"OPEN", "MERGED", "CLOSED"}, f"{label}.pr.state")
             pr = f"#{number}/{state}"
         else:
             pr = _text(pr_value, f"{label}.pr")
@@ -247,6 +256,11 @@ def audit_worktrees(
 
     if recent_days < 0:
         raise AuditInputError("recent_days must be zero or positive")
+    if any(not isinstance(item, WorktreeMetadata) for item in worktrees):
+        raise AuditInputError("worktrees must contain metadata objects")
+    paths = [item.path for item in worktrees]
+    if len(set(paths)) != len(paths):
+        raise AuditInputError("metadata contains duplicate worktree paths")
     current = _as_of(as_of)
     selected = [item for item in worktrees if include_main or not item.is_main]
     rows = tuple(sorted((_row(item, current, recent_days) for item in selected), key=lambda row: row.path))
@@ -266,10 +280,15 @@ def load_metadata(path: str | Path) -> tuple[WorktreeMetadata, ...]:
     if not isinstance(payload, Mapping) or not isinstance(payload.get("worktrees"), list):
         raise AuditInputError("metadata must contain a worktrees array")
     main_path = payload.get("main_worktree")
+    if main_path is not None:
+        main_path = _text(main_path, "main_worktree")
     result: list[WorktreeMetadata] = []
     for index, value in enumerate(payload["worktrees"]):
         is_main = main_path is not None and isinstance(value, Mapping) and value.get("path") == main_path
         result.append(WorktreeMetadata.from_mapping(value, is_main=is_main, label=f"worktrees[{index}]"))
+    paths = [item.path for item in result]
+    if len(set(paths)) != len(paths):
+        raise AuditInputError("metadata contains duplicate worktree paths")
     return tuple(result)
 
 

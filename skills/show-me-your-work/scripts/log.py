@@ -6,7 +6,7 @@ import argparse
 import os
 import tempfile
 import unicodedata
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -40,11 +40,32 @@ def sanitize_cell(value: str) -> str:
     return cleaned
 
 
+def _validate_timestamp(value: str, path: Path) -> None:
+    try:
+        normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+        parsed = datetime.fromisoformat(normalized)
+        offset = parsed.utcoffset()
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise AuditLogError(f"audit log has an invalid UTC timestamp: {path}") from exc
+    if parsed.tzinfo is None or offset != timedelta(0):
+        raise AuditLogError(f"audit log timestamp must be UTC-aware: {path}")
+
+
 def _validate_existing(path: Path) -> None:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError as exc:
+        with path.open("r", encoding="utf-8", newline="") as handle:
+            raw = handle.read()
+    except (OSError, UnicodeError) as exc:
         raise AuditLogError(f"could not read existing audit log: {path}: {exc}") from exc
+    if any(
+        (unicodedata.category(character).startswith("C") and character not in {"\t", "\n"})
+        or character in {"\u2028", "\u2029"}
+        for character in raw
+    ):
+        raise AuditLogError(f"audit log contains an unsafe raw control: {path}")
+    lines = raw.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
     if not lines or lines[0].split("\t") != list(HEADER):
         raise AuditLogError(f"audit log has an invalid header: {path}")
     for row in lines[1:]:
@@ -53,15 +74,23 @@ def _validate_existing(path: Path) -> None:
         cells = row.split("\t")
         if len(cells) != len(HEADER):
             raise AuditLogError(f"audit log has a malformed row: {path}")
+        _validate_timestamp(cells[0], path)
         if any(sanitize_cell(cell) != cell for cell in cells):
             raise AuditLogError(f"audit log has an unsafe row: {path}")
 
 
 def _timestamp(clock: Callable[[], datetime] | None) -> str:
-    value = (clock or (lambda: datetime.now(timezone.utc)))()
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    try:
+        value = (clock or (lambda: datetime.now(timezone.utc)))()
+        if not isinstance(value, datetime):
+            raise AuditLogError("audit clock must return a datetime")
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    except AuditLogError:
+        raise
+    except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+        raise AuditLogError("audit clock did not return a usable datetime") from exc
 
 
 def _evidence_value(evidence: str | os.PathLike[str] | Sequence[str | os.PathLike[str]]) -> str:
@@ -70,7 +99,7 @@ def _evidence_value(evidence: str | os.PathLike[str] | Sequence[str | os.PathLik
             value = os.fspath(evidence)
         else:
             value = ";".join(os.fspath(item) for item in evidence)
-    except (TypeError, OSError) as exc:
+    except (TypeError, OSError, ValueError) as exc:
         raise AuditLogError("evidence path must be a path or path sequence") from exc
     if not value:
         raise AuditLogError("evidence path must not be empty")

@@ -33,9 +33,11 @@ PACKAGE_SPEC.loader.exec_module(PACKAGE)
 
 from pstack_g3_helpers.orch import (  # noqa: E402
     FrontierEntry,
+    LEDGER_HEADER,
     OrchestratorStore,
     StaticStackReader,
     StoreError,
+    UNIT_HEADER,
     UnsupportedSideEffect,
 )
 from pstack_g3_helpers.plan_checker import (  # noqa: E402
@@ -47,6 +49,7 @@ from pstack_g3_helpers.plan_checker import (  # noqa: E402
     load_profile,
 )
 from pstack_g3_helpers.watch import (  # noqa: E402
+    Check,
     CheckRead,
     CommitRollup,
     DeterministicClock,
@@ -104,6 +107,14 @@ class G3WatcherTests(unittest.TestCase):
         with self.assertRaises(UnknownProviderData):
             reader.pull_request(PRContext("owner", "repo", 24))
 
+    def test_unknown_merge_conditions_fail_closed(self) -> None:
+        context = PRContext("owner", "repo", 24)
+        for field in ("mergeable", "merge_state_status"):
+            payload = json.loads((FIXTURES / "provider-ready.json").read_text())
+            payload["pull_request"][field] = "UNKNOWN"
+            with self.subTest(field=field), self.assertRaises(UnknownProviderData):
+                read_snapshot(JsonProviderAdapter(payload), context)
+
     def test_provider_fixture_symlink_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             link = Path(temporary) / "provider.json"
@@ -154,6 +165,21 @@ class G3WatcherTests(unittest.TestCase):
         self.assertEqual(result, 2)
         rendered = json.loads(output.getvalue())
         self.assertEqual(rendered["kind"], "ERROR")
+        self.assertEqual(rendered["error"], "UnknownProviderData")
+
+    def test_public_cli_normalizes_hostile_provider_enum_shapes(self) -> None:
+        from pstack_g3_helpers import watch
+
+        payload = json.loads((FIXTURES / "provider-ready.json").read_text())
+        payload["checks"]["checks"][0]["kind"] = []
+        with tempfile.TemporaryDirectory() as temporary:
+            fixture = Path(temporary) / "hostile.json"
+            fixture.write_text(json.dumps(payload), encoding="utf-8")
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = watch.main(["--fixture", str(fixture)])
+        self.assertEqual(result, 2)
+        rendered = json.loads(output.getvalue())
         self.assertEqual(rendered["error"], "UnknownProviderData")
 
     def test_recorded_fast_path_falls_back_to_rollup_pages(self) -> None:
@@ -232,10 +258,100 @@ class G3WatcherTests(unittest.TestCase):
         self.assertEqual(reader.attempts, 1)
         self.assertEqual(clock.sleeps, [1])
 
+    def test_simple_poll_does_not_read_or_return_ready_after_deadline(self) -> None:
+        context = PRContext("owner", "repo", 24)
+
+        class ChangingReader(FakeReader):
+            def __init__(self) -> None:
+                super().__init__(commits=(CommitRollup("head", "SUCCESS"),))
+                self.check_reads = 0
+
+            def checks(self, context: PRContext) -> CheckRead:
+                self.check_reads += 1
+                return CheckRead(
+                    "recorded",
+                    (pending_check("ci"),)
+                    if self.check_reads == 1
+                    else (Check("passed", "ci", "SUCCESS"),),
+                )
+
+        reader = ChangingReader()
+        result = run_simple(
+            reader,
+            [context],
+            options=PollOptions(interval=10, timeout=1),
+            clock=DeterministicClock(),
+        )
+        self.assertEqual(result["kind"], "TIMEOUT")
+        self.assertEqual(reader.check_reads, 1)
+
+    def test_queued_poll_does_not_read_or_complete_after_deadline(self) -> None:
+        context = PRContext("owner", "repo", 24)
+
+        class ChangingReader(FakeReader):
+            def __init__(self) -> None:
+                super().__init__()
+                self.check_reads = 0
+
+            def checks(self, context: PRContext) -> CheckRead:
+                self.check_reads += 1
+                return CheckRead(
+                    "recorded",
+                    (pending_check("ci"),)
+                    if self.check_reads == 1
+                    else (Check("passed", "ci", "SUCCESS"),),
+                )
+
+        reader = ChangingReader()
+        result = run_queued(
+            reader,
+            [context],
+            options=PollOptions(interval=10, timeout=1),
+            clock=DeterministicClock(),
+        )
+        self.assertEqual(result["kind"], "TIMEOUT")
+        self.assertEqual(reader.check_reads, 1)
+
+    def test_queued_rejects_duplicate_identity_and_preserves_full_keys(self) -> None:
+        duplicate = PRContext("owner", "repo", 24)
+        with self.assertRaises(ValueError):
+            run_queued(FakeReader(), [duplicate, duplicate], clock=DeterministicClock())
+        first = PRContext("first", "repo", 24)
+        second = PRContext("second", "repo", 24)
+        reader = FakeReader(
+            facts={
+                24: PRFacts(first, state="MERGED", merged_at="2026-01-01T00:00:00Z"),
+            }
+        )
+        result = run_queued(reader, [first, second], clock=DeterministicClock())
+        self.assertEqual(result["kind"], "COMPLETE")
+        self.assertEqual(
+            [(row["owner"], row["repo"], row["number"]) for row in result["queue"]],
+            [("first", "repo", 24), ("second", "repo", 24)],
+        )
+        self.assertEqual(len(result["merged"]), 2)
+
+    def test_reader_identity_collision_is_refused(self) -> None:
+        requested = PRContext("owner", "repo", 24)
+        other = PRContext("other", "repo", 24)
+
+        class CollisionReader(FakeReader):
+            def pull_request(self, context: PRContext) -> PRFacts:
+                del context
+                return PRFacts(other)
+
+        with self.assertRaises(UnknownProviderData):
+            run_simple(CollisionReader(), [requested], clock=DeterministicClock())
+
     def test_max_query_errors_requires_a_finite_positive_integer(self) -> None:
         for value in (0, -1, True, 1.0, float("nan"), float("inf")):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 PollOptions(max_query_errors=value)
+
+    def test_poll_durations_reject_booleans(self) -> None:
+        for field in ("interval", "sweep_interval", "timeout"):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                PollOptions(**{field: True})
 
     def test_provider_rollups_and_check_states_fail_closed(self) -> None:
         payload = json.loads((FIXTURES / "provider-ready.json").read_text())
@@ -253,6 +369,24 @@ class G3WatcherTests(unittest.TestCase):
         payload["commit_rollups"].append({"oid": "head", "state": "FAILURE"})
         with self.assertRaises(UnknownProviderData):
             read_snapshot(JsonProviderAdapter(payload), PRContext("owner", "repo", 24))
+
+    def test_non_head_rollup_without_state_is_rejected(self) -> None:
+        payload = json.loads((FIXTURES / "provider-ready.json").read_text())
+        payload["commit_rollups"] = [
+            {"oid": "head", "state": "SUCCESS"},
+            {"oid": "old"},
+        ]
+        with self.assertRaises(UnknownProviderData):
+            read_snapshot(JsonProviderAdapter(payload), PRContext("owner", "repo", 24))
+
+    def test_check_state_invariant_is_shared_by_reader_seams(self) -> None:
+        with self.assertRaises(UnknownProviderData):
+            Check("passed", "ci", "FAILURE")
+        check = Check("passed", "ci", "SUCCESS")
+        object.__setattr__(check, "reported_state", "FAILURE")
+        reader = FakeReader(checks=CheckRead("recorded", (check,)))
+        with self.assertRaises(UnknownProviderData):
+            read_snapshot(reader, PRContext("owner", "repo", 24))
 
     def test_queued_complete_reads_state_without_merging(self) -> None:
         contexts = [PRContext("owner", "repo", 23), PRContext("owner", "repo", 24)]
@@ -356,6 +490,43 @@ class G3StoreTests(unittest.TestCase):
                 store.init()
             store.close()
 
+    def test_store_init_rejects_every_preexisting_file_symlink_and_releases_lock(self) -> None:
+        for filename in ("units.tsv", "ledger.tsv", "gates.md", "preferences.md", "frontier.json"):
+            with self.subTest(filename=filename), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary) / "store"
+                root.mkdir()
+                outside = Path(temporary) / "outside"
+                outside.write_text("outside\n")
+                (root / filename).symlink_to(outside)
+                store = OrchestratorStore(root, pid=4100, pid_alive=lambda pid: False)
+                with self.assertRaises(StoreError):
+                    store.init()
+                self.assertFalse(store._locked)
+                self.assertFalse((root / ".orch.lock").exists())
+                store.close()
+
+    def test_store_rejects_duplicate_unit_and_ledger_identities(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = self.make_store(root)
+            try:
+                (root / "units.tsv").write_text(
+                    f"{UNIT_HEADER}\nunit\ttrack\tpending\t\t\t\tbrief\n"
+                    "unit\tother\tverified\t\t\t\tother\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(StoreError):
+                    store.units_counts()
+                (root / "ledger.tsv").write_text(
+                    f"{LEDGER_HEADER}\n24\tsha\tunit-test-verified\tevidence\toffline\t2026-01-01T00:00:00Z\n"
+                    "24\tsha\tunit-test-verified\tevidence-2\toffline\t2026-01-02T00:00:00Z\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(StoreError):
+                    store.ledger_summary()
+            finally:
+                store.close()
+
     def test_store_root_symlink_parent_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -456,6 +627,35 @@ class G3WorktreeAndLogTests(unittest.TestCase):
             with self.assertRaises(AuditInputError):
                 load_metadata(root / "link" / "worktrees.json")
 
+    def test_metadata_rejects_duplicate_paths_and_invalid_main_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "metadata.json"
+            duplicate = {
+                "main_worktree": "/repo",
+                "worktrees": [{"path": "/repo"}, {"path": "/repo"}],
+            }
+            path.write_text(json.dumps(duplicate), encoding="utf-8")
+            with self.assertRaises(AuditInputError):
+                load_metadata(path)
+            for value in ([], {"path": "/repo"}, 24):
+                malformed = {"main_worktree": value, "worktrees": []}
+                path.write_text(json.dumps(malformed), encoding="utf-8")
+                with self.subTest(value=value), self.assertRaises(AuditInputError):
+                    load_metadata(path)
+
+    def test_metadata_hostile_enum_shapes_are_normalized(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "metadata.json"
+            payload = {"worktrees": [{"path": "/repo", "dirty": []}]}
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(AuditInputError):
+                load_metadata(path)
+            payload["worktrees"][0]["dirty"] = "clean"
+            payload["worktrees"][0]["activity"] = {"status": []}
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaises(AuditInputError):
+                load_metadata(path)
+
     def test_log_appends_utc_rows_and_sanitizes_controls_and_formulas(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / ".audit" / "g3.tsv"
@@ -521,6 +721,45 @@ class G3WorktreeAndLogTests(unittest.TestCase):
             with self.assertRaises(AuditLogError):
                 append_row(invalid, "phase", "ok", "why", None, "PASS")
             self.assertFalse(invalid.exists())
+
+    def test_log_rejects_raw_splitlines_controls_and_invalid_timestamps(self) -> None:
+        controls = ("\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for control in controls:
+                path = root / f"control-{ord(control):x}.tsv"
+                path.write_text(
+                    "ts\tphase\tdecision\twhy\tevidence\tresult\n"
+                    f"2026-01-01T00:00:00Z\tp\tok\twhy\tproof\tPASS{control}\n",
+                    encoding="utf-8",
+                )
+                with self.subTest(control=repr(control)), self.assertRaises(AuditLogError):
+                    append_row(path, "phase", "ok", "why", "proof", "PASS")
+            for timestamp in ("not-a-timestamp", "2026-01-01T00:00:00", "2026-01-01T01:00:00+01:00"):
+                path = root / f"timestamp-{len(timestamp)}.tsv"
+                path.write_text(
+                    "ts\tphase\tdecision\twhy\tevidence\tresult\n"
+                    f"{timestamp}\tp\tok\twhy\tproof\tPASS\n",
+                    encoding="utf-8",
+                )
+                with self.subTest(timestamp=timestamp), self.assertRaises(AuditLogError):
+                    append_row(path, "phase", "ok", "why", "proof", "PASS")
+
+    def test_log_normalizes_hostile_evidence_and_clock_values(self) -> None:
+        class BadPath:
+            def __fspath__(self) -> str:
+                raise ValueError("path conversion failed")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            invalid = root / "invalid.tsv"
+            with self.assertRaises(AuditLogError):
+                append_row(invalid, "phase", "ok", "why", BadPath(), "PASS")
+            self.assertFalse(invalid.exists())
+            for clock in (lambda: "not-a-datetime", lambda: (_ for _ in ()).throw(ValueError("clock failed"))):
+                path = root / f"clock-{len(list(root.iterdir()))}.tsv"
+                with self.subTest(clock=repr(clock)), self.assertRaises(AuditLogError):
+                    append_row(path, "phase", "ok", "why", "proof", "PASS", clock=clock)
 
 
 if __name__ == "__main__":

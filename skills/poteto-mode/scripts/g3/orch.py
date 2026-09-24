@@ -34,6 +34,7 @@ VERDICTS = {
     "verifier-failed",
 }
 FRONTIER_STATES = {"OPEN", "MERGED", "CLOSED"}
+STORE_FILES = ("units.tsv", "ledger.tsv", "gates.md", "preferences.md", "frontier.json")
 
 
 class StoreError(RuntimeError):
@@ -112,8 +113,7 @@ class FrontierEntry:
             raise StoreError("frontier PR must be a positive integer")
         _required_line(self.branches, "frontier branch")
         _required_line(self.sha, "frontier SHA")
-        if self.state not in FRONTIER_STATES:
-            raise StoreError(f"frontier state is unsupported: {self.state!r}")
+        _enum(self.state, FRONTIER_STATES, "frontier state")
 
 
 @dataclass(frozen=True)
@@ -183,11 +183,18 @@ def _positive(value: Any, label: str) -> int:
     return value
 
 
+def _enum(value: Any, values: set[str], label: str) -> str:
+    try:
+        supported = value in values
+    except TypeError:
+        supported = False
+    if not supported:
+        raise StoreError(f"{label} is unsupported: {value!r}")
+    return value
+
+
 def parse_verdict(value: str) -> str:
-    if value not in VERDICTS:
-        raise StoreError(
-            "verdict must be live-ui-verified, unit-test-verified, type-check-only, verifier-blocked, or verifier-failed"
-        )
+    _enum(value, VERDICTS, "verdict")
     return value
 
 
@@ -244,11 +251,17 @@ def _atomic_write(path: Path, text: str) -> None:
 
 
 def _write_if_missing(path: Path, text: str) -> None:
+    if path.is_symlink():
+        raise StoreError(f"store file must not be a symlink: {path.name}")
+    if path.exists() and not path.is_file():
+        raise StoreError(f"store file must be a regular file: {path.name}")
     if path.exists():
         return
     try:
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     except FileExistsError:
+        if path.is_symlink() or not path.is_file():
+            raise StoreError(f"store file must be a regular file: {path.name}")
         return
     with os.fdopen(descriptor, "w", encoding="utf-8", newline="") as handle:
         handle.write(text)
@@ -356,7 +369,11 @@ class OrchestratorStore:
     @property
     def initialized(self) -> bool:
         inbox = self.root / "inbox"
-        return (self.root / "units.tsv").is_file() and inbox.is_dir() and not inbox.is_symlink()
+        return (
+            all((self.root / name).is_file() and not (self.root / name).is_symlink() for name in STORE_FILES)
+            and inbox.is_dir()
+            and not inbox.is_symlink()
+        )
 
     def _safe_inbox(self) -> Path:
         inbox = self.root / "inbox"
@@ -437,17 +454,25 @@ class OrchestratorStore:
         self._ensure_open()
         self.root.mkdir(parents=True, exist_ok=True)
         self._acquire()
-        inbox = self.root / "inbox"
-        if inbox.is_symlink() or (inbox.exists() and not inbox.is_dir()):
-            self._release()
-            raise StoreError("inbox is missing or unsafe")
-        _write_if_missing(self.root / "units.tsv", f"{UNIT_HEADER}\n")
-        _write_if_missing(self.root / "ledger.tsv", f"{LEDGER_HEADER}\n")
-        inbox.mkdir(exist_ok=True)
-        _write_if_missing(self.root / "gates.md", "")
-        _write_if_missing(self.root / "preferences.md", "")
-        _write_if_missing(self.root / "frontier.json", "{}\n")
-        return {"store": str(self.root)}
+        try:
+            inbox = self.root / "inbox"
+            if inbox.is_symlink() or (inbox.exists() and not inbox.is_dir()):
+                raise StoreError("inbox is missing or unsafe")
+            for name in STORE_FILES:
+                path = self.root / name
+                if path.is_symlink() or (path.exists() and not path.is_file()):
+                    raise StoreError(f"store file must be a regular non-symlink file: {name}")
+            _write_if_missing(self.root / "units.tsv", f"{UNIT_HEADER}\n")
+            _write_if_missing(self.root / "ledger.tsv", f"{LEDGER_HEADER}\n")
+            inbox.mkdir(exist_ok=True)
+            _write_if_missing(self.root / "gates.md", "")
+            _write_if_missing(self.root / "preferences.md", "")
+            _write_if_missing(self.root / "frontier.json", "{}\n")
+            return {"store": str(self.root)}
+        except Exception:
+            if self._locked:
+                self._release()
+            raise
 
     def close(self) -> None:
         if self._closed:
@@ -503,7 +528,11 @@ class OrchestratorStore:
         return row
 
     def _read_units(self) -> list[Unit]:
-        return [Unit(*row) for row in _read_tsv(self.root / "units.tsv", UNIT_HEADER, 7)]
+        rows = _read_tsv(self.root / "units.tsv", UNIT_HEADER, 7)
+        identities = [row[0] for row in rows]
+        if len(set(identities)) != len(identities):
+            raise StoreError("units.tsv contains duplicate unit ids")
+        return [Unit(*row) for row in rows]
 
     def _save_units(self, rows: Sequence[Unit]) -> None:
         _write_tsv(self.root / "units.tsv", UNIT_HEADER, [asdict(row).values() for row in rows])
@@ -560,9 +589,14 @@ class OrchestratorStore:
 
     def _read_ledger(self) -> list[LedgerEntry]:
         result: list[LedgerEntry] = []
+        identities: set[tuple[str, str]] = set()
         for row in _read_tsv(self.root / "ledger.tsv", LEDGER_HEADER, 6):
             if row[2] not in VERDICTS:
                 raise StoreError(f"ledger.tsv has invalid verdict {row[2]}")
+            identity = (row[0], row[1])
+            if identity in identities:
+                raise StoreError("ledger.tsv contains duplicate PR and SHA identities")
+            identities.add(identity)
             result.append(LedgerEntry(*row))
         return result
 
