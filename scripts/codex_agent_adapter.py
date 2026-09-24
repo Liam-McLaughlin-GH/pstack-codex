@@ -34,6 +34,7 @@ DIRECT_SKILL_FALLBACKS = {
     "poteto-agent": "poteto-mode",
     "Comment Sicko": "no-comments",
 }
+EXPECTED_ROLE_NAMES = {"poteto-agent", "Comment Sicko"}
 
 
 class AdapterError(ValueError):
@@ -153,14 +154,20 @@ def parse_role_file(path: Path) -> RoleDefinition:
                 f"{path}: Comment Sicko is missing required report-only instructions: "
                 + "; ".join(missing)
             )
-        normalized_instructions = _visible_text(" ".join(instruction_lines)).replace(
+        if any(ord(character) > 127 for character in role.developer_instructions):
+            raise AdapterError(f"{path}: Comment Sicko instructions must use canonical visible text")
+        instruction_body = [
+            line for line in instruction_lines
+            if not any(line.startswith(field) for field in COMMENT_SICKO_REPORT_FIELDS)
+        ]
+        normalized_instructions = _visible_text(" ".join(instruction_body)).replace(
             "Do not write application code.", ""
         )
         unsafe_match = re.search(
-            r"\b(?:write|edit|modify|create|delete|remove|change|mutate|apply)\b"
-            r".{0,60}\b(?:application code|source code|code|files?|repository|repo|data|patch|directory|output|disk)\b"
-            r"|\b(?:application code|source code|code|files?|repository|repo|data|patch|directory|output|disk)\b.{0,40}"
-            r"\b(?:write|edit|modify|create|delete|remove|change|mutate|apply)\b",
+            r"\b(?:writ\w*|edit\w*|modif\w*|creat\w*|delet\w*|remov\w*|chang\w*|mutat\w*|appl\w*|updat\w*)\b"
+            r".{0,120}\b(?:application code|source code|code|files?|repository|repo|data|patch|directory|output|disk)\b"
+            r"|\b(?:application code|source code|code|files?|repository|repo|data|patch|directory|output|disk)\b.{0,120}"
+            r"\b(?:writ\w*|edit\w*|modif\w*|creat\w*|delet\w*|remov\w*|chang\w*|mutat\w*|appl\w*|updat\w*)\b",
             normalized_instructions,
             re.IGNORECASE,
         )
@@ -205,6 +212,8 @@ def load_explicit_roles(project_root: Path) -> dict[str, RoleDefinition]:
     for declared_name, declaration in agents.items():
         if not isinstance(declared_name, str) or not declared_name.strip():
             raise AdapterError(f"{config_path}: agent names must be non-empty strings")
+        if declared_name not in EXPECTED_ROLE_NAMES:
+            raise AdapterError(f"{config_path}: unsupported registered role {declared_name!r}")
         if not isinstance(declaration, dict):
             raise AdapterError(f"{config_path}: agents.{declared_name} must be a table")
         declared_description = declaration.get("description")
@@ -217,9 +226,13 @@ def load_explicit_roles(project_root: Path) -> dict[str, RoleDefinition]:
             "config_file",
             config_path,
         )
+        if Path(config_file).is_absolute():
+            raise AdapterError(f"{config_path}: role config_file must be relative: {config_file}")
         declared_role_path = config_path.parent / config_file
         current = declared_role_path
         while current != codex_root:
+            if current == current.parent:
+                raise AdapterError(f"{config_path}: role path escapes .codex: {config_file}")
             if current.is_symlink():
                 raise AdapterError(f"{config_path}: role path contains a symlink: {config_file}")
             current = current.parent
@@ -392,6 +405,8 @@ def preflight_model(
 def validate_comment_sicko_report(output: str) -> dict[str, str]:
     """Validate the exact first line and required report sections."""
 
+    if not isinstance(output, str):
+        raise ReportContractError("Comment Sicko report must be text")
     lines = output.splitlines()
     if not lines or lines[0] != COMMENT_SICKO_FIRST_OUTPUT:
         actual = lines[0] if lines else "(empty)"
@@ -401,8 +416,16 @@ def validate_comment_sicko_report(output: str) -> dict[str, str]:
 
     sections: dict[str, str] = {}
     for line in lines[1:]:
+        if any(
+            unicodedata.category(character).startswith(("C", "M"))
+            or character in {"\u2028", "\u2029"}
+            for character in line
+        ):
+            raise ReportContractError("Comment Sicko report contains invisible or control characters")
+        matched = False
         for field in COMMENT_SICKO_REPORT_FIELDS:
             if line.startswith(field):
+                matched = True
                 if field in sections and field != "MUST KILL:":
                     raise ReportContractError(f"Comment Sicko report repeats {field!r}")
                 value = line[len(field) :].strip()
@@ -418,6 +441,8 @@ def validate_comment_sicko_report(output: str) -> dict[str, str]:
                 ):
                     raise ReportContractError(f"Comment Sicko report leaves {field!r} empty")
                 break
+        if line.strip() and not matched:
+            raise ReportContractError("Comment Sicko report contains an unrecognized line")
     missing = [field for field in COMMENT_SICKO_REPORT_FIELDS if field not in sections]
     if missing:
         raise ReportContractError(
