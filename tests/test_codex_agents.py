@@ -454,11 +454,16 @@ class CodexAgentRoleTests(unittest.TestCase):
             adapter.preflight_model("unavailable-model", available)
 
     def test_model_catalog_and_model_inputs_fail_as_adapter_errors(self) -> None:
+        class UnhashableString(str):
+            __hash__ = None
+
         with self.assertRaises(adapter.AdapterError):
             adapter.parse_model_catalog(b"\xff\xfe{")
         for payload in (None, 42, [], bytearray(b"{}")):
             with self.assertRaises(adapter.AdapterError):
                 adapter.parse_model_catalog(payload)
+        with self.assertRaises(adapter.AdapterError):
+            adapter.parse_model_catalog({"models": [{"slug": UnhashableString("model")} ]})
 
         for requested in (1, b"gpt-5.6-luna", object()):
             with self.assertRaises(adapter.AdapterError):
@@ -517,6 +522,10 @@ class CodexAgentRoleTests(unittest.TestCase):
                 self.assertIs(type(raised.exception), adapter.AdapterError)
         with self.assertRaises(adapter.AdapterError):
             adapter.resolve_role(Path.cwd(), [])
+        class UnhashableRoleName(str):
+            __hash__ = None
+        with self.assertRaises(adapter.AdapterError):
+            adapter.resolve_role(Path.cwd(), UnhashableRoleName("Comment Sicko"))
 
     def test_cli_catalog_file_failures_serialize_adapter_error(self) -> None:
         with tempfile.TemporaryDirectory(prefix="codex-role-catalog-errors-") as temporary:

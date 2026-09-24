@@ -343,7 +343,7 @@ def load_explicit_roles(project_root: Path) -> dict[str, RoleDefinition]:
 def resolve_role(project_root: Path, role_name: str) -> RoleDefinition:
     """Resolve an exact role name without replacing it with a generic worker."""
 
-    if not isinstance(role_name, str) or not role_name.strip():
+    if type(role_name) is not str or not role_name.strip():
         raise AdapterError("role name must be a non-empty string")
     roles = load_explicit_roles(project_root)
     try:
@@ -383,7 +383,7 @@ def parse_model_catalog(payload: str | bytes | Mapping[str, Any]) -> tuple[str, 
         if not isinstance(entry, Mapping):
             raise AdapterError("model catalog entries must be objects")
         slug = entry.get("slug")
-        if not isinstance(slug, str) or not slug.strip():
+        if type(slug) is not str or not slug.strip():
             raise AdapterError("model catalog entries must have a non-empty slug")
         slugs.add(slug.strip())
     return tuple(sorted(slugs))
