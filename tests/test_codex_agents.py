@@ -530,6 +530,8 @@ class CodexAgentRoleTests(unittest.TestCase):
             adapter.preflight_model(UnhashableRoleName("model"), ["model"])
         with self.assertRaises(adapter.AdapterError):
             adapter.preflight_model("model", [UnhashableRoleName("model")])
+        with self.assertRaises(adapter.AdapterError):
+            adapter.read_model_catalog(UnhashableRoleName("codex"))
 
     def test_cli_catalog_file_failures_serialize_adapter_error(self) -> None:
         with tempfile.TemporaryDirectory(prefix="codex-role-catalog-errors-") as temporary:

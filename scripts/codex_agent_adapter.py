@@ -392,7 +392,7 @@ def parse_model_catalog(payload: str | bytes | Mapping[str, Any]) -> tuple[str, 
 def read_model_catalog(codex_binary: str = "codex", cwd: Path | None = None) -> tuple[str, ...]:
     """Read the active local model catalog through the Codex debug command."""
 
-    if not isinstance(codex_binary, str) or not codex_binary.strip():
+    if type(codex_binary) is not str or not codex_binary.strip():
         raise AdapterError("codex binary must be a non-empty string")
     if cwd is not None and not isinstance(cwd, Path):
         raise AdapterError("codex command cwd must be a pathlib.Path")
