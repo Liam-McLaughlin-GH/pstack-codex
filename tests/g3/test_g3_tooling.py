@@ -48,6 +48,7 @@ from pstack_g3_helpers.plan_checker import (  # noqa: E402
 )
 from pstack_g3_helpers.watch import (  # noqa: E402
     CheckRead,
+    CommitRollup,
     DeterministicClock,
     FakeReader,
     JsonProviderAdapter,
@@ -91,6 +92,7 @@ class G3WatcherTests(unittest.TestCase):
             facts=facts,
             threads=(ReviewThread("thread-1", "needs work"),),
             checks=CheckRead("recorded", (failed_check("ci"),)),
+            commits=(CommitRollup("head", "SUCCESS"),),
         )
         result = run_simple(reader, [context], clock=DeterministicClock())
         self.assertEqual(result["kind"], "BLOCKER")
@@ -170,7 +172,10 @@ class G3WatcherTests(unittest.TestCase):
 
     def test_pending_wait_uses_injected_sleep_and_times_out(self) -> None:
         context = PRContext("owner", "repo", 24)
-        reader = FakeReader(checks=CheckRead("recorded", (pending_check("ci"),)))
+        reader = FakeReader(
+            checks=CheckRead("recorded", (pending_check("ci"),)),
+            commits=(CommitRollup("head", "SUCCESS"),),
+        )
         clock = DeterministicClock()
         result = run_simple(
             reader,
@@ -187,7 +192,10 @@ class G3WatcherTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PollOptions(timeout=float("inf"))
         context = PRContext("owner", "repo", 24)
-        reader = FakeReader(checks=CheckRead("recorded", (pending_check("ci"),)))
+        reader = FakeReader(
+            checks=CheckRead("recorded", (pending_check("ci"),)),
+            commits=(CommitRollup("head", "SUCCESS"),),
+        )
         clock = DeterministicClock()
         result = run_simple(
             reader,
@@ -197,6 +205,54 @@ class G3WatcherTests(unittest.TestCase):
         )
         self.assertEqual(result["kind"], "TIMEOUT")
         self.assertEqual(clock.sleeps, [1])
+
+    def test_retry_timeout_does_not_read_after_deadline(self) -> None:
+        context = PRContext("owner", "repo", 24)
+
+        class RetryReader(FakeReader):
+            def __init__(self) -> None:
+                super().__init__(commits=(CommitRollup("head", "SUCCESS"),))
+                self.attempts = 0
+
+            def pull_request(self, context: PRContext) -> PRFacts:
+                self.attempts += 1
+                if self.attempts == 1:
+                    raise QueryFailure("temporary", retryable=True)
+                return super().pull_request(context)
+
+        reader = RetryReader()
+        clock = DeterministicClock()
+        result = run_simple(
+            reader,
+            [context],
+            options=PollOptions(interval=2, timeout=1),
+            clock=clock,
+        )
+        self.assertEqual(result["kind"], "TIMEOUT")
+        self.assertEqual(reader.attempts, 1)
+        self.assertEqual(clock.sleeps, [1])
+
+    def test_max_query_errors_requires_a_finite_positive_integer(self) -> None:
+        for value in (0, -1, True, 1.0, float("nan"), float("inf")):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                PollOptions(max_query_errors=value)
+
+    def test_provider_rollups_and_check_states_fail_closed(self) -> None:
+        payload = json.loads((FIXTURES / "provider-ready.json").read_text())
+        payload["pull_request"]["merge_state_status"] = "BLOCKED"
+        payload["checks"]["checks"][0]["reported_state"] = "FAILURE"
+        with self.assertRaises(UnknownProviderData):
+            read_snapshot(JsonProviderAdapter(payload), PRContext("owner", "repo", 24))
+        payload = json.loads((FIXTURES / "provider-ready.json").read_text())
+        payload["commit_rollups"] = [
+            {"oid": "other", "state": "SUCCESS"},
+        ]
+        with self.assertRaises(UnknownProviderData):
+            read_snapshot(JsonProviderAdapter(payload), PRContext("owner", "repo", 24))
+        payload["commit_rollups"].append({"oid": "head", "state": "SUCCESS"})
+        payload["commit_rollups"].append({"oid": "head", "state": "FAILURE"})
+        with self.assertRaises(UnknownProviderData):
+            read_snapshot(JsonProviderAdapter(payload), PRContext("owner", "repo", 24))
 
     def test_queued_complete_reads_state_without_merging(self) -> None:
         contexts = [PRContext("owner", "repo", 23), PRContext("owner", "repo", 24)]
@@ -271,6 +327,21 @@ class G3StoreTests(unittest.TestCase):
                 self.assertEqual(len(drained), 1)
                 self.assertEqual(store.inbox_count(), 0)
                 self.assertTrue(list(store.root.glob(".inbox-drain-*/")))
+            finally:
+                store.close()
+
+    def test_frontier_repo_symlink_parent_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.mkdir()
+            (target / "repo").mkdir()
+            (root / "link").symlink_to(target, target_is_directory=True)
+            reader = StaticStackReader((FrontierEntry(23, "feature/23", "a" * 40, "MERGED"),))
+            store = self.make_store(root / "store", stack_reader=reader)
+            try:
+                with self.assertRaises(StoreError):
+                    store.frontier_set(root / "link" / "repo")
             finally:
                 store.close()
 
@@ -352,6 +423,17 @@ class G3PlanAndAuditTests(unittest.TestCase):
             with self.assertRaises(PlanInputError):
                 check_plan(link / "nested", completion_profile())
 
+    def test_profile_symlink_parent_is_refused(self) -> None:
+        profile = {"name": "fixture", "required_files": [], "rules": []}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.mkdir()
+            (target / "profile.json").write_text(json.dumps(profile), encoding="utf-8")
+            (root / "link").symlink_to(target, target_is_directory=True)
+            with self.assertRaises(PlanInputError):
+                load_profile(root / "link" / "profile.json")
+
 
 class G3WorktreeAndLogTests(unittest.TestCase):
     def test_worktree_audit_reports_unknown_activity_without_fetch_or_scan(self) -> None:
@@ -425,6 +507,20 @@ class G3WorktreeAndLogTests(unittest.TestCase):
             path.write_text("not the expected header\n", encoding="utf-8")
             with self.assertRaises(AuditLogError):
                 append_row(path, "phase", "ok", "why", "proof", "PASS")
+            path.write_text(
+                "ts\tphase\tdecision\twhy\tevidence\tresult\n"
+                "2026-01-01T00:00:00Z\tp\tok\twhy\tproof\tbad\x00\n",
+                encoding="utf-8",
+            )
+            with self.assertRaises(AuditLogError):
+                append_row(path, "phase", "ok", "why", "proof", "PASS")
+            invalid = root = Path(temporary) / "invalid.tsv"
+            with self.assertRaises(AuditLogError):
+                append_row(invalid, None, "ok", "why", "proof", "PASS")
+            self.assertFalse(invalid.exists())
+            with self.assertRaises(AuditLogError):
+                append_row(invalid, "phase", "ok", "why", None, "PASS")
+            self.assertFalse(invalid.exists())
 
 
 if __name__ == "__main__":

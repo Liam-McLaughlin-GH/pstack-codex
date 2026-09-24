@@ -48,8 +48,13 @@ def _validate_existing(path: Path) -> None:
     if not lines or lines[0].split("\t") != list(HEADER):
         raise AuditLogError(f"audit log has an invalid header: {path}")
     for row in lines[1:]:
-        if row and len(row.split("\t")) != len(HEADER):
+        if not row:
+            continue
+        cells = row.split("\t")
+        if len(cells) != len(HEADER):
             raise AuditLogError(f"audit log has a malformed row: {path}")
+        if any(sanitize_cell(cell) != cell for cell in cells):
+            raise AuditLogError(f"audit log has an unsafe row: {path}")
 
 
 def _timestamp(clock: Callable[[], datetime] | None) -> str:
@@ -60,10 +65,13 @@ def _timestamp(clock: Callable[[], datetime] | None) -> str:
 
 
 def _evidence_value(evidence: str | os.PathLike[str] | Sequence[str | os.PathLike[str]]) -> str:
-    if isinstance(evidence, (str, os.PathLike)):
-        value = os.fspath(evidence)
-    else:
-        value = ";".join(os.fspath(item) for item in evidence)
+    try:
+        if isinstance(evidence, (str, os.PathLike)):
+            value = os.fspath(evidence)
+        else:
+            value = ";".join(os.fspath(item) for item in evidence)
+    except (TypeError, OSError) as exc:
+        raise AuditLogError("evidence path must be a path or path sequence") from exc
     if not value:
         raise AuditLogError("evidence path must not be empty")
     return value
@@ -81,6 +89,14 @@ def append_row(
 ) -> str:
     """Append one row and return its rendered TSV line."""
 
+    fields = (
+        _timestamp(clock),
+        sanitize_cell(phase),
+        sanitize_cell(decision),
+        sanitize_cell(why),
+        sanitize_cell(_evidence_value(evidence)),
+        sanitize_cell(result),
+    )
     path = Path(logfile)
     if _unsafe_symlink(path) is not None:
         raise AuditLogError(f"audit log path must not contain symlinks: {path}")
@@ -99,14 +115,6 @@ def append_row(
                 handle.write("\t".join(HEADER) + "\n")
         else:
             _validate_existing(path)
-    fields = (
-        _timestamp(clock),
-        sanitize_cell(phase),
-        sanitize_cell(decision),
-        sanitize_cell(why),
-        sanitize_cell(_evidence_value(evidence)),
-        sanitize_cell(result),
-    )
     line = "\t".join(fields) + "\n"
     with path.open("a", encoding="utf-8", newline="") as handle:
         handle.write(line)

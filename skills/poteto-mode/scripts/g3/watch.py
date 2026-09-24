@@ -338,7 +338,7 @@ class PollOptions:
             raise ValueError("timeout must be zero or positive")
         if not math.isfinite(self.timeout):
             raise ValueError("timeout must be finite")
-        if self.max_query_errors <= 0:
+        if type(self.max_query_errors) is not int or self.max_query_errors <= 0:
             raise ValueError("max_query_errors must be positive")
 
 
@@ -534,11 +534,24 @@ class JsonProviderAdapter:
         checks: list[Check] = []
         for index, item in enumerate(values):
             value = _mapping(item, f"{label}[{index}]")
+            kind = value.get("kind")
+            reported_state = value.get("reported_state", "")
+            expected_states = {
+                "passed": {"", "SUCCESS"},
+                "failed": {"", "FAILURE", "ERROR"},
+                "pending": {"", "PENDING"},
+                "skipped": {"", "SKIPPED", "SUCCESS"},
+                "code-review-gate": {"", "PENDING", "FAILURE", "ERROR", "SUCCESS"},
+            }
+            if kind in expected_states and reported_state not in expected_states[kind]:
+                raise UnknownProviderData(
+                    f"{label}[{index}] reported_state contradicts kind {kind!r}"
+                )
             checks.append(
                 Check(
-                    kind=value.get("kind"),
+                    kind=kind,
                     name=value.get("name"),
-                    reported_state=value.get("reported_state", ""),
+                    reported_state=reported_state,
                     description=value.get("description", ""),
                     link=value.get("link", ""),
                     workflow=value.get("workflow", ""),
@@ -566,17 +579,19 @@ def _merge_assessment(facts: PRFacts, commits: Sequence[CommitRollup]) -> tuple[
     for commit in commits:
         if not isinstance(commit, CommitRollup):
             raise UnknownProviderData("commit rollups contain an invalid row")
-    head_state = None
-    if facts.head_ref_oid is not None:
-        head_state = next(
-            (commit.state for commit in commits if commit.oid == facts.head_ref_oid),
-            None,
-        )
+    if len({commit.oid for commit in commits}) != len(commits):
+        raise UnknownProviderData("commit rollups contain duplicate oids")
+    matching = [commit for commit in commits if commit.oid == facts.head_ref_oid]
+    if len(matching) != 1:
+        raise UnknownProviderData("commit rollups must contain one current head row")
+    head_state = matching[0].state
+    if head_state not in {"SUCCESS", "FAILURE", "ERROR", "PENDING"}:
+        raise UnknownProviderData("current head rollup has an unknown state")
     previous_success = any(
         commit.oid != facts.head_ref_oid and commit.state == "SUCCESS" for commit in commits
     )
-    if facts.merge_state_status == "BLOCKED" and head_state in {"ERROR", "FAILURE"}:
-        assessment = MergeAssessment("refused", None, facts.merge_state_status, head_state)
+    if head_state != "SUCCESS":
+        assessment = MergeAssessment("refused", "rollup", facts.merge_state_status, head_state)
     elif facts.merge_state_status == "BLOCKED":
         assessment = MergeAssessment("allowed", "rollup", facts.merge_state_status, head_state)
     else:
@@ -872,6 +887,8 @@ def _handle_query_failure(
     if options.timeout > 0:
         remaining = min(remaining, max(0.0, options.timeout - (clock.now() - started)))
     clock.sleep(remaining)
+    if options.timeout > 0 and clock.now() - started >= options.timeout:
+        return _timeout(emitter, {"kind": "status-unavailable", "failure": failure.as_dict()}), failures
     return None, failures
 
 

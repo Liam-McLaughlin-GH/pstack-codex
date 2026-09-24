@@ -214,6 +214,14 @@ def _safe_root(path: str | Path) -> Path:
     return root.resolve()
 
 
+def _unsafe_symlink(path: Path) -> Path | None:
+    ambient_temp = Path(tempfile.gettempdir()).absolute()
+    for candidate in (path, *path.parents):
+        if candidate.is_symlink() and not ambient_temp.is_relative_to(candidate.absolute()):
+            return candidate
+    return None
+
+
 def _atomic_write(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
@@ -740,7 +748,7 @@ class OrchestratorStore:
         if self.stack_reader is None:
             raise StoreError("frontier set requires an injected stack reader")
         repo_path = Path(repo).expanduser()
-        if not repo_path.is_dir() or repo_path.is_symlink():
+        if _unsafe_symlink(repo_path) is not None or not repo_path.is_dir():
             raise StoreError(f"frontier repo is not a real directory: {repo_path}")
         entries = tuple(self.stack_reader.read_frontier(repo_path))
         if any(not isinstance(entry, FrontierEntry) for entry in entries):

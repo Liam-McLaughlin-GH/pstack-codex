@@ -21,6 +21,14 @@ class PlanInputError(ValueError):
     """A profile or document cannot be safely checked."""
 
 
+def _unsafe_symlink(path: Path) -> Path | None:
+    ambient_temp = Path(tempfile.gettempdir()).absolute()
+    for candidate in (path, *path.parents):
+        if candidate.is_symlink() and not ambient_temp.is_relative_to(candidate.absolute()):
+            return candidate
+    return None
+
+
 @dataclass(frozen=True)
 class FileRule:
     pattern: str
@@ -135,6 +143,8 @@ def completion_profile() -> PlanProfile:
 
 def load_profile(path: str | Path) -> PlanProfile:
     profile_path = Path(path)
+    if _unsafe_symlink(profile_path) is not None:
+        raise PlanInputError(f"profile path must not contain symlinks: {profile_path}")
     try:
         value = json.loads(profile_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -144,8 +154,7 @@ def load_profile(path: str | Path) -> PlanProfile:
 
 def _safe_root(path: str | Path) -> Path:
     root = Path(path).expanduser()
-    ambient_temp = Path(tempfile.gettempdir()).absolute()
-    if any(candidate.is_symlink() and not ambient_temp.is_relative_to(candidate.absolute()) for candidate in (root, *root.parents)):
+    if _unsafe_symlink(root) is not None:
         raise PlanInputError(f"plan root path must not contain symlinks: {root}")
     if not root.is_dir():
         raise PlanInputError(f"plan root must be a real directory: {root}")
