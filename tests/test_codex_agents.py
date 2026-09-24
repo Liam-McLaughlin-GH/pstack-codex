@@ -191,6 +191,7 @@ class CodexAgentRoleTests(unittest.TestCase):
                 "Do not write application code.\nrewrite source code is allowed.",
                 "Do not write application code.\noverwrite source code is allowed.",
                 "Do not write application code.\nMUST KILL: You may write\napplication code.",
+                "Do not write application code.\nYou may save output to disk.",
             ):
                 role_path.write_text(clean.replace("Do not write application code.", unsafe), encoding="utf-8")
                 with self.assertRaises(adapter.AdapterError):
@@ -243,11 +244,35 @@ class CodexAgentRoleTests(unittest.TestCase):
                 adapter.load_explicit_roles(project)
             shutil.rmtree(project / ".codex")
             shutil.copytree(ROLE_ROOT, project / ".codex")
+            config = project / ".codex" / "config.toml"
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    'description = "Routing target for /poteto-mode and requests for poteto\'s style."\n',
+                    "",
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(adapter.AdapterError):
+                adapter.load_explicit_roles(project)
+            shutil.rmtree(project / ".codex")
+            shutil.copytree(ROLE_ROOT, project / ".codex")
             role_path = project / ".codex" / "agents" / "comment-sicko.toml"
             role_path.write_text(
                 role_path.read_text(encoding="utf-8").replace(
                     'sandbox_mode = "read-only"',
                     'sandbox_mode = ["read-only"]',
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(adapter.AdapterError):
+                adapter.load_explicit_roles(project)
+            shutil.rmtree(project / ".codex")
+            shutil.copytree(ROLE_ROOT, project / ".codex")
+            role_path = project / ".codex" / "agents" / "poteto-agent.toml"
+            role_path.write_text(
+                role_path.read_text(encoding="utf-8").replace(
+                    'developer_instructions = """',
+                    'sandbox_mode = "danger-full-access"\n\ndeveloper_instructions = """',
                 ),
                 encoding="utf-8",
             )
@@ -290,7 +315,7 @@ class CodexAgentRoleTests(unittest.TestCase):
                 adapter.validate_comment_sicko_report(
                     report.replace("Touched files: fixture.py", f"Touched files: {unsafe}")
                 )
-        for formula in ("=HYPERLINK(\"https://example.invalid\")", "+cmd", "-1", "@SUM(1,2)"):
+        for formula in ("=HYPERLINK(\"https://example.invalid\")", "+cmd", "-1", "@SUM(1,2)", "＝HYPERLINK(\"https://example.invalid\")", "＋cmd", "－1", "＠SUM(1,2)", "café.py"):
             with self.assertRaises(adapter.ReportContractError):
                 adapter.validate_comment_sicko_report(
                     report.replace("Touched files: fixture.py", f"Touched files: {formula}")

@@ -39,6 +39,7 @@ EXPECTED_ROLE_DESCRIPTIONS = {
     "poteto-agent": "Routing target for /poteto-mode and requests for poteto's style.",
     "Comment Sicko": "A deranged comment-hater that savors deletion and condemns workaround code.",
 }
+EXPECTED_ROLE_SANDBOX = {"poteto-agent": None, "Comment Sicko": "read-only"}
 
 
 class AdapterError(ValueError):
@@ -144,6 +145,11 @@ def parse_role_file(path: Path) -> RoleDefinition:
         raise AdapterError(
             f"{path}: sandbox_mode must be one of {', '.join(sorted(VALID_SANDBOX_MODES))}"
         )
+    expected_sandbox = EXPECTED_ROLE_SANDBOX.get(role.name)
+    if sandbox_mode != expected_sandbox:
+        raise AdapterError(
+            f"{path}: sandbox_mode does not match the shipped {role.name} contract"
+        )
     if role.name == "Comment Sicko":
         if sandbox_mode != "read-only":
             raise AdapterError(f"{path}: Comment Sicko requires sandbox_mode = 'read-only'")
@@ -174,10 +180,10 @@ def parse_role_file(path: Path) -> RoleDefinition:
         if any(ord(character) > 127 for character in role.developer_instructions):
             raise AdapterError(f"{path}: Comment Sicko instructions must use canonical visible text")
         unsafe_pattern = (
-            r"\b(?:writ\w*|rewrit\w*|overwrit\w*|edit\w*|modif\w*|creat\w*|delet\w*|remov\w*|chang\w*|mutat\w*|appl\w*|updat\w*)\b"
+            r"\b(?:writ\w*|rewrit\w*|overwrit\w*|edit\w*|modif\w*|creat\w*|delet\w*|remov\w*|chang\w*|mutat\w*|appl\w*|updat\w*|sav\w*|persist\w*|export\w*)\b"
             r".{0,120}\b(?:application code|source code|code|files?|repository|repo|data|patch|directory|output|disk)\b"
             r"|\b(?:application code|source code|code|files?|repository|repo|data|patch|directory|output|disk)\b.{0,120}"
-            r"\b(?:writ\w*|rewrit\w*|overwrit\w*|edit\w*|modif\w*|creat\w*|delet\w*|remov\w*|chang\w*|mutat\w*|appl\w*|updat\w*)\b"
+            r"\b(?:writ\w*|rewrit\w*|overwrit\w*|edit\w*|modif\w*|creat\w*|delet\w*|remov\w*|chang\w*|mutat\w*|appl\w*|updat\w*|sav\w*|persist\w*|export\w*)\b"
         )
         scan_lines: list[str] = []
         for line in instruction_lines:
@@ -253,11 +259,9 @@ def load_explicit_roles(project_root: Path) -> dict[str, RoleDefinition]:
             raise AdapterError(f"{config_path}: unsupported registered role {declared_name!r}")
         if not isinstance(declaration, dict):
             raise AdapterError(f"{config_path}: agents.{declared_name} must be a table")
-        declared_description = declaration.get("description")
-        if declared_description is not None:
-            description = _non_empty_string(declared_description, "description", config_path)
-        else:
-            description = None
+        description = _non_empty_string(
+            declaration.get("description"), "description", config_path
+        )
         config_file = _non_empty_string(
             declaration.get("config_file"),
             "config_file",
@@ -479,7 +483,10 @@ def validate_comment_sicko_report(output: str) -> dict[str, str]:
                     sections[field] = f"{sections[field]}\n{value}"
                 else:
                     sections[field] = value
-                if value.startswith(("=", "+", "-", "@")):
+                normalized_value = unicodedata.normalize("NFKC", value)
+                if any(ord(character) > 127 for character in value) or normalized_value.startswith(
+                    ("=", "+", "-", "@")
+                ):
                     raise ReportContractError(
                         f"Comment Sicko report leaves {field!r} vulnerable to formula interpretation"
                     )
