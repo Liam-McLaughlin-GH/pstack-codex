@@ -183,7 +183,9 @@ def dry_run_cleanup(candidates: list[dict[str, object]]) -> tuple[list[str], int
     proposals = [
         str(candidate["path"])
         for candidate in candidates
-        if candidate["merged"] and not candidate["dirty"] and not candidate["active"]
+        if candidate["merged"] is True
+        and candidate["dirty"] is False
+        and candidate["active"] is False
     ]
     return proposals, 0
 
@@ -466,6 +468,13 @@ class G1ParityTests(unittest.TestCase):
                 ("NOT RUN", 0),
             )
         self.assertEqual(gate.calls, [])
+
+    def test_cleanup_rejects_truthy_non_boolean_state(self) -> None:
+        proposals, deletions = dry_run_cleanup(
+            [{"path": "attacker", "merged": "true", "dirty": False, "active": False}]
+        )
+        self.assertEqual(proposals, [])
+        self.assertEqual(deletions, 0)
 
     def test_handoff_expectations_cannot_define_a_new_contract(self) -> None:
         attacker = {
