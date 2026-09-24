@@ -189,13 +189,18 @@ def load_explicit_roles(project_root: Path) -> dict[str, RoleDefinition]:
     """Load only roles named by the project's explicit ``[agents]`` registry."""
 
     project_root = project_root.resolve()
-    config_path = project_root / ".codex" / "config.toml"
+    codex_path = project_root / ".codex"
+    if codex_path.is_symlink() or not codex_path.is_dir():
+        raise AdapterError(f"{codex_path}: explicit .codex directory must be real")
+    config_path = codex_path / "config.toml"
+    if config_path.is_symlink() or not config_path.is_file():
+        raise AdapterError(f"{config_path}: explicit config must be a real file")
     raw = _load_toml_table(config_path)
     agents = raw.get("agents")
     if not isinstance(agents, dict) or not agents:
         raise AdapterError(f"{config_path}: expected a non-empty [agents] registry")
 
-    codex_root = (project_root / ".codex").resolve()
+    codex_root = codex_path
     roles: dict[str, RoleDefinition] = {}
     for declared_name, declaration in agents.items():
         if not isinstance(declared_name, str) or not declared_name.strip():
@@ -212,7 +217,13 @@ def load_explicit_roles(project_root: Path) -> dict[str, RoleDefinition]:
             "config_file",
             config_path,
         )
-        role_path = (config_path.parent / config_file).resolve()
+        declared_role_path = config_path.parent / config_file
+        current = declared_role_path
+        while current != codex_root:
+            if current.is_symlink():
+                raise AdapterError(f"{config_path}: role path contains a symlink: {config_file}")
+            current = current.parent
+        role_path = declared_role_path.resolve()
         if not role_path.is_relative_to(codex_root):
             raise AdapterError(f"{config_path}: role file escapes .codex: {config_file}")
         role = parse_role_file(role_path)

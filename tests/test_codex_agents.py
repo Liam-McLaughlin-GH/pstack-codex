@@ -98,6 +98,38 @@ class CodexAgentRoleTests(unittest.TestCase):
             after = sorted(path.relative_to(project).as_posix() for path in project.rglob("*"))
             self.assertEqual(before, after)
 
+    def test_explicit_registration_rejects_symlinked_codex_roots_and_roles(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="codex-role-symlink-") as temporary:
+            base = Path(temporary)
+            project = base / "project"
+            project.mkdir()
+            external = base / "external"
+            shutil.copytree(ROLE_ROOT, external)
+            (project / ".codex").symlink_to(external, target_is_directory=True)
+            with self.assertRaises(adapter.AdapterError):
+                adapter.load_explicit_roles(project)
+
+        with tempfile.TemporaryDirectory(prefix="codex-role-symlink-") as temporary:
+            project = Path(temporary)
+            shutil.copytree(ROLE_ROOT, project / ".codex")
+            external = project / "external-agents"
+            external.mkdir()
+            shutil.copy2(
+                project / ".codex" / "agents" / "comment-sicko.toml",
+                external / "comment-sicko.toml",
+            )
+            config = project / ".codex" / "config.toml"
+            original = config.read_text(encoding="utf-8")
+            config.write_text(
+                original.replace(
+                    "agents/comment-sicko.toml",
+                    "../external-agents/comment-sicko.toml",
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(adapter.AdapterError):
+                adapter.load_explicit_roles(project)
+
     def test_comment_sicko_tampering_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="codex-role-tampered-") as temporary:
             project = Path(temporary)
