@@ -80,6 +80,15 @@ def _non_empty_string(value: object, field: str, path: Path) -> str:
     return value.strip()
 
 
+def _visible_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value)
+    return "".join(
+        character
+        for character in normalized
+        if unicodedata.category(character) not in {"Cf", "Mn"}
+    )
+
+
 def parse_role_file(path: Path) -> RoleDefinition:
     """Parse one current-format Codex role file and validate its required fields."""
 
@@ -144,11 +153,13 @@ def parse_role_file(path: Path) -> RoleDefinition:
                 f"{path}: Comment Sicko is missing required report-only instructions: "
                 + "; ".join(missing)
             )
-        normalized_instructions = " ".join(instruction_lines).replace(
+        normalized_instructions = _visible_text(" ".join(instruction_lines)).replace(
             "Do not write application code.", ""
         )
         unsafe_match = re.search(
-            r"\b(?:may|can|should|must|please|will)\b.{0,120}"
+            r"\b(?:write|edit|modify|create|delete|remove|change|mutate|apply)\b"
+            r".{0,60}\b(?:application code|files?|repository|data)\b"
+            r"|\b(?:application code|files?|repository|data)\b.{0,40}"
             r"\b(?:write|edit|modify|create|delete|remove|change|mutate|apply)\b",
             normalized_instructions,
             re.IGNORECASE,
@@ -389,7 +400,8 @@ def validate_comment_sicko_report(output: str) -> dict[str, str]:
                 else:
                     sections[field] = value
                 if not value or not any(
-                    not character.isspace() and unicodedata.category(character) != "Cf"
+                    not character.isspace()
+                    and unicodedata.category(character) not in {"Cf", "Mn"}
                     for character in value
                 ):
                     raise ReportContractError(f"Comment Sicko report leaves {field!r} empty")
