@@ -5,15 +5,43 @@ description: Explain how an existing code path, subsystem, or repository works. 
 
 # How
 
-Explain the system well enough that another engineer can change it safely.
+Explore a codebase and produce an explanation that gives another engineer a
+working mental model. Use the local prompt contracts in
+[explorer-prompt.md](references/explorer-prompt.md) and
+[explainer-prompt.md](references/explainer-prompt.md) when the question is
+complex enough to split.
 
-1. State the question and your interpretation of its scope.
-2. Find the entry point and trace the real path through the repository.
-3. Name the data shape at each meaningful boundary.
-4. Separate the normal path from error paths, retries, and side effects.
-5. Point to the files and symbols that prove each important claim.
-6. Run a focused check when a claim depends on runtime behavior.
+## Step 1. Assess complexity
 
-For a small question, inspect one path and answer directly. For a subsystem, inspect its callers, state transitions, persistence, and external boundaries. Do not replace a walkthrough with a list of filenames.
+State the question and your interpretation. A small question covers one
+module or symbol and uses one direct pass. A complex question spans files,
+services, state transitions, or external boundaries and uses two to four
+distinct local exploration angles before synthesis.
 
-Write the explanation in the order a new maintainer needs it. Start with what the system does. Then explain the flow. End with the constraints and the places a change could break.
+## Step 2. Explore
+
+For each angle, find the entry point, trace the path, name the data shape at
+each boundary, separate normal and error paths, list side effects, and cite
+exact files and symbols. Give each worker an independent output path when
+delegation is available. If it is not, run the angles in one session and keep
+the scope bounded.
+
+Do not replace a walkthrough with a list of filenames. Read implementations,
+callers, persistence, retries, and boundary adapters.
+
+## Step 3. Explain and synthesize
+
+For a simple question, write the explanation from the direct pass. For a
+complex question, reconcile the angles and check contradictions against the
+repository. A missing trace becomes an explicit open question.
+
+Use these sections when they apply:
+
+- Overview
+- Key Concepts
+- How It Works
+- Where Things Live
+- Gotchas
+
+Run a focused local check when a claim depends on runtime behavior. If the
+matching surface is unavailable, state BLOCKED or INCONCLUSIVE.

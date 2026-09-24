@@ -1,0 +1,29 @@
+{
+  "source_commit": "53e579f1481697931fc44f5445171397cfa2b24b",
+  "source_path": "pstack/skills/poteto-mode/playbooks",
+  "names": [
+    "authoring-a-skill.md",
+    "autonomous-run.md",
+    "autopilot-full.md",
+    "autopilot-stack.md",
+    "babysit.md",
+    "bug-fix.md",
+    "eval.md",
+    "feature.md",
+    "hillclimb.md",
+    "investigation.md",
+    "multi-phase-plan.md",
+    "opening-a-pr.md",
+    "orchestrate.md",
+    "pause-safely.md",
+    "perf-issue.md",
+    "prototype.md",
+    "refactoring.md",
+    "runtime-forensics.md",
+    "session-pickup.md",
+    "shipping.md",
+    "trace-forensics.md",
+    "visual-parity.md",
+    "worktree-cleanup.md"
+  ]
+}

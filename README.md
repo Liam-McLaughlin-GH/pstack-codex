@@ -25,7 +25,7 @@ The following 30 upstream skills are active in this repo without changing their 
 
 These skills carry over the parts of pstack that do not depend on Cursor APIs. They cover design principles, root-cause debugging, behavior-focused verification, plain explanations, TypeScript modeling, and clean writing.
 
-The following 10 skills are present as Codex-native rewrites.
+The following skills are present as Codex-native rewrites.
 
 | Skill | Codex port |
 | --- | --- |
@@ -42,6 +42,18 @@ The following 10 skills are present as Codex-native rewrites.
 | `make-bot-ui` | Builds and verifies a UI relay with explicit local and remote boundaries. |
 | `repo-best-practices` | Routes Showpass repository work using source-backed ownership, safe command boundaries, and explicit drift limits. |
 
+The following seven issue-focused skills are also active Codex-native ports:
+
+| Skill | Codex port |
+| --- | --- |
+| `automate-me` | Runs bounded local automation with explicit fixture and side-effect boundaries. |
+| `create-verification-skill` | Builds verification skills from a local feature map and saved evidence. |
+| `figure-it-out` | Routes structured investigation and records lifecycle state locally. |
+| `maintain-verification-skill` | Maintains verification artifacts without assuming Cursor layout. |
+| `python-best-practices` | Checks Python structure and review boundaries with local tooling. |
+| `recall` | Reconstructs supplied local history without scanning private transcripts. |
+| `setup-pstack` | Prepares Codex-local activation through temporary and explicit configuration. |
+
 The two portable agent roles are also included under `.codex/agents/`.
 `poteto-agent` requires the complete poteto-mode and leaf-principle skill reads.
 `Comment Sicko` keeps its exact role name, first-output line, report-only policy,
@@ -49,25 +61,20 @@ and read-only sandbox. `.codex/config.toml` registers both roles explicitly.
 
 The port preserves the names of these workflows where possible. In Codex, invoke them as skills such as `$poteto-mode`, `$how`, `$architect`, or `$tdd`.
 
+The 23 poteto-mode playbooks are active under
+skills/poteto-mode/playbooks. They retain the upstream workflow contracts and
+use the local capability and side-effect rules in
+skills/poteto-mode/references/capability-boundaries.md. Forge, watcher,
+deployment, message, delegation, and deletion steps remain fixture-only or
+require explicit authorization.
+The source and MIT attribution remain in the source and license section above.
+
 ## What is missing
 
-The following 7 upstream skills are not active in the port.
+The remaining upstream runtime pieces are not ported as live services.
 
-- `automate-me`. It depends on Cursor's built-in skill-authoring flow and transcript paths.
-- `create-verification-skill`. Its feature-map workflow assumes Cursor control skills and `.cursor/skills`.
-- `figure-it-out`. Its playbook routing and subagent instructions need a Codex-specific rewrite.
-- `maintain-verification-skill`. It assumes the same Cursor verification-skill layout.
-- `recall`. It reads Cursor agent transcripts.
-- `setup-pstack`. It writes Cursor model configuration to `~/.cursor/rules/pstack-models.mdc`.
-
-The upstream `poteto-mode` playbooks are not copied into the active port. The missing playbook files are:
-
-`authoring-a-skill.md`, `autonomous-run.md`, `autopilot-full.md`, `autopilot-stack.md`, `babysit.md`, `bug-fix.md`, `eval.md`, `feature.md`, `hillclimb.md`, `investigation.md`, `multi-phase-plan.md`, `opening-a-pr.md`, `orchestrate.md`, `pause-safely.md`, `perf-issue.md`, `prototype.md`, `refactoring.md`, `runtime-forensics.md`, `session-pickup.md`, `shipping.md`, `trace-forensics.md`, `visual-parity.md`, and `worktree-cleanup.md`.
-
-The remaining upstream runtime pieces are not ported.
-
-- Project-local role auto-discovery has not been claimed for the installed Codex CLI 0.144.0. Use the explicit `.codex/config.toml` registration and the offline adapter in `scripts/codex_agent_adapter.py`.
-- The 20 pstack scripts are not copied. This includes the PR watcher, worktree audit, plan checker, and orchestration helper.
+- Automatic project-local role discovery is not claimed; use the explicit agent registration described in `skills/setup-pstack/SKILL.md` and the generated `.codex/agents` files when that setup is applied.
+- The live provider and host wrappers from the pstack scripts remain unsupported; the offline helper subset is tracked as a separate parity item and does not add a live provider dependency to these playbooks.
 - `automations/benny/` is not copied. It is a Cursor automation pack with Cursor UI adapters.
 - Cursor model names and model-specific routing are not preserved.
 - Cursor transcript paths under `~/.cursor/projects/.../agent-transcripts` are not preserved.
