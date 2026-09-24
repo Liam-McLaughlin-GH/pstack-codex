@@ -186,6 +186,13 @@ class G3WatcherTests(unittest.TestCase):
         with self.assertRaises(UnknownProviderData):
             JsonProviderAdapter(payload).pull_request(PRContext("owner", "repo", 24))
 
+    def test_closed_provider_cannot_claim_a_merged_timestamp(self) -> None:
+        payload = json.loads((FIXTURES / "provider-ready.json").read_text())
+        payload["pull_request"]["state"] = "CLOSED"
+        payload["pull_request"]["merged_at"] = "2026-01-01T00:00:00Z"
+        with self.assertRaises(UnknownProviderData):
+            JsonProviderAdapter(payload).pull_request(PRContext("owner", "repo", 24))
+
     def test_queued_status_only_is_rejected_in_public_cli(self) -> None:
         from pstack_g3_helpers import watch
 
@@ -577,6 +584,21 @@ class G3StoreTests(unittest.TestCase):
                 self.assertEqual(store.ledger_summary(), {"unit-test-verified": 1})
                 self.assertEqual(report.summary["open_gate_ids"], ["gate-1"])
                 self.assertIn("'=unsafe", (root / "units.tsv").read_text())
+            finally:
+                store.close()
+
+    def test_units_and_inbox_writes_reject_unsafe_controls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            store = self.make_store(Path(temporary))
+            try:
+                for value in ("bad\x00brief", "bad\u2028brief"):
+                    with self.subTest(value=repr(value)), self.assertRaises(StoreError):
+                        store.units_add("unit-1", "track", value)
+                store.units_add("unit-1", "track", "safe")
+                with self.assertRaises(StoreError):
+                    store.units_set("unit-1", "verified", branch="bad\x00branch")
+                with self.assertRaises(StoreError):
+                    store.inbox_push("agent", "unit", "done", "bad\x00report")
             finally:
                 store.close()
 

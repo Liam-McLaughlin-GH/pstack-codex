@@ -163,8 +163,19 @@ def _clean_cell(value: Any, label: str = "value") -> str:
     return f"'{cleaned}" if cleaned.startswith(("=", "+", "-", "@")) else cleaned
 
 
-def _required_cell(value: Any, label: str) -> str:
+def _write_cell(value: Any, label: str = "value") -> str:
     cleaned = _clean_cell(value, label)
+    if any(
+        unicodedata.category(character).startswith("C")
+        or character in {"\u2028", "\u2029"}
+        for character in cleaned
+    ):
+        raise StoreError(f"{label} contains an unsafe control")
+    return cleaned
+
+
+def _required_cell(value: Any, label: str) -> str:
+    cleaned = _write_cell(value, label)
     if not cleaned.strip():
         raise StoreError(f"{label} must not be empty")
     return cleaned
@@ -541,7 +552,7 @@ class OrchestratorStore:
 
     def units_add(self, unit_id: str, track: str, brief: str = "") -> Unit:
         self._begin_write()
-        row = Unit(_required_cell(unit_id, "unit id"), _required_cell(track, "track"), "pending", "", "", "", _clean_cell(brief, "brief"))
+        row = Unit(_required_cell(unit_id, "unit id"), _required_cell(track, "track"), "pending", "", "", "", _write_cell(brief, "brief"))
         rows = self.units_list()
         if any(item.id == row.id for item in rows):
             raise StoreError(f"unit {row.id} already exists")
@@ -694,7 +705,7 @@ class OrchestratorStore:
             _required_cell(agent, "agent"),
             _required_cell(unit, "unit"),
             _required_cell(status, "status"),
-            _clean_cell(report, "report"),
+            _write_cell(report, "report"),
         )
         inbox = self._safe_inbox()
         filename = f"{pointer.ts.replace(':', '-').replace('.', '-')}-{self.pid}-{uuid.uuid4().hex}.tsv"

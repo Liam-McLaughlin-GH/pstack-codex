@@ -219,8 +219,8 @@ class PRFacts:
         if self.merged_at is not None:
             _nonempty(self.merged_at, "merged timestamp")
             _validate_utc_timestamp(self.merged_at, "merged timestamp")
-            if self.state == "OPEN":
-                raise UnknownProviderData("open pull requests cannot have merged_at")
+            if self.state != "MERGED":
+                raise UnknownProviderData("only merged pull requests can have merged_at")
         elif self.state == "MERGED":
             raise UnknownProviderData("merged pull requests require merged_at")
 
@@ -732,7 +732,9 @@ def _validate_snapshot(value: Any, label: str = "snapshot") -> None:
         raise UnknownProviderData("non-open snapshot contains open pull request data")
     if value.kind == "open" and value.ci is None:
         raise UnknownProviderData("open snapshot has no CI state")
-    if value.kind == "merged" and value.facts.state != "MERGED" and value.facts.merged_at is None:
+    if value.kind == "merged" and (
+        value.facts.state != "MERGED" or value.facts.merged_at is None
+    ):
         raise UnknownProviderData("merged snapshot has inconsistent facts")
 
 
@@ -768,7 +770,7 @@ def read_snapshot(
         raise UnknownProviderData("reader returned pull request facts for another identity")
     _enum(facts.mergeable, MERGEABLE, "mergeable")
     _enum(facts.merge_state_status, MERGE_STATES, "merge state status")
-    if facts.state == "MERGED" or facts.merged_at is not None:
+    if facts.state == "MERGED":
         snapshot = PRSnapshot("merged", context, facts)
         _validate_snapshot(snapshot)
         return snapshot
@@ -856,7 +858,7 @@ def read_snapshot(
     _revalidate(check_read, "reader returned check data")
     for index, check in enumerate(check_read.checks):
         _revalidate(check, f"reader returned check {index}")
-    if facts.state == "MERGED" or facts.merged_at is not None:
+    if facts.state == "MERGED":
         snapshot = PRSnapshot("merged", context, facts)
         _validate_snapshot(snapshot)
         return snapshot
