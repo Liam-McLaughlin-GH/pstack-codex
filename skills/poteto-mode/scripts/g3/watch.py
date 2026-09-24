@@ -1281,9 +1281,10 @@ def run_queued(
                     if terminal is not None:
                         return terminal
                     continue
-                _queue_context_key(context, sweep_index)
+                if _queue_context_key(context, sweep_index) != queue_keys[sweep_index]:
+                    raise UnknownProviderData("queue context identity changed during read")
                 _validate_snapshot(snapshot, "queue reader snapshot")
-                if snapshot.context != context:
+                if _queue_context_key(snapshot.context, sweep_index) != queue_keys[sweep_index]:
                     raise UnknownProviderData("queue reader returned another pull request identity")
                 snapshots[context] = snapshot
                 sweep_index += 1
@@ -1319,9 +1320,10 @@ def run_queued(
                 (index for index, item in enumerate(contexts) if item is frontier_context),
                 0,
             )
-            _queue_context_key(frontier_context, frontier_index)
+            if _queue_context_key(frontier_context, frontier_index) != queue_keys[frontier_index]:
+                raise UnknownProviderData("queue context identity changed during read")
             _validate_snapshot(snapshot, "queue reader snapshot")
-            if snapshot.context != frontier_context:
+            if _queue_context_key(snapshot.context, frontier_index) != queue_keys[frontier_index]:
                 raise UnknownProviderData("queue reader returned another pull request identity")
             snapshots[frontier_context] = snapshot
 

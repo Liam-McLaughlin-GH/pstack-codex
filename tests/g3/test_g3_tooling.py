@@ -4,6 +4,7 @@ import json
 import importlib.util
 import contextlib
 import io
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -544,6 +545,17 @@ class G3WatcherTests(unittest.TestCase):
                 with self.assertRaises(UnknownProviderData):
                     run_queued(FakeReader(), [context], clock=DeterministicClock())
 
+    def test_queued_rejects_reader_mutating_context_identity(self) -> None:
+        context = PRContext("owner", "repo", 24)
+
+        class MutatingReader(FakeReader):
+            def pull_request(self, requested: PRContext) -> PRFacts:
+                object.__setattr__(requested, "owner", "mutated-owner")
+                return PRFacts(requested)
+
+        with self.assertRaises(UnknownProviderData):
+            run_queued(MutatingReader(), [context], clock=DeterministicClock())
+
     def test_queued_complete_reads_state_without_merging(self) -> None:
         contexts = [PRContext("owner", "repo", 23), PRContext("owner", "repo", 24)]
         facts = {
@@ -1013,6 +1025,30 @@ class G3WorktreeAndLogTests(unittest.TestCase):
                     "proof",
                     "PASS",
                 )
+
+    def test_shell_log_refuses_symlink_target(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "outside.tsv"
+            target.write_text("untouched\n", encoding="utf-8")
+            link = root / "audit.tsv"
+            link.symlink_to(target)
+            result = subprocess.run(
+                [
+                    "bash",
+                    str(LOG_ROOT / "log.sh"),
+                    str(link),
+                    "phase",
+                    "decision",
+                    "why",
+                    "evidence",
+                    "PASS",
+                ],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(target.read_text(encoding="utf-8"), "untouched\n")
 
     def test_log_sanitizes_controls_and_rejects_invalid_existing_shape(self) -> None:
         self.assertEqual(sanitize_cell("a\x00\x1b\u2028b"), "a   b")

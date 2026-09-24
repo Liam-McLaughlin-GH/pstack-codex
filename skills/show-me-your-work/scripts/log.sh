@@ -14,6 +14,11 @@ if [ "$logdir" != "." ] && [ ! -d "$logdir" ]; then
 	mkdir -p "$logdir"
 fi
 
+if [ -L "$logfile" ]; then
+	printf 'audit log must not be a symlink: %s\n' "$logfile" >&2
+	exit 1
+fi
+
 if [ ! -f "$logfile" ]; then
 	printf 'ts\tphase\tdecision\twhy\tevidence\tresult\n' > "$logfile"
 fi
