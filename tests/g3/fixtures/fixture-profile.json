@@ -1,0 +1,12 @@
+{
+  "name": "fixture-profile",
+  "required_files": ["plan.md"],
+  "rules": [
+    {
+      "pattern": "plan.md",
+      "required_headings": ["Fixture plan"],
+      "required_markers": ["Local marker"],
+      "require_checked_boxes": true
+    }
+  ]
+}

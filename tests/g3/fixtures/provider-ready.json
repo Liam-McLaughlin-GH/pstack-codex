@@ -1,0 +1,30 @@
+{
+  "pull_request": {
+    "mergeable": "MERGEABLE",
+    "merge_state_status": "CLEAN",
+    "review_decision": "APPROVED",
+    "head_ref_oid": "head",
+    "head_ref_name": "feature/g3",
+    "base_ref_name": "main",
+    "state": "OPEN",
+    "merged_at": null,
+    "is_draft": false
+  },
+  "review_threads": [],
+  "checks": {
+    "source": "recorded",
+    "checks": [
+      {
+        "kind": "passed",
+        "name": "unit",
+        "reported_state": "SUCCESS",
+        "description": "",
+        "link": "",
+        "workflow": ""
+      }
+    ]
+  },
+  "commit_rollups": [
+    {"oid": "head", "state": "SUCCESS"}
+  ]
+}
