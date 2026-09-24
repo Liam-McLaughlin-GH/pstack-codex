@@ -22,7 +22,8 @@ shape, not a pile of conditionals.
 6. Verify the matching user-observable surface. Tests can cover branches but
    do not replace the behavior check. A missing surface is BLOCKED.
 7. Sequence small green units, then run $interrogate when the design is
-   contested. Route the gated handoff through [Opening a PR](./opening-a-pr.md).
+   contested. Route the local handoff through [Opening a PR](./opening-a-pr.md);
+   remote operations remain independently gated.
 
 Keep shared primitive changes synchronized across all consumers. Do not use a
 worker summary as evidence. Open the files and receipts.

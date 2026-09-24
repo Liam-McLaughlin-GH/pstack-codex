@@ -77,9 +77,10 @@ condition.
 
 If a worker change is retained, route the local handoff through [Opening a PR](./opening-a-pr.md).
 Record the diff, exact head SHA, checks, and proposed body before any forge
-operation. Push, PR create, ready, edit, comment, merge, auto-merge, and
-deployment are separate operations; each remains NOT RUN until its exact
-operation is explicitly authorized.
+operation and set `local_handoff_ready` when that package is complete. Push,
+PR create, ready, edit, comment, merge, auto-merge, and deployment are separate
+operations; each remains externally `NOT RUN` until its exact operation is
+explicitly authorized.
 
 ## Verification and failure
 

@@ -33,13 +33,16 @@ Forge gate:
 
 1. Resolve the selected forge adapter before any remote operation. A local
    fake adapter is the default in tests.
-2. A PR is ready only when the user has explicitly authorized its creation and
-   the local diff, head SHA, checks, and body are recorded.
+2. A local review package is ready when the local diff, exact head SHA, checks,
+   and proposed body are recorded. Preparing it does not require forge
+   authorization.
 3. Push, PR create, ready, edit, comment, merge, auto-merge, and deployment
-   are separate operations. Ask for or consume authorization for the exact
-   operation. One authorization does not imply the others.
-4. If authorization is absent, return a complete local handoff with status
-   NOT RUN. Do not leave a watcher or retry loop active.
+   are separate operations on the remote surface. They require authorization for the exact
+   operation and must be explicitly authorized individually. One authorization does not
+   imply the others.
+4. If a remote operation lacks authorization, return its canonical external
+   status as `NOT RUN`. Carry `local_handoff_ready: true` when the local
+   package is complete. Do not leave a watcher or retry loop active.
 
 UNSUPPORTED-SEAM: no implicit forge, PR, video, or deployment adapter exists.
 The local handoff is the safe fallback.

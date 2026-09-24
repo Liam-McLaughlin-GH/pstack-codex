@@ -34,10 +34,10 @@ fresh verified verdict and explicit landing authorization.
    their briefs and local evidence. Do not delete a worktree or discard
    uncommitted work during the hold.
 
-8. For an accepted code change, route the merge-ready handoff through
+8. For an accepted code change, route the merge-ready local handoff through
    [Opening a PR](./opening-a-pr.md). Keep PR creation, push, ready, comment,
-   merge, auto-merge, and deployment NOT RUN until each exact action is
-   authorized.
+   merge, auto-merge, and deployment externally NOT RUN until each exact
+   action is authorized.
 
 The queue record uses one row per item. The verification ledger keys verdicts
 by item and head SHA. The frontier is computed from the ledger, not inferred

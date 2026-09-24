@@ -13,8 +13,9 @@ You own pixel comparison. The baseline is the spec and must not be changed.
    visual confidence. A nonzero diff fails and gets a delta report.
 5. A missing browser or image adapter is BLOCKED. A text-only source review
    cannot prove pixel equivalence.
-6. Route a passing component to [Opening a PR](./opening-a-pr.md). The
-   handoff remains gated and does not modify the baseline.
+6. Route a passing component to [Opening a PR](./opening-a-pr.md). Prepare the
+   local handoff without forge authorization; remote operations remain gated
+   and the baseline is unchanged.
 
 UNSUPPORTED-SEAM: no browser, simulator, screenshot, or image-diff capability
 is implicit. Use a supplied pair of images for offline comparison or report

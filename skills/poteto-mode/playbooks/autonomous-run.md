@@ -27,11 +27,14 @@ predicate.
    boundary, keep the operation in the fixture adapter until the user names
    the exact action.
 8. A code-changing run is not complete at a local predicate. Return the diff,
-   checks, reviewer result, and PR handoff state. Create or update a PR only
-   after the operator gives explicit authorization; otherwise stop at
-   merge-ready with the handoff recorded.
+   exact head SHA, checks, proposed body, reviewer result, and PR handoff
+   state. Prepare that local package without forge authorization. Create or
+   update a PR only after the operator gives exact authorization for that
+   operation; otherwise keep external status `NOT RUN` and record
+   `local_handoff_ready` separately.
 9. For a retained code change, route the handoff through [Opening a PR](./opening-a-pr.md).
-   Preserve NOT RUN when the exact forge action is not authorized.
+   Push, PR, review, merge, and deployment operations remain independently
+   gated.
 
 Use the state shape in [the capability contract](../references/capability-boundaries.md)
 and the local audit trail from $show-me-your-work.

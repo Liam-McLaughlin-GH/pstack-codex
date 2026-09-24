@@ -21,7 +21,8 @@ does not.
    a recorded input. A compile-only pass is insufficient.
 7. Measure reader load. If the change does not make the path easier to trace,
    revert it. Sequence subtraction, reshape, and cleanup into checked units.
-8. Route the ordered handoff through [Opening a PR](./opening-a-pr.md).
+8. Route the ordered local handoff through [Opening a PR](./opening-a-pr.md).
+   Remote operations remain independently gated.
 
 UNSUPPORTED-SEAM: a missing runtime surface limits the equivalence claim. Use
 the strongest local fixture available and mark the result INCONCLUSIVE when it

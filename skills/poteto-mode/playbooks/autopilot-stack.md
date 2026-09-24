@@ -28,7 +28,7 @@ queue, then hand the operator one base-branch chain.
    through verification. If a conflict touches an owner's files, report the
    owning branch and stop the topology action.
 8. Deliver the chain as a local report. Route accepted code changes through
-   [Opening a PR](./opening-a-pr.md). No PR creation, push, retarget,
+   [Opening a PR](./opening-a-pr.md) for local package preparation. No PR creation, push, retarget,
    force-push, merge, auto-merge, deployment, or external comment occurs
    without an exact operator authorization. A fake forge may record the
    proposed operation in tests.

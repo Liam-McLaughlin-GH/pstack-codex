@@ -40,7 +40,8 @@ the exact authorization field for that operation. The log is evidence of an
 attempt, not proof that a remote operation succeeded.
 
 UNSUPPORTED-SEAM: no implicit forge, watcher, merge, deployment, message,
-agent-spawn, or worktree-removal adapter is supplied by these playbooks.
+agent-spawn, or deletion adapter is supplied by these playbooks. Worktree,
+simulator, cache, runtime, and repository deletion remain separately gated.
 
 The following operations always stop or stay fixture-only unless the user
 explicitly authorizes the exact action in the current request:
@@ -52,7 +53,11 @@ explicitly authorizes the exact action in the current request:
 | Merge or auto-merge | fixture log only | independent verdict at the exact head and explicit landing authorization |
 | Deployment or external message | NOT RUN | target, payload, rollback path, and explicit authorization |
 | Watcher or recurring monitor | bounded local poll or BLOCKED | stop predicate and bounded interval |
-| Worktree, simulator, or cache deletion | dry-run inventory | exact path, active-use check, and explicit deletion authorization |
+| Worktree deletion | dry-run inventory | exact worktree path, active-use check, and explicit worktree deletion authorization |
+| Simulator deletion | dry-run inventory | exact simulator path, active-use check, and explicit simulator deletion authorization |
+| Cache deletion | dry-run inventory | exact cache path, active-use check, and explicit cache deletion authorization |
+| Runtime deletion | dry-run inventory | exact runtime path, active-use check, and explicit runtime deletion authorization |
+| Repository deletion | dry-run inventory | exact repository path, active-use check, and explicit repository deletion authorization |
 
 Descriptions of commands below are plans, not permission to run them. A test
 must inject a fake adapter and assert that the log stays empty when the gate
@@ -71,3 +76,9 @@ next_action: one sentence
 
 Keep the state in a local file or fixture record when a loop spans turns.
 Never treat a prose claim in a reply as durable state.
+
+For a retained change handoff, keep the external lane state canonical. When no
+forge operation is authorized, report `status: NOT RUN` and carry
+`local_handoff_ready: true` only when the local diff, exact head SHA, checks,
+and proposed body are recorded. Do not combine those fields into a composite
+status such as `READY LOCAL; PR NOT RUN`.

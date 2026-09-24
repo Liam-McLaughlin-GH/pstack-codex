@@ -22,8 +22,9 @@ matching post-change artifact.
    paths. An artifact with no mapping or a wrong surface is INCONCLUSIVE.
 5. Apply $principle-sequence-verifiable-units. Verify one attempt before starting the
    next. Cite the measurement in the handoff.
-6. Route accepted work through [Opening a PR](./opening-a-pr.md). Forge and
-   deployment actions remain gated.
+6. Route accepted work through [Opening a PR](./opening-a-pr.md) for local
+   package preparation. Forge and deployment actions remain independently
+   gated.
 
 UNSUPPORTED-SEAM: no live profiler, browser, trace parser, or process-control
 surface is assumed. A local fixture or supplied artifact can support Trace

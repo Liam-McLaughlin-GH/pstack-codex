@@ -22,8 +22,8 @@ thing, measures it, then keeps or reverts it.
 7. Push past the first plateau. Re-read the source, change the category, or
    combine a supported near-miss. Stop when the predicate passes or the
    bounded set of cheap hypotheses is exhausted. Do not relax the predicate.
-8. Route accepted work to [Opening a PR](./opening-a-pr.md). Push and forge
-   actions stay behind the side-effect gate.
+8. Route accepted work to [Opening a PR](./opening-a-pr.md) for local package
+   preparation. Push and other forge actions stay behind the side-effect gate.
 
 UNSUPPORTED-SEAM: live timing, profiler control, and delegated workers may be
 unavailable. A local harness can produce a fixture result, but a missing

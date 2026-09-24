@@ -17,8 +17,10 @@ Codex skill that another session can load without guessing.
    is useful.
 6. Run the narrow structural check, the repository verifier, and
    git diff --check. Inspect the resulting tree, not only command output.
-7. Hand off to Opening a PR only when the user has authorized forge work. A
-   normal implementation report stops before create, push, or review actions.
+7. After local checks pass, hand off to Opening a PR to prepare the local
+   review package. Forge authorization is not required for that preparation.
+   Keep external status `NOT RUN` and `local_handoff_ready` separate when the
+   exact create, push, or review operation is not authorized.
 
 Keep prose that changes a decision. Delete duplicate explanation. When a
 workflow repeats, encode it in a check or fixture instead of adding another

@@ -73,6 +73,7 @@ class FakeSideEffectGate:
 
     def __init__(self) -> None:
         self.calls: list[str] = []
+        self.contracts = side_effect_contract_data()
 
     def request(
         self,
@@ -88,6 +89,18 @@ class FakeSideEffectGate:
             return False
         if not target or not evidence:
             raise ValueError(f"{operation} requires an exact target and evidence")
+        contract = self.contracts[operation]
+        target_prefix = str(contract["target_prefix"])
+        evidence_prefix = str(contract["evidence_prefix"])
+        if not target.startswith(target_prefix):
+            raise ValueError(f"{operation} target must start with {target_prefix!r}")
+        if not evidence.startswith(evidence_prefix):
+            raise ValueError(
+                f"{operation} evidence must start with {evidence_prefix!r}"
+            )
+        for field in contract["evidence_fields"]:
+            if f"{field}=" not in evidence:
+                raise ValueError(f"{operation} evidence lacks {field!r}")
         self.calls.append(operation)
         return True
 
@@ -105,8 +118,8 @@ def shipping_status(verified: bool, authorized: bool, gate: FakeSideEffectGate) 
     if not gate.request(
         "merge",
         authorized=authorized,
-        target="fixture-pr-24",
-        evidence="verified-head:abc123",
+        target="pr:24",
+        evidence="head-verdict:sha=abc123;verdict=pass",
     ):
         return "NOT RUN"
     return "PASS"
@@ -138,10 +151,15 @@ def diagnostic_state(
     artifact_supplied: bool,
     artifact_matches: bool,
     authorized: bool,
+    *,
+    artifact_required: bool = True,
+    capture_ready: bool = True,
 ) -> tuple[str, int]:
-    if not authorized:
+    if not authorized or not capture_ready:
         return "NOT RUN", 0
     if not capability_available:
+        return "BLOCKED", 0
+    if artifact_required and not artifact_supplied:
         return "BLOCKED", 0
     if artifact_supplied and not artifact_matches:
         return "INCONCLUSIVE", 0
@@ -152,12 +170,15 @@ def pr_handoff(
     change_retained: bool,
     authorized: bool,
     evidence: dict[str, str],
-) -> str:
+) -> dict[str, object]:
     if not change_retained:
-        return "NOT RUN"
+        return {"status": "NOT RUN", "local_handoff_ready": False}
     if any(not evidence.get(field) for field in ("diff", "head_sha", "checks", "body")):
-        return "BLOCKED"
-    return "READY" if authorized else "READY LOCAL; PR NOT RUN"
+        return {"status": "BLOCKED", "local_handoff_ready": False}
+    return {
+        "status": "PASS" if authorized else "NOT RUN",
+        "local_handoff_ready": True,
+    }
 
 
 class G1ParityTests(unittest.TestCase):
@@ -220,13 +241,34 @@ class G1ParityTests(unittest.TestCase):
             gate.request(
                 "merge",
                 authorized=True,
-                target="fixture-pr-24",
-                evidence="verified-head:abc123",
+                target="pr:24",
+                evidence="head-verdict:sha=abc123;verdict=pass",
             )
         )
         self.assertEqual(gate.calls, ["merge"])
         with self.assertRaises(ValueError):
             gate.request("unexpected-operation", authorized=True, target="x", evidence="y")
+
+    def test_side_effect_gate_rejects_missing_and_mismatched_fields(self) -> None:
+        contracts = side_effect_contract_data()
+        for operation, contract in contracts.items():
+            valid_target = str(contract["valid_target"])
+            valid_evidence = str(contract["valid_evidence"])
+            for target, evidence in (
+                (None, valid_evidence),
+                (valid_target, None),
+                ("wrong:target", valid_evidence),
+                (valid_target, "wrong:evidence"),
+            ):
+                gate = FakeSideEffectGate()
+                with self.assertRaises(ValueError, msg=operation):
+                    gate.request(
+                        operation,
+                        authorized=True,
+                        target=target,
+                        evidence=evidence,
+                    )
+                self.assertEqual(gate.calls, [], operation)
 
     def test_side_effect_fixture_binds_named_playbooks_to_the_gate(self) -> None:
         contracts = side_effect_contract_data()
@@ -249,8 +291,8 @@ class G1ParityTests(unittest.TestCase):
                 gate.request(
                     operation,
                     authorized=True,
-                    target=f"fixture-{operation}",
-                    evidence=f"contract:{operation}",
+                    target=str(contract["valid_target"]),
+                    evidence=str(contract["valid_evidence"]),
                 )
             )
             self.assertEqual(gate.calls, [operation])
@@ -321,19 +363,28 @@ class G1ParityTests(unittest.TestCase):
                     case["artifact"],
                     case["matches"],
                     case["authorized"],
+                    artifact_required=case["artifact_required"],
+                    capture_ready=case["capture_ready"],
                 ),
                 (case["expected"], 0),
                 case["workflow"],
             )
         for name in ("pr_handoff_without_authorization", "pr_handoff_with_authorization"):
             case = cases[name]
+            result = pr_handoff(
+                case["change_retained"], case["authorized"], case["evidence"]
+            )
+            self.assertEqual(result["status"], case["expected_status"])
             self.assertEqual(
-                pr_handoff(case["change_retained"], case["authorized"], case["evidence"]),
-                case["expected_status"],
+                result["local_handoff_ready"], case["expected_local_handoff_ready"]
             )
         self.assertEqual(
-            pr_handoff(True, False, {"diff": "", "head_sha": "abc", "checks": "ok", "body": "body"}),
-            "BLOCKED",
+            pr_handoff(
+                True,
+                False,
+                {"diff": "", "head_sha": "abc", "checks": "ok", "body": "body"},
+            ),
+            {"status": "BLOCKED", "local_handoff_ready": False},
         )
 
         cleanup = cases["cleanup_dry_run"]

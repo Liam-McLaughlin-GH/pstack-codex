@@ -40,8 +40,9 @@ merge-ready.
 
 If a verified local fix is retained, route the evidence package through
 [Opening a PR](./opening-a-pr.md). Record the diff, exact head SHA, checks, and
-proposed body locally first. Push, PR create, ready, edit, comment, merge,
-auto-merge, and deployment remain NOT RUN until each exact operation is
+proposed body locally first and set `local_handoff_ready` when the package is
+complete. Push, PR create, ready, edit, comment, merge, auto-merge, and
+deployment remain externally `NOT RUN` until each exact operation is
 explicitly authorized.
 
 UNSUPPORTED-SEAM: the upstream watcher and forge state are not available as an
