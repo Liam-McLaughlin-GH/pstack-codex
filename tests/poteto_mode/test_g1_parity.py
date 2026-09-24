@@ -86,6 +86,23 @@ class FakeSideEffectGate:
         self.calls: list[str] = []
         self.contracts = side_effect_contract_data()
 
+    def validate_deletion_target(self, operation: str, target: str) -> None:
+        """Validate a deletion target independently of exact authorization."""
+        contract = self.contracts[operation]
+        target_prefix = str(contract["target_prefix"])
+        if not target.startswith(target_prefix):
+            raise ValueError(f"{operation} target has the wrong kind")
+        target_path = target[len(target_prefix):]
+        if ".." in target_path.split("/"):
+            raise ValueError(f"{operation} target may not traverse directories")
+        normalized_target = posixpath.normpath(target_path)
+        inventory_paths = {
+            posixpath.normpath(str(path))
+            for path in contract["inventory_paths"]
+        }
+        if normalized_target not in inventory_paths:
+            raise ValueError(f"{operation} target is outside the fixture inventory")
+
     def request(
         self,
         operation: str,
@@ -112,19 +129,7 @@ class FakeSideEffectGate:
         if authorization.target != target or authorization.evidence != evidence:
             raise ValueError(f"{operation} authorization does not match the exact request")
         if operation in self.DELETION_OPERATIONS:
-            target_prefix = str(contract["target_prefix"])
-            if not target.startswith(target_prefix):
-                raise ValueError(f"{operation} target has the wrong kind")
-            target_path = target[len(target_prefix):]
-            if ".." in target_path.split("/"):
-                raise ValueError(f"{operation} target may not traverse directories")
-            normalized_target = posixpath.normpath(target_path)
-            inventory_paths = {
-                posixpath.normpath(str(path))
-                for path in contract["inventory_paths"]
-            }
-            if normalized_target not in inventory_paths:
-                raise ValueError(f"{operation} target is outside the fixture inventory")
+            self.validate_deletion_target(operation, target)
         if target != valid_target:
             raise ValueError(f"{operation} target is not the exact fixture target")
         if evidence != valid_evidence:
@@ -390,20 +395,15 @@ class G1ParityTests(unittest.TestCase):
         for operation in deletion_operations:
             contract = side_effect_contract_data()[operation]
             target_prefix = str(contract["target_prefix"])
-            evidence = str(contract["valid_evidence"])
             for target in (
                 target_prefix + "/tmp/fixture/../../etc/passwd",
                 target_prefix + "/tmp/not-in-inventory",
             ):
                 gate = FakeSideEffectGate()
                 with self.assertRaises(ValueError, msg=operation):
-                    gate.request(
-                        operation,
-                        authorization=fixture_authorization(operation),
-                        target=target,
-                        evidence=evidence,
-                    )
+                    gate.validate_deletion_target(operation, target)
                 self.assertEqual(gate.calls, [], operation)
+            gate.validate_deletion_target(operation, target_prefix + "/tmp/fixture")
 
     def test_side_effect_fixture_binds_named_playbooks_to_the_gate(self) -> None:
         contracts = side_effect_contract_data()
