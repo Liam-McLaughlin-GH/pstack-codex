@@ -30,6 +30,8 @@ predicate.
    checks, reviewer result, and PR handoff state. Create or update a PR only
    after the operator gives explicit authorization; otherwise stop at
    merge-ready with the handoff recorded.
+9. For a retained code change, route the handoff through [Opening a PR](./opening-a-pr.md).
+   Preserve NOT RUN when the exact forge action is not authorized.
 
 Use the state shape in [the capability contract](../references/capability-boundaries.md)
 and the local audit trail from $show-me-your-work.

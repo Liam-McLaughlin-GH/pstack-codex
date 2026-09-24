@@ -31,6 +31,31 @@
     "explicit_pause": false,
     "expected_checkpoint": false
   },
+  "autopilot_without_go": {
+    "go": false,
+    "expected_status": "NOT RUN",
+    "expected_owner_starts": 0
+  },
+  "autopilot_with_go": {
+    "go": true,
+    "expected_status": "RUN",
+    "expected_owner_starts": 1
+  },
+  "perf_missing_surface": {
+    "surface_available": false,
+    "expected_status": "BLOCKED",
+    "expected_changes": 0
+  },
+  "pr_handoff_without_authorization": {
+    "change_retained": true,
+    "authorized": false,
+    "expected_status": "NOT RUN"
+  },
+  "pr_handoff_with_authorization": {
+    "change_retained": true,
+    "authorized": true,
+    "expected_status": "READY"
+  },
   "cleanup_dry_run": {
     "candidates": [
       {"path": "clean-merged", "merged": true, "dirty": false, "active": false},

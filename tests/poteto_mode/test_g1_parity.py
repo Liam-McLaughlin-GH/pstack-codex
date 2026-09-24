@@ -77,7 +77,7 @@ def contract_data() -> dict[str, list[str]]:
     )
 
 
-def side_effect_contract_data() -> dict[str, list[str]]:
+def side_effect_contract_data() -> dict[str, dict[str, object]]:
     return json.loads(
         (FIXTURES / "side_effect_contracts.json").read_text(encoding="utf-8")
     )
@@ -122,6 +122,20 @@ def dry_run_cleanup(candidates: list[dict[str, object]]) -> tuple[list[str], int
         if candidate["merged"] and not candidate["dirty"] and not candidate["active"]
     ]
     return proposals, 0
+
+
+def start_autopilot(go: bool) -> tuple[str, int]:
+    return ("RUN", 1) if go else ("NOT RUN", 0)
+
+
+def perf_status(surface_available: bool) -> tuple[str, int]:
+    return ("RUN", 1) if surface_available else ("BLOCKED", 0)
+
+
+def pr_handoff(change_retained: bool, authorized: bool) -> str:
+    if not change_retained:
+        return "NOT RUN"
+    return "READY" if authorized else "NOT RUN"
 
 
 class G1ParityTests(unittest.TestCase):
@@ -177,19 +191,23 @@ class G1ParityTests(unittest.TestCase):
 
     def test_side_effect_fixture_binds_named_playbooks_to_the_gate(self) -> None:
         contracts = side_effect_contract_data()
-        self.assertEqual(set(contracts), {"forge", "watcher", "deployment", "merge", "deletion"})
-        for operation, filenames in contracts.items():
-            self.assertTrue(filenames, operation)
-            for filename in filenames:
-                text = (PLAYBOOK_DIR / filename).read_text(encoding="utf-8").casefold()
-                self.assertIn("unsupported-seam:", text, filename)
-                self.assertTrue(
-                    "fixture" in text or "fake adapter" in text,
-                    f"{filename} lacks fixture boundary for {operation}",
-                )
+        expected_operations = {
+            "pr-create", "pr-edit", "pr-ready", "push", "comment", "merge",
+            "auto-merge", "deployment", "message", "watcher", "agent-spawn",
+            "worktree-removal", "simulator", "cache",
+        }
+        self.assertEqual(set(contracts), expected_operations)
+        for operation, contract in contracts.items():
+            filename = contract["playbook"]
+            text = (PLAYBOOK_DIR / filename).read_text(encoding="utf-8").casefold()
+            self.assertIn("unsupported-seam:", text, filename)
+            for marker in contract["markers"]:
+                self.assertIn(marker, text, f"{filename} lacks {operation} marker {marker!r}")
             gate = FakeSideEffectGate()
             self.assertFalse(gate.request(operation, authorized=False))
             self.assertEqual(gate.calls, [])
+            self.assertTrue(gate.request(operation, authorized=True))
+            self.assertEqual(gate.calls, [operation])
 
     def test_contract_fixture_checks_the_actual_playbooks(self) -> None:
         contracts = contract_data()
@@ -238,6 +256,24 @@ class G1ParityTests(unittest.TestCase):
             pause_checkpoint(cases["normal_continuation"]["explicit_pause"]),
             cases["normal_continuation"]["expected_checkpoint"],
         )
+
+        for name in ("autopilot_without_go", "autopilot_with_go"):
+            case = cases[name]
+            self.assertEqual(
+                start_autopilot(case["go"]),
+                (case["expected_status"], case["expected_owner_starts"]),
+            )
+        perf = cases["perf_missing_surface"]
+        self.assertEqual(
+            perf_status(perf["surface_available"]),
+            (perf["expected_status"], perf["expected_changes"]),
+        )
+        for name in ("pr_handoff_without_authorization", "pr_handoff_with_authorization"):
+            case = cases[name]
+            self.assertEqual(
+                pr_handoff(case["change_retained"], case["authorized"]),
+                case["expected_status"],
+            )
 
         cleanup = cases["cleanup_dry_run"]
         proposals, deletions = dry_run_cleanup(cleanup["candidates"])

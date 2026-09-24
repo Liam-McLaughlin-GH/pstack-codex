@@ -1,7 +1,16 @@
 {
-  "forge": ["opening-a-pr.md", "shipping.md", "feature.md"],
-  "watcher": ["autonomous-run.md", "babysit.md", "investigation.md"],
-  "deployment": ["shipping.md", "autopilot-stack.md"],
-  "merge": ["shipping.md", "autopilot-full.md", "autopilot-stack.md"],
-  "deletion": ["worktree-cleanup.md"]
+  "pr-create": {"playbook": "opening-a-pr.md", "markers": ["pr create", "explicitly authorized", "not run"]},
+  "pr-edit": {"playbook": "opening-a-pr.md", "markers": ["edit", "separate operations", "authorization for the exact"]},
+  "pr-ready": {"playbook": "opening-a-pr.md", "markers": ["ready", "separate operations", "authorization for the exact"]},
+  "push": {"playbook": "opening-a-pr.md", "markers": ["push", "separate operations", "authorization for the exact"]},
+  "comment": {"playbook": "opening-a-pr.md", "markers": ["comment", "separate operations", "authorization for the exact"]},
+  "merge": {"playbook": "shipping.md", "markers": ["merge", "explicit ship or merge authorization", "merge log must remain empty"]},
+  "auto-merge": {"playbook": "autopilot-full.md", "markers": ["auto-merge", "explicit landing authorization", "not run"]},
+  "deployment": {"playbook": "autopilot-full.md", "markers": ["deployment", "authorized", "not run"]},
+  "message": {"playbook": "orchestrate.md", "markers": ["external message", "local fixture store", "blocked"]},
+  "watcher": {"playbook": "autonomous-run.md", "markers": ["watcher", "bounded local poll", "blocked"]},
+  "agent-spawn": {"playbook": "orchestrate.md", "markers": ["agent-spawn", "explicit go", "not run"]},
+  "worktree-removal": {"playbook": "worktree-cleanup.md", "markers": ["worktree-removal", "exact path", "explicitly authorized"]},
+  "simulator": {"playbook": "worktree-cleanup.md", "markers": ["simulator", "not run"]},
+  "cache": {"playbook": "worktree-cleanup.md", "markers": ["cache", "not run"]}
 }

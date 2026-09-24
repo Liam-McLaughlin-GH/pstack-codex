@@ -21,8 +21,9 @@ Deletion is a separate, explicitly authorized operation.
    operations. Keep them NOT RUN unless each exact target is authorized.
 7. Confirm disk state and worktree list after any controlled fixture action.
 
-UNSUPPORTED-SEAM: no automatic transcript, simulator, cache, or deletion
-adapter is assumed. The safe fallback is a local inventory and dry-run report.
+UNSUPPORTED-SEAM: no automatic transcript, simulator, cache, worktree-removal,
+or deletion adapter is assumed. The safe fallback is a local inventory and
+dry-run fixture report. Each exact deletion remains explicitly authorized.
 
 Reply with before and after disk evidence, proposed or deleted paths, held
 paths with reasons, dry-run state, and the next authorization gate.

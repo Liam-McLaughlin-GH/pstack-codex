@@ -27,7 +27,8 @@ queue, then hand the operator one base-branch chain.
 7. Absorb drift bottom-up. If a rebase changes a patch, send that item back
    through verification. If a conflict touches an owner's files, report the
    owning branch and stop the topology action.
-8. Deliver the chain as a local report. No PR creation, push, retarget,
+8. Deliver the chain as a local report. Route accepted code changes through
+   [Opening a PR](./opening-a-pr.md). No PR creation, push, retarget,
    force-push, merge, auto-merge, deployment, or external comment occurs
    without an exact operator authorization. A fake forge may record the
    proposed operation in tests.

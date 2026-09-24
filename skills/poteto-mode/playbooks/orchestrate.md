@@ -53,20 +53,23 @@ condition.
 
 ## Steps
 
-1. Frame a countable done predicate, unit count, tracks, stack shape, and
+1. Require an explicit go before initializing the local store, starting a
+   worker, or fanning out. A plan, status request, or state-then-wait response
+   is NOT RUN and leaves the coordinator and every owner at zero-write hold.
+2. Frame a countable done predicate, unit count, tracks, stack shape, and
    time budget. If one owner fits, route to Autonomous run.
-2. Initialize the local store, write standing orders, and open the decision
+3. Initialize the local store, write standing orders, and open the decision
    trail before starting a worker.
-3. Pilot one unit through brief, work, verification, ledger, and local
+4. Pilot one unit through brief, work, verification, ledger, and local
    integration. Fix the contract before fan-out.
-4. Scale with a bounded rolling window. Recompute ready work after every
+5. Scale with a bounded rolling window. Recompute ready work after every
    drain. Stop spawning when the time budget reaches its landing threshold.
-5. Drain completion pointers in batches. Classify each as landed,
+6. Drain completion pointers in batches. Classify each as landed,
    needs-verification, failed, zombie, or noise. Update units and ledger
    records before refilling.
-6. Integrate the first verified unit while later units run. Keep the local
+7. Integrate the first verified unit while later units run. Keep the local
    frontier green. Topology changes have one owner.
-7. Close by reconciling every spawned unit to done, abandoned, or
+8. Close by reconciling every spawned unit to done, abandoned, or
    zombie-reconciled. Verify the terminal predicate on the artifact and audit
    the trail.
 
@@ -82,9 +85,10 @@ retry. Retry a cap or memory failure with smaller scope, a network failure as
 is, a tool failure with another available capability, and an unknown failure
 once. After two retries, abandon the unit and replan.
 
-UNSUPPORTED-SEAM: no implicit coordinator store, worker spawn, cloud status,
-forge, watcher, merge, or deletion adapter exists. Use a local fixture store
-and fake worker records. Report BLOCKED where the missing capability matters.
+UNSUPPORTED-SEAM: no implicit coordinator store, agent-spawn, external message,
+worker, cloud status, forge, watcher, merge, deployment, or deletion adapter
+exists. Use a local fixture store and fake worker records. Report BLOCKED where
+the missing capability matters.
 
 Reply with predicate and counts from units.tsv and ledger.tsv, tracks, frontier
 records, verdicts, abandoned units, gates awaiting the user, store path, and
