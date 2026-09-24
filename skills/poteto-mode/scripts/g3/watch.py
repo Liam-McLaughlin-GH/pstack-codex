@@ -1118,10 +1118,20 @@ def run_simple(
 ) -> dict[str, Any]:
     """Poll one PR or a stack without invoking a provider or mutating it."""
 
+    try:
+        contexts = tuple(contexts)
+    except (TypeError, ValueError) as exc:
+        raise UnknownProviderData("watch contexts are not a valid sequence") from exc
     if not contexts:
         raise ValueError("watch context cannot be empty")
     if mode not in {"single", "stack"}:
         raise ValueError("run_simple mode must be single or stack")
+    expected_context_keys: list[tuple[str, str, int]] = []
+    for index, context in enumerate(contexts):
+        if not isinstance(context, PRContext):
+            raise UnknownProviderData(f"watch context {index} is not a pull request identity")
+        _revalidate(context, f"watch context {index} identity")
+        expected_context_keys.append((context.owner, context.repo, context.number))
     options = options or PollOptions()
     clock = clock or SystemClock()
     emitter = _Emitter(clock, mode, emit)
@@ -1150,6 +1160,11 @@ def run_simple(
             continue
         if _deadline_reached(clock, started, options):
             return _timeout(emitter, {"kind": "deadline"})
+        for index, (context, row) in enumerate(zip(contexts, rows)):
+            _revalidate(context, f"watch context {index} identity")
+            row_key = (row.context.owner, row.context.repo, row.context.number)
+            if row_key != expected_context_keys[index]:
+                raise UnknownProviderData("reader returned another pull request identity")
         if status_only:
             return emitter.stamp(
                 {"kind": "STATUS", "reason": "status-only", "rows": [_snapshot(row) for row in rows]},

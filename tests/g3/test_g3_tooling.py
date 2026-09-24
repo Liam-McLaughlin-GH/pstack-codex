@@ -428,6 +428,17 @@ class G3WatcherTests(unittest.TestCase):
         with self.assertRaises(UnknownProviderData):
             run_simple(CollisionReader(), [requested], clock=DeterministicClock())
 
+    def test_simple_rejects_reader_mutating_context_identity(self) -> None:
+        context = PRContext("owner", "repo", 24)
+
+        class MutatingReader(FakeReader):
+            def pull_request(self, requested: PRContext) -> PRFacts:
+                object.__setattr__(requested, "owner", "mutated-owner")
+                return PRFacts(requested)
+
+        with self.assertRaises(UnknownProviderData):
+            run_simple(MutatingReader(), [context], clock=DeterministicClock())
+
     def test_max_query_errors_requires_a_finite_positive_integer(self) -> None:
         for value in (0, -1, True, 1.0, float("nan"), float("inf")):
             with self.subTest(value=value), self.assertRaises(ValueError):
