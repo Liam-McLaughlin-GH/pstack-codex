@@ -1142,6 +1142,8 @@ def apply_plan(plan: list[AgentPlan], agents_root: Path, *, allow_replace: bool 
                                 staging_metadata,
                                 root_metadata,
                                 published_snapshot,
+                                outcome.recovery_receipt,
+                                outcome.recovery_state,
                             )
                             if outcome.status not in {"published", "published_cleanup_pending"}:
                                 break

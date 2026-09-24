@@ -215,13 +215,23 @@ class SetupPstackBehaviorTests(unittest.TestCase):
 
             module.atomic_rename_noreplace_at = fail_publication
             try:
-                with self.assertRaises(module.InstallError):
+                with self.assertRaises(module.InstallError) as raised:
                     module.apply_install(source, destination)
             finally:
                 module.atomic_rename_noreplace_at = original_publish
             if sys.platform == "darwin":
-                self.assertFalse((destination / "setup-pstack").exists())
+                if raised.exception.status == "cleanup_pending":
+                    self.assertIsNotNone(raised.exception.residue)
+                    assert raised.exception.residue is not None
+                    self.assertTrue(raised.exception.residue.exists())
+                    self.assertTrue(raised.exception.residue.name.startswith(".setup-pstack-install-"))
+                    self.assertIn("install.py cleanup", raised.exception.retry or "")
+                    self.assertEqual(raised.exception.recovery_state, "rollback_cleanup_pending")
+                else:
+                    self.assertEqual(raised.exception.status, "failed")
+                    self.assertFalse((root / "new-root").exists())
             else:
+                self.assertEqual(raised.exception.status, "failed")
                 self.assertFalse((root / "new-root").exists())
 
     def test_installer_rollback_reports_a_replaced_created_parent(self) -> None:
@@ -570,7 +580,7 @@ class SetupPstackBehaviorTests(unittest.TestCase):
 
             module.atomic_rename_noreplace_at = publish_with_competitor
             try:
-                with self.assertRaises(module.InstallError):
+                with self.assertRaises(module.InstallError) as raised:
                     module.apply_install(source, destination)
             finally:
                 module.atomic_rename_noreplace_at = original_publish
@@ -578,8 +588,18 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertEqual((competitor / "SKILL.md").read_text(encoding="utf-8"), "competitor\n")
             residue = list(destination.glob(".setup-pstack-install-*"))
             if sys.platform == "darwin":
-                self.assertLessEqual(len(residue), 1)
+                if raised.exception.status == "cleanup_pending":
+                    self.assertIsNotNone(raised.exception.residue)
+                    assert raised.exception.residue is not None
+                    self.assertTrue(raised.exception.residue.exists())
+                    self.assertEqual(residue, [raised.exception.residue])
+                    self.assertIn("install.py cleanup", raised.exception.retry or "")
+                    self.assertEqual(raised.exception.recovery_state, "rollback_cleanup_pending")
+                else:
+                    self.assertEqual(raised.exception.status, "failed")
+                    self.assertEqual(residue, [])
             else:
+                self.assertEqual(raised.exception.status, "failed")
                 self.assertEqual(residue, [])
 
     def test_self_tests_and_repeated_preview_leave_no_bytecode_residue(self) -> None:
@@ -920,13 +940,32 @@ class SetupPstackBehaviorTests(unittest.TestCase):
 
             fresh = module.build_plan(models, agents, budget="large")
             original_remove = module.remove_tree_at
+            safe_fs = sys.modules["safe_fs"]
             failed = False
 
             def fail_cleanup(parent_fd: int, name: str, **kwargs: object) -> None:
                 nonlocal failed
                 if not failed and name.startswith(".pstack-agents-"):
                     failed = True
-                    raise OSError("injected old-generation cleanup failure")
+                    residue = kwargs["receipt_root"]
+                    metadata = kwargs["expected_metadata"]
+                    assert isinstance(residue, Path)
+                    assert isinstance(metadata, os.stat_result)
+                    receipt = safe_fs.CleanupReceipt.from_entries(
+                        [
+                            safe_fs.CleanupReceiptEntry(
+                                residue,
+                                metadata.st_dev,
+                                metadata.st_ino,
+                                "cleanup-error",
+                            )
+                        ]
+                    )
+                    raise safe_fs.SafeFilesystemError(
+                        "injected old-generation cleanup failure",
+                        cleanup_receipt=receipt,
+                        preserve_private=True,
+                    )
                 original_remove(parent_fd, name, **kwargs)
 
             module.remove_tree_at = fail_cleanup
@@ -937,6 +976,8 @@ class SetupPstackBehaviorTests(unittest.TestCase):
             self.assertEqual(outcome.status, "published_cleanup_pending")
             self.assertIsNotNone(outcome.residue)
             self.assertTrue(outcome.residue.is_dir())
+            self.assertEqual(outcome.recovery_state, "publication_cleanup_recovery_pending")
+            self.assertIsNotNone(outcome.recovery_receipt)
             self.assertIn('model_reasoning_effort = "xhigh"', (agents / "pstack-feature.toml").read_text(encoding="utf-8"))
 
             cleanup = run_script(CONFIGURER, "cleanup", "--residue", str(outcome.residue), "--json")
@@ -1185,11 +1226,22 @@ class SetupPstackBehaviorTests(unittest.TestCase):
                 outcome = module.apply_plan(replacement, agents, allow_replace=True)
             finally:
                 module.atomic_exchange_at = original_exchange
-            self.assertIn(outcome.status, {"published", "published_cleanup_pending"})
+            if outcome.status == "published_cleanup_pending":
+                self.assertEqual(sys.platform, "darwin")
+                self.assertIsNotNone(outcome.residue)
+                self.assertTrue(outcome.residue.exists())
+                self.assertIsNotNone(outcome.retry)
+                self.assertEqual(outcome.recovery_state, "publication_cleanup_recovery_pending")
+            else:
+                self.assertEqual(outcome.status, "published")
+                self.assertIsNone(outcome.residue)
+                self.assertEqual(list(agents.parent.glob(".pstack-agents-old-*")), [])
             self.assertIn('model_reasoning_effort = "xhigh"', (agents / "pstack-feature.toml").read_text(encoding="utf-8"))
             if sys.platform == "darwin":
-                self.assertIn(outcome.status, {"published", "published_cleanup_pending"})
-                self.assertLessEqual(len(list(agents.parent.glob(".pstack-agents-old-*"))), 1)
+                if outcome.status == "published":
+                    self.assertEqual(list(agents.parent.glob(".pstack-agents-old-*")), [])
+                else:
+                    self.assertEqual(list(agents.parent.glob(".pstack-agents-old-*")), [outcome.residue])
             else:
                 self.assertEqual(list(agents.parent.glob(".pstack-agents-old-*")), [])
 
@@ -2209,7 +2261,15 @@ class SetupPstackBehaviorTests(unittest.TestCase):
                 outcome = module.apply_plan(replacement, agents, allow_replace=True)
             finally:
                 module.atomic_exchange_at = original_exchange
-            self.assertIn(outcome.status, {"published", "published_cleanup_pending"})
+            if outcome.status == "published_cleanup_pending":
+                self.assertEqual(sys.platform, "darwin")
+                self.assertIsNotNone(outcome.residue)
+                self.assertTrue(outcome.residue.exists())
+                self.assertIsNotNone(outcome.retry)
+                self.assertEqual(outcome.recovery_state, "publication_cleanup_recovery_pending")
+            else:
+                self.assertEqual(outcome.status, "published")
+                self.assertIsNone(outcome.residue)
             self.assertIn('model_reasoning_effort = "xhigh"', (agents / "pstack-feature.toml").read_text(encoding="utf-8"))
 
     def test_verifier_allows_documented_unsupported_boundary_and_rejects_active_seam(self) -> None:
