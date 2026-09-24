@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import contextlib
+import io
 import sys
 import tempfile
 import unittest
@@ -140,6 +142,17 @@ class G3WatcherTests(unittest.TestCase):
                     "--status-only",
                 ]
             )
+
+    def test_public_cli_renders_malformed_provider_as_json_error(self) -> None:
+        from pstack_g3_helpers import watch
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            result = watch.main(["--fixture", str(FIXTURES / "provider-unknown.json")])
+        self.assertEqual(result, 2)
+        rendered = json.loads(output.getvalue())
+        self.assertEqual(rendered["kind"], "ERROR")
+        self.assertEqual(rendered["error"], "UnknownProviderData")
 
     def test_recorded_fast_path_falls_back_to_rollup_pages(self) -> None:
         payload = json.loads((FIXTURES / "provider-ready.json").read_text())

@@ -10,6 +10,7 @@ how the data was obtained.  Unknown provider enums and malformed shapes raise
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import tempfile
@@ -1092,18 +1093,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--status-only", action="store_true")
     parser.add_argument("--timeout", type=float, default=0)
     args = parser.parse_args(argv)
-    context = PRContext(args.owner, args.repo, args.pr)
-    reader = JsonProviderAdapter.from_file(args.fixture)
-    if args.mode == "queued-stack" and args.status_only:
-        parser.error("--status-only is not supported with --mode queued-stack")
     try:
+        context = PRContext(args.owner, args.repo, args.pr)
+        reader = JsonProviderAdapter.from_file(args.fixture)
+        if args.mode == "queued-stack" and args.status_only:
+            parser.error("--status-only is not supported with --mode queued-stack")
         options = PollOptions(timeout=args.timeout)
-    except ValueError as exc:
-        parser.error(str(exc))
-    if args.mode == "queued-stack":
-        result = run_queued(reader, [context], options=options)
-    else:
-        result = run_simple(reader, [context], mode=args.mode, status_only=args.status_only, options=options)
+        if args.mode == "queued-stack":
+            result = run_queued(reader, [context], options=options)
+        else:
+            result = run_simple(reader, [context], mode=args.mode, status_only=args.status_only, options=options)
+    except SystemExit:
+        raise
+    except (UnknownProviderData, QueryFailure, ValueError) as exc:
+        print(
+            json.dumps(
+                {
+                    "kind": "ERROR",
+                    "error": type(exc).__name__,
+                    "message": str(exc),
+                    "schema_version": 1,
+                    "terminal": True,
+                    "exit_code": 2,
+                },
+                sort_keys=True,
+            )
+        )
+        return 2
     print(json.dumps(result, default=_json_default, sort_keys=True))
     return int(result.get("exit_code", 1))
 
