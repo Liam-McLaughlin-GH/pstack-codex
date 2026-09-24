@@ -73,6 +73,14 @@ condition.
    zombie-reconciled. Verify the terminal predicate on the artifact and audit
    the trail.
 
+## Retained changes
+
+If a worker change is retained, route the local handoff through [Opening a PR](./opening-a-pr.md).
+Record the diff, exact head SHA, checks, and proposed body before any forge
+operation. Push, PR create, ready, edit, comment, merge, auto-merge, and
+deployment are separate operations; each remains NOT RUN until its exact
+operation is explicitly authorized.
+
 ## Verification and failure
 
 A unit needs evidence stronger than a green generic check. Use

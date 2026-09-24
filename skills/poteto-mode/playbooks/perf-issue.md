@@ -4,8 +4,10 @@ You own the measurement story. Tie each fix to a captured baseline and a
 matching post-change artifact.
 
 1. Confirm that the matching profiler, browser, trace, or process-control
-   surface is available. If it is missing, stop before editing and return
-   BLOCKED or INCONCLUSIVE with the local fallback and next action. Otherwise
+   surface is available. If the required surface is missing, stop before
+   editing and return BLOCKED. If a supplied artifact is wrong-surface or
+   unmappable, return INCONCLUSIVE. If capture is unapproved or its
+   precondition is unmet, return NOT RUN. Otherwise
    capture a baseline on the matching surface. Name metric, unit,
    workload, sample count, noise rule, and artifact path.
 2. Run $how over the affected path. Use the following strategy families as
@@ -26,7 +28,8 @@ matching post-change artifact.
 UNSUPPORTED-SEAM: no live profiler, browser, trace parser, or process-control
 surface is assumed. A local fixture or supplied artifact can support Trace
 forensics, but it cannot prove a live performance change. Missing matching
-surface status is BLOCKED or INCONCLUSIVE before any code change.
+surface status is BLOCKED before any code change; a wrong-surface artifact is
+INCONCLUSIVE and an unapproved capture is NOT RUN.
 
 Reply with baseline, post-fix number, delta, workload, artifacts, source
 mapping, and any INCONCLUSIVE boundary.

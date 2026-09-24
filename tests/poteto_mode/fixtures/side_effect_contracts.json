@@ -12,5 +12,7 @@
   "agent-spawn": {"playbook": "orchestrate.md", "markers": ["agent-spawn", "explicit go", "not run"]},
   "worktree-removal": {"playbook": "worktree-cleanup.md", "markers": ["worktree-removal", "exact path", "explicitly authorized"]},
   "simulator": {"playbook": "worktree-cleanup.md", "markers": ["simulator", "not run"]},
-  "cache": {"playbook": "worktree-cleanup.md", "markers": ["cache", "not run"]}
+  "cache": {"playbook": "worktree-cleanup.md", "markers": ["cache", "not run"]},
+  "runtime": {"playbook": "worktree-cleanup.md", "markers": ["runtime", "separate operations", "not run"]},
+  "repository": {"playbook": "worktree-cleanup.md", "markers": ["repository", "separate operations", "not run"]}
 }

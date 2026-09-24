@@ -49,13 +49,21 @@
   "pr_handoff_without_authorization": {
     "change_retained": true,
     "authorized": false,
-    "expected_status": "NOT RUN"
+    "evidence": {"diff": "diff", "head_sha": "abc123", "checks": "pass", "body": "body"},
+    "expected_status": "READY LOCAL; PR NOT RUN"
   },
   "pr_handoff_with_authorization": {
     "change_retained": true,
     "authorized": true,
+    "evidence": {"diff": "diff", "head_sha": "abc123", "checks": "pass", "body": "body"},
     "expected_status": "READY"
   },
+  "diagnostic_states": [
+    {"workflow": "investigation", "capability": false, "artifact": false, "matches": false, "authorized": true, "expected": "BLOCKED"},
+    {"workflow": "runtime-forensics", "capability": true, "artifact": true, "matches": false, "authorized": true, "expected": "INCONCLUSIVE"},
+    {"workflow": "trace-forensics", "capability": true, "artifact": true, "matches": true, "authorized": false, "expected": "NOT RUN"},
+    {"workflow": "perf-issue", "capability": true, "artifact": true, "matches": true, "authorized": true, "expected": "PASS"}
+  ],
   "cleanup_dry_run": {
     "candidates": [
       {"path": "clean-merged", "merged": true, "dirty": false, "active": false},

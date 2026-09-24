@@ -15,31 +15,10 @@ ROOT = Path(__file__).resolve().parents[2]
 PLAYBOOK_DIR = ROOT / "skills" / "poteto-mode" / "playbooks"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
-PLAYBOOK_NAMES = {
-    "authoring-a-skill.md",
-    "autonomous-run.md",
-    "autopilot-full.md",
-    "autopilot-stack.md",
-    "babysit.md",
-    "bug-fix.md",
-    "eval.md",
-    "feature.md",
-    "hillclimb.md",
-    "investigation.md",
-    "multi-phase-plan.md",
-    "opening-a-pr.md",
-    "orchestrate.md",
-    "pause-safely.md",
-    "perf-issue.md",
-    "prototype.md",
-    "refactoring.md",
-    "runtime-forensics.md",
-    "session-pickup.md",
-    "shipping.md",
-    "trace-forensics.md",
-    "visual-parity.md",
-    "worktree-cleanup.md",
-}
+PLAYBOOK_INVENTORY = json.loads(
+    (FIXTURES / "playbook_inventory.json").read_text(encoding="utf-8")
+)
+PLAYBOOK_NAMES = set(PLAYBOOK_INVENTORY["names"])
 
 WORKFLOW_PATHS = (
     ROOT / "skills" / "poteto-mode" / "SKILL.md",
@@ -86,12 +65,29 @@ def side_effect_contract_data() -> dict[str, dict[str, object]]:
 class FakeSideEffectGate:
     """Fixture-only adapter that makes authorization observable."""
 
+    OPERATIONS = {
+        "pr-create", "pr-edit", "pr-ready", "push", "comment", "merge",
+        "auto-merge", "deployment", "message", "watcher", "agent-spawn",
+        "worktree-removal", "simulator", "cache", "runtime", "repository",
+    }
+
     def __init__(self) -> None:
         self.calls: list[str] = []
 
-    def request(self, operation: str, *, authorized: bool) -> bool:
+    def request(
+        self,
+        operation: str,
+        *,
+        authorized: bool,
+        target: str | None = None,
+        evidence: str | None = None,
+    ) -> bool:
+        if operation not in self.OPERATIONS:
+            raise ValueError(f"unsupported fixture operation: {operation}")
         if not authorized:
             return False
+        if not target or not evidence:
+            raise ValueError(f"{operation} requires an exact target and evidence")
         self.calls.append(operation)
         return True
 
@@ -106,7 +102,12 @@ def run_autonomous(outcomes: list[str]) -> tuple[str, int]:
 def shipping_status(verified: bool, authorized: bool, gate: FakeSideEffectGate) -> str:
     if not verified:
         return "BLOCKED"
-    if not gate.request("merge", authorized=authorized):
+    if not gate.request(
+        "merge",
+        authorized=authorized,
+        target="fixture-pr-24",
+        evidence="verified-head:abc123",
+    ):
         return "NOT RUN"
     return "PASS"
 
@@ -132,10 +133,31 @@ def perf_status(surface_available: bool) -> tuple[str, int]:
     return ("RUN", 1) if surface_available else ("BLOCKED", 0)
 
 
-def pr_handoff(change_retained: bool, authorized: bool) -> str:
+def diagnostic_state(
+    capability_available: bool,
+    artifact_supplied: bool,
+    artifact_matches: bool,
+    authorized: bool,
+) -> tuple[str, int]:
+    if not authorized:
+        return "NOT RUN", 0
+    if not capability_available:
+        return "BLOCKED", 0
+    if artifact_supplied and not artifact_matches:
+        return "INCONCLUSIVE", 0
+    return "PASS", 0
+
+
+def pr_handoff(
+    change_retained: bool,
+    authorized: bool,
+    evidence: dict[str, str],
+) -> str:
     if not change_retained:
         return "NOT RUN"
-    return "READY" if authorized else "NOT RUN"
+    if any(not evidence.get(field) for field in ("diff", "head_sha", "checks", "body")):
+        return "BLOCKED"
+    return "READY" if authorized else "READY LOCAL; PR NOT RUN"
 
 
 class G1ParityTests(unittest.TestCase):
@@ -143,6 +165,14 @@ class G1ParityTests(unittest.TestCase):
         actual = {path.name for path in PLAYBOOK_DIR.glob("*.md")}
         self.assertEqual(actual, PLAYBOOK_NAMES)
         self.assertEqual(len(actual), 23)
+        self.assertEqual(
+            PLAYBOOK_INVENTORY["source_commit"],
+            "53e579f1481697931fc44f5445171397cfa2b24b",
+        )
+        self.assertEqual(
+            PLAYBOOK_INVENTORY["source_path"],
+            "pstack/skills/poteto-mode/playbooks",
+        )
 
     def test_targeted_links_and_repository_verifier_are_clean(self) -> None:
         verifier = load_verifier()
@@ -183,18 +213,27 @@ class G1ParityTests(unittest.TestCase):
     def test_external_operations_stop_without_authorization(self) -> None:
         gate = FakeSideEffectGate()
         self.assertFalse(gate.request("merge", authorized=False))
-        self.assertFalse(gate.request("deploy", authorized=False))
+        self.assertFalse(gate.request("deployment", authorized=False))
         self.assertEqual(gate.calls, [])
 
-        self.assertTrue(gate.request("merge", authorized=True))
+        self.assertTrue(
+            gate.request(
+                "merge",
+                authorized=True,
+                target="fixture-pr-24",
+                evidence="verified-head:abc123",
+            )
+        )
         self.assertEqual(gate.calls, ["merge"])
+        with self.assertRaises(ValueError):
+            gate.request("unexpected-operation", authorized=True, target="x", evidence="y")
 
     def test_side_effect_fixture_binds_named_playbooks_to_the_gate(self) -> None:
         contracts = side_effect_contract_data()
         expected_operations = {
             "pr-create", "pr-edit", "pr-ready", "push", "comment", "merge",
             "auto-merge", "deployment", "message", "watcher", "agent-spawn",
-            "worktree-removal", "simulator", "cache",
+            "worktree-removal", "simulator", "cache", "runtime", "repository",
         }
         self.assertEqual(set(contracts), expected_operations)
         for operation, contract in contracts.items():
@@ -206,7 +245,14 @@ class G1ParityTests(unittest.TestCase):
             gate = FakeSideEffectGate()
             self.assertFalse(gate.request(operation, authorized=False))
             self.assertEqual(gate.calls, [])
-            self.assertTrue(gate.request(operation, authorized=True))
+            self.assertTrue(
+                gate.request(
+                    operation,
+                    authorized=True,
+                    target=f"fixture-{operation}",
+                    evidence=f"contract:{operation}",
+                )
+            )
             self.assertEqual(gate.calls, [operation])
 
     def test_contract_fixture_checks_the_actual_playbooks(self) -> None:
@@ -268,12 +314,27 @@ class G1ParityTests(unittest.TestCase):
             perf_status(perf["surface_available"]),
             (perf["expected_status"], perf["expected_changes"]),
         )
+        for case in cases["diagnostic_states"]:
+            self.assertEqual(
+                diagnostic_state(
+                    case["capability"],
+                    case["artifact"],
+                    case["matches"],
+                    case["authorized"],
+                ),
+                (case["expected"], 0),
+                case["workflow"],
+            )
         for name in ("pr_handoff_without_authorization", "pr_handoff_with_authorization"):
             case = cases[name]
             self.assertEqual(
-                pr_handoff(case["change_retained"], case["authorized"]),
+                pr_handoff(case["change_retained"], case["authorized"], case["evidence"]),
                 case["expected_status"],
             )
+        self.assertEqual(
+            pr_handoff(True, False, {"diff": "", "head_sha": "abc", "checks": "ok", "body": "body"}),
+            "BLOCKED",
+        )
 
         cleanup = cases["cleanup_dry_run"]
         proposals, deletions = dry_run_cleanup(cleanup["candidates"])

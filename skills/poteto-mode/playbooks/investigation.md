@@ -14,8 +14,10 @@ explanation or a recommendation.
    create a branch, edit code, create a PR, send a message, or mutate data.
 6. Apply $unslop to the final explanation. If the investigation is the
    prelude to a change, hand the evidence back and route to Bug fix or
-   Feature. Do not begin that change in this playbook. When a named surface is
-   unavailable, mark the result `BLOCKED`, `INCONCLUSIVE`, or `NOT RUN`.
+   Feature. Do not begin that change in this playbook. Use this state matrix:
+   a missing required capability is `BLOCKED`, an unapproved or unmet
+   precondition is `NOT RUN`, and a supplied artifact that is wrong-surface or
+   cannot be mapped is `INCONCLUSIVE`.
 
 UNSUPPORTED-SEAM: external issue, chat, observability, or analytics sources are
 not assumed. Record the unavailable category and use local source evidence,

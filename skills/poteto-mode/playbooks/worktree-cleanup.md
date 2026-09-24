@@ -18,7 +18,11 @@ Deletion is a separate, explicitly authorized operation.
    Record the operation and post-action accounting. Do not infer that a broad
    authorization covers other paths.
 6. Treat simulator, cache, runtime, and repository deletion as separate
-   operations. Keep them NOT RUN unless each exact target is authorized.
+   operations. Keep simulator deletion NOT RUN, cache deletion NOT RUN,
+   runtime deletion NOT RUN, and repository deletion NOT RUN unless each exact
+   target is authorized.
+   Runtime and repository deletion are separate operations with separate
+   targets and authorization records.
 7. Confirm disk state and worktree list after any controlled fixture action.
 
 UNSUPPORTED-SEAM: no automatic transcript, simulator, cache, worktree-removal,

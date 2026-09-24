@@ -16,8 +16,10 @@ cited finding, not a fix.
 5. Keep the throughput checkpoint to one line:
    throughput checkpoint: n/a, read-only forensics.
 6. Hand the diagnosis to Bug fix or Perf issue. Do not apply a fix in this
-   playbook. If a required live surface is absent, mark the result `BLOCKED`,
-   `INCONCLUSIVE`, or `NOT RUN` and stop with the diagnostic report.
+   playbook. Use this state matrix: an absent required live surface is
+   `BLOCKED`, a supplied artifact from the wrong surface or without source
+   mapping is `INCONCLUSIVE`, and an unapproved or unmet capture precondition
+   is `NOT RUN`. Stop with the diagnostic report.
 
 UNSUPPORTED-SEAM: no live process, browser protocol, device, or profiler
 adapter is assumed. A supplied capture can be handled by Trace forensics, but
