@@ -85,7 +85,7 @@ def _visible_text(value: str) -> str:
     return "".join(
         character
         for character in normalized
-        if unicodedata.category(character) not in {"Cf", "Mn"}
+        if character.isprintable() and unicodedata.category(character) not in {"Cf", "Mn"}
     )
 
 
@@ -158,8 +158,8 @@ def parse_role_file(path: Path) -> RoleDefinition:
         )
         unsafe_match = re.search(
             r"\b(?:write|edit|modify|create|delete|remove|change|mutate|apply)\b"
-            r".{0,60}\b(?:application code|files?|repository|data)\b"
-            r"|\b(?:application code|files?|repository|data)\b.{0,40}"
+            r".{0,60}\b(?:application code|source code|code|files?|repository|repo|data|patch|directory|output|disk)\b"
+            r"|\b(?:application code|source code|code|files?|repository|repo|data|patch|directory|output|disk)\b.{0,40}"
             r"\b(?:write|edit|modify|create|delete|remove|change|mutate|apply)\b",
             normalized_instructions,
             re.IGNORECASE,
@@ -400,9 +400,10 @@ def validate_comment_sicko_report(output: str) -> dict[str, str]:
                 else:
                     sections[field] = value
                 if not value or not any(
-                    not character.isspace()
+                    character.isprintable()
+                    and not character.isspace()
                     and unicodedata.category(character) not in {"Cf", "Mn"}
-                    for character in value
+                    for character in unicodedata.normalize("NFKC", value)
                 ):
                     raise ReportContractError(f"Comment Sicko report leaves {field!r} empty")
                 break

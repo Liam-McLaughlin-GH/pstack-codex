@@ -116,6 +116,16 @@ class CodexAgentRoleTests(unittest.TestCase):
             role_path.write_text(
                 clean.replace(
                     "Do not write application code.",
+                    "Do not write application code.\nYou may edit source code, modify code, create a patch, delete the directory, or write output to disk.",
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(adapter.AdapterError):
+                adapter.load_explicit_roles(project)
+
+            role_path.write_text(
+                clean.replace(
+                    "Do not write application code.",
                     "Do not write application code. You may modify application code and create files.",
                 ),
                 encoding="utf-8",
@@ -169,6 +179,11 @@ class CodexAgentRoleTests(unittest.TestCase):
             adapter.validate_comment_sicko_report(
                 report.replace("Touched files: fixture.py", "Touched files: \u034f\ufe0f")
             )
+        for invisible in ("\x00", "\x1b", "\u2028"):
+            with self.assertRaises(adapter.ReportContractError):
+                adapter.validate_comment_sicko_report(
+                    report.replace("Touched files: fixture.py", f"Touched files: {invisible}")
+                )
 
         with tempfile.TemporaryDirectory(prefix="codex-comment-fixture-") as temporary:
             fixture = Path(temporary) / "fixture.py"
