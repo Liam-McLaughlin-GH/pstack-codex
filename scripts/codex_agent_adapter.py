@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import re
 import subprocess
 import sys
 import tomllib
@@ -24,12 +23,6 @@ COMMENT_SICKO_REPORT_FIELDS = (
     "MUST KILL:",
     "Skips:",
 )
-COMMENT_SICKO_REQUIRED_INSTRUCTIONS = (
-    "Your first output must be exactly this single line:",
-    COMMENT_SICKO_FIRST_OUTPUT,
-    *COMMENT_SICKO_REPORT_FIELDS,
-)
-VALID_SANDBOX_MODES = {"read-only", "workspace-write", "danger-full-access"}
 DIRECT_SKILL_FALLBACKS = {
     "poteto-agent": "poteto-mode",
     "Comment Sicko": "no-comments",
@@ -39,7 +32,53 @@ EXPECTED_ROLE_DESCRIPTIONS = {
     "poteto-agent": "Routing target for /poteto-mode and requests for poteto's style.",
     "Comment Sicko": "A deranged comment-hater that savors deletion and condemns workaround code.",
 }
-EXPECTED_ROLE_SANDBOX = {"poteto-agent": None, "Comment Sicko": "read-only"}
+EXPECTED_ROLE_CONFIG_FILES = {
+    "poteto-agent": "agents/poteto-agent.toml",
+    "Comment Sicko": "agents/comment-sicko.toml",
+}
+EXPECTED_ROLE_SETTINGS = {
+    "poteto-agent": {},
+    "Comment Sicko": {"sandbox_mode": "read-only"},
+}
+EXPECTED_ROLE_DEVELOPER_INSTRUCTIONS = {
+    "poteto-agent": (
+        "You are operating as poteto-mode's full agent style.\n"
+        "\n"
+        "Before doing any work, read the complete skills/poteto-mode/SKILL.md file, including its inline Principles index and working rules. Do not replace that read with a summary. When applying a principle, read the complete relevant skills/principle-*/SKILL.md leaf before using it.\n"
+        "\n"
+        "Preserve the parent task contract, scope, and verification requirements. If an existing poteto-agent identity is supplied by the caller, continue that identity instead of creating a sibling. A generic-purpose worker is not a substitute for this role because it can skip the required skill reads.\n"
+    ),
+    "Comment Sicko": (
+        "Your first output must be exactly this single line:\n"
+        "Yes... Ha ha ha... Yes!\n"
+        "\n"
+        "You are Comment Sicko. Work only from the parent-scoped files or diff. If no scope is supplied, inspect the current diff against main. If that diff is empty or unavailable, report the skip instead of inventing findings.\n"
+        "\n"
+        "Review narration, banners, commented-out code, workaround explanations, and long justifications. Keep only these exceptions:\n"
+        "\n"
+        "- Legal or license headers.\n"
+        "- Non-obvious behavior forced by an external dependency, platform, vendor, or protocol that cannot be reshaped. If our own code is surprising, mark the exact symbol MUST KILL for rename, extraction, typing, or rearchitecture that makes the behavior obvious without prose.\n"
+        "- // prettier-ignore.\n"
+        "- Lint suppressions only when the rule is faulty, pedantic, or style-only. Look up the rule. If it protects correctness or safety, flag the exact guilty symbol MUST KILL.\n"
+        "- Public API doc comments.\n"
+        "- Issue or RFC links that express a constraint code cannot express.\n"
+        "\n"
+        "Read nearby code before judging. When a claim is not obvious there, use the $how or $why skill on the named symbol or call. Do not write application code. This is a report-only review.\n"
+        "\n"
+        "The report must contain these sections after the first line, using one line for each MUST KILL flag:\n"
+        "Touched files:\n"
+        "Deletion count:\n"
+        "MUST KILL:\n"
+        "Skips:\n"
+    ),
+}
+EXPECTED_REGISTRY = {
+    role_name: {
+        "description": EXPECTED_ROLE_DESCRIPTIONS[role_name],
+        "config_file": EXPECTED_ROLE_CONFIG_FILES[role_name],
+    }
+    for role_name in EXPECTED_ROLE_NAMES
+}
 
 
 class AdapterError(ValueError):
@@ -83,26 +122,19 @@ class ModelSelection:
 def _non_empty_string(value: object, field: str, path: Path) -> str:
     if not isinstance(value, str) or not value.strip():
         raise AdapterError(f"{path}: {field} must be a non-empty string")
-    return value.strip()
-
-
-def _visible_text(value: str) -> str:
-    normalized = unicodedata.normalize("NFKC", value)
-    return "".join(
-        character
-        for character in normalized
-        if character.isprintable() and unicodedata.category(character) not in {"Cf", "Mn"}
-    )
+    return value
 
 
 def parse_role_file(path: Path) -> RoleDefinition:
     """Parse one current-format Codex role file and validate its required fields."""
 
+    if not isinstance(path, Path):
+        raise AdapterError("role file path must be a pathlib.Path")
     try:
         with path.open("rb") as stream:
             raw = tomllib.load(stream)
-    except FileNotFoundError as exc:
-        raise AdapterError(f"role file does not exist: {path}") from exc
+    except (OSError, UnicodeError) as exc:
+        raise AdapterError(f"could not read role file: {path}: {exc}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise AdapterError(f"role file is not valid TOML: {path}: {exc}") from exc
 
@@ -110,16 +142,33 @@ def parse_role_file(path: Path) -> RoleDefinition:
         raise AdapterError(f"role file must contain a TOML table: {path}")
     name = _non_empty_string(raw.get("name"), "name", path)
     description = _non_empty_string(raw.get("description"), "description", path)
-    developer_instructions = _non_empty_string(
-        raw.get("developer_instructions"),
-        "developer_instructions",
-        path,
-    )
+    developer_instructions_value = raw.get("developer_instructions")
+    if not isinstance(developer_instructions_value, str) or not developer_instructions_value.strip():
+        raise AdapterError(f"{path}: developer_instructions must be a non-empty string")
+    developer_instructions = developer_instructions_value
+    if name not in EXPECTED_ROLE_NAMES:
+        raise AdapterError(f"{path}: unsupported shipped role {name!r}")
+    expected_settings = EXPECTED_ROLE_SETTINGS[name]
+    expected_keys = {"name", "description", "developer_instructions", *expected_settings}
+    unknown_keys = set(raw) - expected_keys
+    if unknown_keys:
+        raise AdapterError(
+            f"{path}: unknown role-file settings: {', '.join(sorted(unknown_keys))}"
+        )
     settings = {
         key: value
         for key, value in raw.items()
         if key not in {"name", "description", "developer_instructions"}
     }
+    if settings != expected_settings:
+        raise AdapterError(f"{path}: role settings do not match the shipped {name} contract")
+    expected_description = EXPECTED_ROLE_DESCRIPTIONS[name]
+    if description != expected_description:
+        raise AdapterError(f"{path}: {name} description does not match the shipped role contract")
+    if developer_instructions != EXPECTED_ROLE_DEVELOPER_INSTRUCTIONS[name]:
+        raise AdapterError(
+            f"{path}: developer_instructions do not match the shipped {name} contract"
+        )
     role = RoleDefinition(
         path=path.resolve(),
         name=name,
@@ -138,89 +187,17 @@ def parse_role_file(path: Path) -> RoleDefinition:
         ord(character) > 127 for character in role.developer_instructions
     ):
         raise AdapterError(f"{path}: developer_instructions contain hidden or non-canonical text")
-    sandbox_mode = role.settings.get("sandbox_mode")
-    if sandbox_mode is not None and (
-        not isinstance(sandbox_mode, str) or sandbox_mode not in VALID_SANDBOX_MODES
-    ):
-        raise AdapterError(
-            f"{path}: sandbox_mode must be one of {', '.join(sorted(VALID_SANDBOX_MODES))}"
-        )
-    expected_sandbox = EXPECTED_ROLE_SANDBOX.get(role.name)
-    if sandbox_mode != expected_sandbox:
-        raise AdapterError(
-            f"{path}: sandbox_mode does not match the shipped {role.name} contract"
-        )
-    if role.name == "Comment Sicko":
-        if sandbox_mode != "read-only":
-            raise AdapterError(f"{path}: Comment Sicko requires sandbox_mode = 'read-only'")
-        instruction_lines = [line.strip() for line in role.developer_instructions.splitlines()]
-        expected_prefix = [
-            "Your first output must be exactly this single line:",
-            COMMENT_SICKO_FIRST_OUTPUT,
-        ]
-        if instruction_lines[:2] != expected_prefix:
-            raise AdapterError(
-                f"{path}: Comment Sicko must begin with its exact first-output contract"
-            )
-        missing = [
-            required
-            for required in COMMENT_SICKO_REQUIRED_INSTRUCTIONS
-            if required not in instruction_lines
-        ]
-        if not any(
-            "Do not write application code." in line
-            for line in instruction_lines
-        ):
-            missing.append("Do not write application code.")
-        if missing:
-            raise AdapterError(
-                f"{path}: Comment Sicko is missing required report-only instructions: "
-                + "; ".join(missing)
-            )
-        if any(ord(character) > 127 for character in role.developer_instructions):
-            raise AdapterError(f"{path}: Comment Sicko instructions must use canonical visible text")
-        unsafe_pattern = (
-            r"\b(?:writ\w*|rewrit\w*|overwrit\w*|edit\w*|modif\w*|creat\w*|delet\w*|remov\w*|chang\w*|mutat\w*|appl\w*|updat\w*|sav\w*|persist\w*|export\w*)\b"
-            r".{0,120}\b(?:application code|source code|code|files?|repository|repo|data|patch|directory|output|disk)\b"
-            r"|\b(?:application code|source code|code|files?|repository|repo|data|patch|directory|output|disk)\b.{0,120}"
-            r"\b(?:writ\w*|rewrit\w*|overwrit\w*|edit\w*|modif\w*|creat\w*|delet\w*|remov\w*|chang\w*|mutat\w*|appl\w*|updat\w*|sav\w*|persist\w*|export\w*)\b"
-        )
-        scan_lines: list[str] = []
-        for line in instruction_lines:
-            content = line
-            for field in COMMENT_SICKO_REPORT_FIELDS:
-                if content == field:
-                    content = ""
-                    break
-                if content.startswith(field):
-                    content = content[len(field) :].lstrip()
-                    break
-            scan_lines.append(content)
-        normalized_instructions = re.sub(
-            r"\s+",
-            " ",
-            _visible_text(" ".join(scan_lines)).replace(
-                "Do not write application code.", ""
-            ),
-        )
-        unsafe_match = re.search(unsafe_pattern, normalized_instructions, re.IGNORECASE)
-        if unsafe_match:
-            raise AdapterError(
-                f"{path}: Comment Sicko contains write-capable instructions: "
-                + unsafe_match.group(0)
-            )
-    expected_description = EXPECTED_ROLE_DESCRIPTIONS.get(role.name)
-    if expected_description is not None and role.description != expected_description:
-        raise AdapterError(f"{path}: {role.name} description does not match the shipped role contract")
     return role
 
 
 def _load_toml_table(path: Path) -> dict[str, Any]:
+    if not isinstance(path, Path):
+        raise AdapterError("configuration file path must be a pathlib.Path")
     try:
         with path.open("rb") as stream:
             raw = tomllib.load(stream)
-    except FileNotFoundError as exc:
-        raise AdapterError(f"configuration file does not exist: {path}") from exc
+    except (OSError, UnicodeError) as exc:
+        raise AdapterError(f"could not read configuration file: {path}: {exc}") from exc
     except tomllib.TOMLDecodeError as exc:
         raise AdapterError(f"configuration file is not valid TOML: {path}: {exc}") from exc
     if not isinstance(raw, dict):
@@ -231,6 +208,8 @@ def _load_toml_table(path: Path) -> dict[str, Any]:
 def load_explicit_roles(project_root: Path) -> dict[str, RoleDefinition]:
     """Load only roles named by the project's explicit ``[agents]`` registry."""
 
+    if not isinstance(project_root, Path):
+        raise AdapterError("project root must be a pathlib.Path")
     project_root = project_root.resolve()
     codex_path = project_root / ".codex"
     if codex_path.is_symlink() or not codex_path.is_dir():
@@ -239,6 +218,11 @@ def load_explicit_roles(project_root: Path) -> dict[str, RoleDefinition]:
     if config_path.is_symlink() or not config_path.is_file():
         raise AdapterError(f"{config_path}: explicit config must be a real file")
     raw = _load_toml_table(config_path)
+    unknown_config_keys = set(raw) - {"agents"}
+    if unknown_config_keys:
+        raise AdapterError(
+            f"{config_path}: unknown registry settings: {', '.join(sorted(unknown_config_keys))}"
+        )
     agents = raw.get("agents")
     if not isinstance(agents, dict) or not agents:
         raise AdapterError(f"{config_path}: expected a non-empty [agents] registry")
@@ -259,6 +243,15 @@ def load_explicit_roles(project_root: Path) -> dict[str, RoleDefinition]:
             raise AdapterError(f"{config_path}: unsupported registered role {declared_name!r}")
         if not isinstance(declaration, dict):
             raise AdapterError(f"{config_path}: agents.{declared_name} must be a table")
+        expected_declaration = EXPECTED_REGISTRY[declared_name]
+        unknown_keys = set(declaration) - set(expected_declaration)
+        missing_keys = set(expected_declaration) - set(declaration)
+        if unknown_keys or missing_keys:
+            raise AdapterError(
+                f"{config_path}: agents.{declared_name} must contain exactly the shipped "
+                f"keys; missing={', '.join(sorted(missing_keys)) or '(none)'}; "
+                f"extra={', '.join(sorted(unknown_keys)) or '(none)'}"
+            )
         description = _non_empty_string(
             declaration.get("description"), "description", config_path
         )
@@ -267,6 +260,10 @@ def load_explicit_roles(project_root: Path) -> dict[str, RoleDefinition]:
             "config_file",
             config_path,
         )
+        if {"description": description, "config_file": config_file} != expected_declaration:
+            raise AdapterError(
+                f"{config_path}: agents.{declared_name} does not match the shipped registry contract"
+            )
         if Path(config_file).is_absolute():
             raise AdapterError(f"{config_path}: role config_file must be relative: {config_file}")
         declared_role_path = config_path.parent / config_file
@@ -320,10 +317,12 @@ def parse_model_catalog(payload: str | bytes | Mapping[str, Any]) -> tuple[str, 
     if isinstance(payload, (str, bytes)):
         try:
             decoded = json.loads(payload)
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeError, TypeError) as exc:
             raise AdapterError(f"model catalog is not valid JSON: {exc}") from exc
-    else:
+    elif isinstance(payload, Mapping):
         decoded = payload
+    else:
+        raise AdapterError("model catalog must be JSON text, bytes, or an object")
     if not isinstance(decoded, Mapping):
         raise AdapterError("model catalog must be a JSON object")
     entries = decoded.get("models")
@@ -343,20 +342,67 @@ def parse_model_catalog(payload: str | bytes | Mapping[str, Any]) -> tuple[str, 
 def read_model_catalog(codex_binary: str = "codex", cwd: Path | None = None) -> tuple[str, ...]:
     """Read the active local model catalog through the Codex debug command."""
 
+    if not isinstance(codex_binary, str) or not codex_binary.strip():
+        raise AdapterError("codex binary must be a non-empty string")
+    if cwd is not None and not isinstance(cwd, Path):
+        raise AdapterError("codex command cwd must be a pathlib.Path")
     try:
         completed = subprocess.run(
-            [codex_binary, "debug", "models"],
+            [codex_binary.strip(), "debug", "models"],
             cwd=cwd,
             capture_output=True,
             text=True,
             check=False,
         )
-    except OSError as exc:
+    except (OSError, subprocess.SubprocessError, TypeError, ValueError, UnicodeError) as exc:
         raise AdapterError(f"could not run {codex_binary!r} to read the model catalog: {exc}") from exc
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or "no diagnostic"
+    try:
+        returncode = completed.returncode
+        stdout = completed.stdout
+        stderr = completed.stderr
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise AdapterError(f"model catalog command returned an invalid result: {exc}") from exc
+    if not isinstance(returncode, int):
+        raise AdapterError("model catalog command returned a non-integer exit status")
+    if returncode != 0:
+        if stderr is not None and not isinstance(stderr, (str, bytes)):
+            raise AdapterError("model catalog command returned a non-text diagnostic")
+        if stdout is not None and not isinstance(stdout, (str, bytes)):
+            raise AdapterError("model catalog command returned non-text output")
+        detail = (stderr.strip() if stderr else "") or (stdout.strip() if stdout else "") or "no diagnostic"
         raise AdapterError(f"model catalog command failed: {detail}")
-    return parse_model_catalog(completed.stdout)
+    return parse_model_catalog(stdout)
+
+
+def _normalize_optional_model(value: object, field: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise AdapterError(f"{field} must be a string or None")
+    normalized = value.strip()
+    return normalized or None
+
+
+def _normalize_available_models(available_models: Iterable[str]) -> tuple[str, ...]:
+    if available_models is None or isinstance(available_models, (str, bytes)):
+        raise AdapterError("available_models must be an iterable of strings")
+    try:
+        iterator = iter(available_models)
+    except TypeError as exc:
+        raise AdapterError("available_models must be an iterable of strings") from exc
+    normalized: list[str] = []
+    try:
+        for model in iterator:
+            if not isinstance(model, str):
+                raise AdapterError("available_models must contain only strings")
+            model = model.strip()
+            if model:
+                normalized.append(model)
+    except AdapterError:
+        raise
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise AdapterError(f"could not read available models: {exc}") from exc
+    return tuple(sorted(set(normalized)))
 
 
 def preflight_model(
@@ -368,10 +414,10 @@ def preflight_model(
 ) -> ModelSelection:
     """Select a model and record every fallback decision explicitly."""
 
-    available = tuple(sorted({model.strip() for model in available_models if model.strip()}))
-    requested = requested_model.strip() if requested_model else None
-    fallback = fallback_model.strip() if fallback_model else None
-    parent = parent_model.strip() if parent_model else None
+    available = _normalize_available_models(available_models)
+    requested = _normalize_optional_model(requested_model, "requested_model")
+    fallback = _normalize_optional_model(fallback_model, "fallback_model")
+    parent = _normalize_optional_model(parent_model, "parent_model")
 
     if requested is None:
         if fallback is not None:
@@ -515,6 +561,15 @@ def _relative_path(path: Path, root: Path) -> str:
         return str(path.resolve())
 
 
+def _read_catalog_file(path: Path) -> str:
+    if not isinstance(path, Path):
+        raise AdapterError("catalog file path must be a pathlib.Path")
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError, TypeError) as exc:
+        raise AdapterError(f"could not read model catalog file: {path}: {exc}") from exc
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--project-root", type=Path, default=Path.cwd())
@@ -530,7 +585,7 @@ def main(argv: list[str] | None = None) -> int:
         project_root = args.project_root.resolve()
         role = resolve_role(project_root, args.role)
         if args.catalog_file is not None:
-            catalog_payload = args.catalog_file.read_text(encoding="utf-8")
+            catalog_payload = _read_catalog_file(args.catalog_file)
             available_models = parse_model_catalog(catalog_payload)
         elif any(value is not None for value in (args.model, args.fallback_model, args.parent_model)):
             available_models = read_model_catalog(args.codex_binary, cwd=project_root)
@@ -552,13 +607,27 @@ def main(argv: list[str] | None = None) -> int:
         }
         print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
-    except (AdapterError, OSError) as exc:
+    except AdapterError as exc:
         print(
             json.dumps(
                 {
                     "status": "error",
                     "error": type(exc).__name__,
                     "message": str(exc),
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 2
+    except (OSError, UnicodeError, TypeError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+        normalized = AdapterError(f"adapter input failure: {exc}")
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "error": type(normalized).__name__,
+                    "message": str(normalized),
                 },
                 indent=2,
                 sort_keys=True,
