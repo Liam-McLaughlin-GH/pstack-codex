@@ -42,6 +42,11 @@ The following 10 skills are present as Codex-native rewrites.
 | `make-bot-ui` | Builds and verifies a UI relay with explicit local and remote boundaries. |
 | `repo-best-practices` | Routes Showpass repository work using source-backed ownership, safe command boundaries, and explicit drift limits. |
 
+The two portable agent roles are also included under `.codex/agents/`.
+`poteto-agent` requires the complete poteto-mode and leaf-principle skill reads.
+`Comment Sicko` keeps its exact role name, first-output line, report-only policy,
+and read-only sandbox. `.codex/config.toml` registers both roles explicitly.
+
 The port preserves the names of these workflows where possible. In Codex, invoke them as skills such as `$poteto-mode`, `$how`, `$architect`, or `$tdd`.
 
 ## What is missing
@@ -59,10 +64,9 @@ The upstream `poteto-mode` playbooks are not copied into the active port. The mi
 
 `authoring-a-skill.md`, `autonomous-run.md`, `autopilot-full.md`, `autopilot-stack.md`, `babysit.md`, `bug-fix.md`, `eval.md`, `feature.md`, `hillclimb.md`, `investigation.md`, `multi-phase-plan.md`, `opening-a-pr.md`, `orchestrate.md`, `pause-safely.md`, `perf-issue.md`, `prototype.md`, `refactoring.md`, `runtime-forensics.md`, `session-pickup.md`, `shipping.md`, `trace-forensics.md`, `visual-parity.md`, and `worktree-cleanup.md`.
 
-The upstream agent and runtime pieces are also not ported.
+The remaining upstream runtime pieces are not ported.
 
-- `agents/poteto-agent.md` is not converted to a Codex agent configuration.
-- `agents/comment-sicko.md` is not converted to a Codex agent configuration.
+- Project-local role auto-discovery has not been claimed for the installed Codex CLI 0.144.0. Use the explicit `.codex/config.toml` registration and the offline adapter in `scripts/codex_agent_adapter.py`.
 - The 20 pstack scripts are not copied. This includes the PR watcher, worktree audit, plan checker, and orchestration helper.
 - `automations/benny/` is not copied. It is a Cursor automation pack with Cursor UI adapters.
 - Cursor model names and model-specific routing are not preserved.
@@ -77,6 +81,11 @@ These are omissions, not hidden dependencies. A future port should add each feat
 The port uses Codex skill folders with a `SKILL.md` file. It does not copy Cursor frontmatter such as `mode`, `icon`, `color`, or `reminder`.
 
 The port does not hard-code a model name. Codex model selection belongs to the Codex session or project configuration, not to this skill package.
+
+The agent adapter reads the active local model catalog before selecting a model.
+An unavailable requested model requires an explicit available fallback, and the
+result records both requested and effective models. It does not silently choose
+a replacement.
 
 The port treats delegation as a capability. `reflect` accepts a bounded Codex
 delegation manifest with reviewer and synthesizer identity when exposed. It
