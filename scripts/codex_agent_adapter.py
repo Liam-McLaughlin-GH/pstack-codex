@@ -156,20 +156,25 @@ def parse_role_file(path: Path) -> RoleDefinition:
             )
         if any(ord(character) > 127 for character in role.developer_instructions):
             raise AdapterError(f"{path}: Comment Sicko instructions must use canonical visible text")
-        instruction_body = [
-            line for line in instruction_lines
-            if not any(line.startswith(field) for field in COMMENT_SICKO_REPORT_FIELDS)
-        ]
-        normalized_instructions = _visible_text(" ".join(instruction_body)).replace(
-            "Do not write application code.", ""
-        )
-        unsafe_match = re.search(
-            r"\b(?:writ\w*|edit\w*|modif\w*|creat\w*|delet\w*|remov\w*|chang\w*|mutat\w*|appl\w*|updat\w*)\b"
+        unsafe_pattern = (
+            r"\b(?:writ\w*|rewrit\w*|overwrit\w*|edit\w*|modif\w*|creat\w*|delet\w*|remov\w*|chang\w*|mutat\w*|appl\w*|updat\w*)\b"
             r".{0,120}\b(?:application code|source code|code|files?|repository|repo|data|patch|directory|output|disk)\b"
             r"|\b(?:application code|source code|code|files?|repository|repo|data|patch|directory|output|disk)\b.{0,120}"
-            r"\b(?:writ\w*|edit\w*|modif\w*|creat\w*|delet\w*|remov\w*|chang\w*|mutat\w*|appl\w*|updat\w*)\b",
-            normalized_instructions,
-            re.IGNORECASE,
+            r"\b(?:writ\w*|rewrit\w*|overwrit\w*|edit\w*|modif\w*|creat\w*|delet\w*|remov\w*|chang\w*|mutat\w*|appl\w*|updat\w*)\b"
+        )
+        unsafe_match = next(
+            (
+                match
+                for line in instruction_lines
+                if (
+                    match := re.search(
+                        unsafe_pattern,
+                        _visible_text(line).replace("Do not write application code.", ""),
+                        re.IGNORECASE,
+                    )
+                )
+            ),
+            None,
         )
         if unsafe_match:
             raise AdapterError(
@@ -206,6 +211,13 @@ def load_explicit_roles(project_root: Path) -> dict[str, RoleDefinition]:
     agents = raw.get("agents")
     if not isinstance(agents, dict) or not agents:
         raise AdapterError(f"{config_path}: expected a non-empty [agents] registry")
+    if set(agents) != EXPECTED_ROLE_NAMES:
+        missing = ", ".join(sorted(EXPECTED_ROLE_NAMES - set(agents))) or "(none)"
+        extra = ", ".join(sorted(set(agents) - EXPECTED_ROLE_NAMES)) or "(none)"
+        raise AdapterError(
+            f"{config_path}: explicit registry must contain exactly the shipped roles; "
+            f"missing={missing}; extra={extra}"
+        )
 
     codex_root = codex_path
     roles: dict[str, RoleDefinition] = {}
@@ -407,6 +419,15 @@ def validate_comment_sicko_report(output: str) -> dict[str, str]:
 
     if not isinstance(output, str):
         raise ReportContractError("Comment Sicko report must be text")
+    for index, character in enumerate(output):
+        if character == "\r":
+            if index + 1 >= len(output) or output[index + 1] != "\n":
+                raise ReportContractError("Comment Sicko report contains a bare carriage return")
+            continue
+        if character == "\n":
+            continue
+        if unicodedata.category(character).startswith(("C", "M")) or character in {"\u2028", "\u2029"}:
+            raise ReportContractError("Comment Sicko report contains invisible or control characters")
     lines = output.splitlines()
     if not lines or lines[0] != COMMENT_SICKO_FIRST_OUTPUT:
         actual = lines[0] if lines else "(empty)"

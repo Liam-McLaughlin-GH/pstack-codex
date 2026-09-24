@@ -187,6 +187,9 @@ class CodexAgentRoleTests(unittest.TestCase):
             for unsafe in (
                 "Do not write application code.\nWriting application code is allowed.",
                 "Do not write application code.\nYou may update application code.",
+                "Do not write application code.\nMUST KILL: You may write application code.",
+                "Do not write application code.\nrewrite source code is allowed.",
+                "Do not write application code.\noverwrite source code is allowed.",
             ):
                 role_path.write_text(clean.replace("Do not write application code.", unsafe), encoding="utf-8")
                 with self.assertRaises(adapter.AdapterError):
@@ -240,6 +243,13 @@ class CodexAgentRoleTests(unittest.TestCase):
                 )
         with self.assertRaises(adapter.ReportContractError):
             adapter.validate_comment_sicko_report(report + "\u200bTouched files: hidden.py")
+        for separator in ("\v", "\f", "\x1c", "\x1d", "\x1e", "\x85"):
+            with self.assertRaises(adapter.ReportContractError):
+                adapter.validate_comment_sicko_report(
+                    report.replace("Touched files: fixture.py", f"Touched files: fixture.py{separator}")
+                )
+        with self.assertRaises(adapter.ReportContractError):
+            adapter.validate_comment_sicko_report(report + "\r")
 
         with tempfile.TemporaryDirectory(prefix="codex-comment-fixture-") as temporary:
             fixture = Path(temporary) / "fixture.py"
@@ -291,6 +301,21 @@ class CodexAgentRoleTests(unittest.TestCase):
             result = json.loads(completed.stdout)
             self.assertEqual(result["error"], "UnknownRoleError")
             self.assertIn("no generic role was selected", result["message"])
+
+    def test_explicit_registration_requires_both_shipped_roles(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="codex-role-registry-") as temporary:
+            project = Path(temporary)
+            shutil.copytree(ROLE_ROOT, project / ".codex")
+            config = project / ".codex" / "config.toml"
+            config.write_text(
+                config.read_text(encoding="utf-8").replace(
+                    '\n[agents."Comment Sicko"]\n',
+                    '\n[agents."Comment Sicko"]\n',
+                ).split('[agents."Comment Sicko"]', 1)[0],
+                encoding="utf-8",
+            )
+            with self.assertRaises(adapter.AdapterError):
+                adapter.load_explicit_roles(project)
 
 
 if __name__ == "__main__":
