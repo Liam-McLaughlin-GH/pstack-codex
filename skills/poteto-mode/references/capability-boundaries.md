@@ -22,9 +22,15 @@ BLOCKED, NOT RUN, and INCONCLUSIVE never become a pass by omission.
 
 Prefer the surface the task names. A local terminal, repository checkout,
 temporary directory, supplied artifact, and the current Codex session are
-available when the environment exposes them. Named delegation, browser or
-image capture, live-process instrumentation, forge access, and recurring
-wakeups are capabilities that must be checked before a playbook uses them.
+available when the environment exposes them. Check Codex-native worker
+controls, the active model catalog, browser or image capture, live-process
+instrumentation, forge access, and recurring wakeups before a playbook uses
+them. A model catalog entry alone does not prove account access.
+
+Codex-native worker creation is a reversible in-session capability. It is
+separate from an external Herdr worker or provider service. Use the native
+control when available and follow Poteto's model lanes. Do not claim that a
+Herdr, forge, or watcher adapter exists because Codex worker controls do.
 
 Record the capability check in the decision trail. If it is missing, finish
 the read-only preparation, stop at the boundary, and give the smallest local
@@ -32,24 +38,37 @@ fallback. A fallback may inspect a supplied artifact or run a fixture. It may
 not invent a screenshot, model identity, CI verdict, source mapping, merge,
 deployment, or worker result.
 
+## Showpass lifecycle scope
+
+For an explicitly requested Showpass PR lifecycle, use
+[Showpass PR lifecycle](../playbooks/showpass-pr-lifecycle.md) to determine
+scoped PR edits, reviewer messages, QA evidence publication, and Jira updates.
+That request supplies authority for those lifecycle actions, overriding their
+NOT RUN defaults below. Loading Poteto alone does not. Merge, deployment
+mutations, and Production writes retain separate explicit authorization.
+
 ## Side-effect gate
 
-External operations use a fixture adapter by default. The adapter writes an
-append-only local log and accepts an operation only when the fixture includes
-the exact authorization field for that operation. The log is evidence of an
-attempt, not proof that a remote operation succeeded.
+Tests of external operations use a fixture adapter by default. The adapter
+writes an append-only local log and accepts an operation only when the fixture
+includes the authorization field for that operation. The log is evidence of
+an attempt, not proof that a remote operation succeeded. Live scoped push and
+review PR creation follow the change-producing request rule below.
 
-UNSUPPORTED-SEAM: no implicit forge, watcher, merge, deployment, message,
-agent-spawn, or deletion adapter is supplied by these playbooks. Worktree,
-simulator, cache, runtime, and repository deletion remain separately gated.
+UNSUPPORTED-SEAM: no implicit Herdr, forge, watcher, merge, deployment,
+message, or deletion adapter is supplied by these playbooks. Codex-native
+worker availability is checked separately. Worktree, simulator, cache,
+runtime, and repository deletion remain separately gated.
 
-The following operations always stop or stay fixture-only unless the user
-explicitly authorizes the exact action in the current request:
+Push and review PR creation are authorized by a change-producing request once
+local checks pass and the exact remote, branch, base, head, and body are known.
+The following operations have their own gates:
 
 | Operation | Safe default | Required evidence before an authorized action |
 | --- | --- | --- |
 | Forge read | local fixture or an explicitly supplied read surface | repository and object identity |
-| PR create, edit, ready, push, or comment | NOT RUN | exact target, body, and user authorization |
+| Push scoped commits and create a review PR | proceed after local checks | exact remote, branch, base, head, and body; change-producing request |
+| PR edit, ready, or comment | NOT RUN | exact target, payload, and user authorization |
 | Merge or auto-merge | fixture log only | independent verdict at the exact head and explicit landing authorization |
 | Deployment or external message | NOT RUN | target, payload, rollback path, and explicit authorization |
 | Watcher or recurring monitor | bounded local poll or BLOCKED | stop predicate and bounded interval |
@@ -77,8 +96,8 @@ next_action: one sentence
 Keep the state in a local file or fixture record when a loop spans turns.
 Never treat a prose claim in a reply as durable state.
 
-For a retained change handoff, keep the external lane state canonical. When no
-forge operation is authorized, report `status: NOT RUN` and carry
+For a retained change handoff, keep the external lane state canonical. When a
+forge operation is unavailable or outside the authorized scope, report `status: NOT RUN` and carry
 `local_handoff_ready: true` only when the local diff, exact head SHA, checks,
 and proposed body are recorded. Do not combine those fields into a composite
 status such as `READY LOCAL; PR NOT RUN`.

@@ -23,8 +23,8 @@ evidence-backed change, and verify it on the same surface.
    cheap local path. Skip it for expensive or unclear integration work and
    explain why.
 6. Run the structural checks and route the local handoff through
-   [Opening a PR](./opening-a-pr.md). PR creation and push remain independently
-   gated.
+   [Opening a PR](./opening-a-pr.md). Push scoped commits and create a review
+   PR after local checks pass.
 
 UNSUPPORTED-SEAM: live browser, mobile, or process-control surfaces may be
 absent. A local reproduction is useful evidence but does not prove a

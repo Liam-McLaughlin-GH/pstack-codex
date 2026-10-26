@@ -3,12 +3,16 @@
 You own the verified linear stack, never the landing. Build and verify the
 queue, then hand the operator one base-branch chain.
 
-1. Require an explicit go before spawning owners or running the owner loop.
-   A plan, status request, or state-then-wait response is NOT RUN and leaves
-   every owner at zero-write hold.
-2. Resolve the work shape before spawning owners. Independent items branch
-   from the same base. Dependent items name their intended parent and remain a
-   single linear chain. One writer owns each worktree or branch.
+1. A plan, status request, or state-then-wait response is NOT RUN and leaves
+   every owner at zero-write hold. Run the local owner loop when the user asks
+   to execute Autopilot. This authorizes scoped push and review PR creation
+   after local checks, but not other remote mutations or external workers.
+2. Resolve the work shape before dispatch. Independent items branch from the
+   same base and use Luna-at-max code workers when available. Dependent items
+   name their intended parent and remain a single linear chain. One writer
+   owns each worktree or branch. Check model availability in the active
+   catalog and dispatch controls; if no allowed lane is available, use a
+   bounded local fallback or report BLOCKED.
 3. Run the owner loop for build, local verification, decision trail, review
    preparation, and merge-ready state. Keep exact base and head SHAs. A
    changed head requires a new verdict. For a standing run, use a 30-minute
@@ -27,11 +31,11 @@ queue, then hand the operator one base-branch chain.
 7. Absorb drift bottom-up. If a rebase changes a patch, send that item back
    through verification. If a conflict touches an owner's files, report the
    owning branch and stop the topology action.
-8. Deliver the chain as a local report. Route accepted code changes through
-   [Opening a PR](./opening-a-pr.md) for local package preparation. No PR creation, push, retarget,
-   force-push, merge, auto-merge, deployment, or external comment occurs
-   without an exact operator authorization. A fake forge may record the
-   proposed operation in tests.
+8. Deliver the chain with a report. Route accepted code changes through
+   [Opening a PR](./opening-a-pr.md). Push scoped commits and create review
+   PRs after local checks. Retarget, force-push, merge, auto-merge, deployment,
+   and external comment still require exact authorization. A fake forge may
+   record proposed operations in tests.
 
 The stack record contains item, parent, base SHA, head SHA, patch-id, verdict,
 and evidence. A child is not eligible while its parent is unverified.

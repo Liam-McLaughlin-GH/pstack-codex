@@ -1,5 +1,12 @@
 ### Shipping
 
+For Showpass backend/frontend work, also read
+[Showpass PR lifecycle](showpass-pr-lifecycle.md). It owns repository-specific
+PR standards, authorized reviewer/Jira updates, QA, and post-merge verification.
+Its lifecycle-specific authorization applies over the generic defaults below;
+merge and deployment mutations retain their explicit permission gates.
+
+
 You own what lands. Verify each item independently, land only the contiguous
 verified run, and stop after the next gap.
 
@@ -11,8 +18,10 @@ verified run, and stop after the next gap.
 3. Record verdict head SHA, base SHA, and patch-id. Recompute the patch-id
    after a rebase or base retarget. A changed patch needs a fresh verdict.
    An unchanged patch still needs current mergeability and check state.
-4. Prepare only the bottom item against the exact current base. Keep the
-   preparation in a local fixture unless the user authorizes a remote write.
+4. Prepare only the bottom item against the exact current base. A
+   change-producing request authorizes its scoped push and review PR creation
+   after local checks. Keep other remote writes in a local fixture until
+   authorized.
 5. Land one item at a time only after explicit ship or merge authorization.
    A fake forge can record the proposed operation. Without authorization the
    merge log must remain empty.

@@ -1,7 +1,14 @@
 ### Opening a PR
 
+For Showpass backend/frontend work, also read
+[Showpass PR lifecycle](showpass-pr-lifecycle.md). It owns repository-specific
+PR standards, authorized reviewer/Jira updates, QA, and post-merge verification.
+Its lifecycle-specific authorization applies over the generic defaults below;
+merge and deployment mutations retain their explicit permission gates.
+
+
 This is the handoff at the end of another playbook. It prepares a review
-package. It does not silently grant remote write access.
+package and, for an authorized change-producing task, publishes it for review.
 
 Worktree:
 
@@ -36,11 +43,14 @@ Forge gate:
 2. A local review package is ready when the local diff, exact head SHA, checks,
    and proposed body are recorded. Preparing it does not require forge
    authorization.
-3. Push, PR create, ready, edit, comment, merge, auto-merge, and deployment
-   are separate operations on the remote surface. They require authorization for the exact
-   operation and must be explicitly authorized individually. One authorization does not
-   imply the others.
-4. If a remote operation lacks authorization, return its canonical external
+3. A request to implement a change authorizes pushing its scoped commits and
+   creating a review PR once local checks pass. Verify the remote, branch,
+   target base, exact head, and proposed body before each operation. Do not
+   push unrelated work or force-push without separate authorization.
+4. Ready, edit, comment, merge, auto-merge, and deployment remain separate
+   operations requiring their own authorization. Push and PR creation do not
+   imply approval for those actions.
+5. If a remote operation lacks authorization, return its canonical external
    status as `NOT RUN`. Carry `local_handoff_ready: true` when the local
    package is complete. Do not leave a watcher or retry loop active.
 

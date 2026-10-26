@@ -14,8 +14,8 @@ You own pixel comparison. The baseline is the spec and must not be changed.
 5. A missing browser or image adapter is BLOCKED. A text-only source review
    cannot prove pixel equivalence.
 6. Route a passing component to [Opening a PR](./opening-a-pr.md). Prepare the
-   local handoff without forge authorization; remote operations remain gated
-   and the baseline is unchanged.
+   review package, push scoped commits, and create a review PR after local
+   checks. The baseline is unchanged.
 
 UNSUPPORTED-SEAM: no browser, simulator, screenshot, or image-diff capability
 is implicit. Use a supplied pair of images for offline comparison or report

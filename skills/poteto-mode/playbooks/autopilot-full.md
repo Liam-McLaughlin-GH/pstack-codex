@@ -4,14 +4,17 @@ You own the verdicts, never the remote queue. One local owner may carry an
 independent work item from build to merge-ready. Nothing merges without a
 fresh verified verdict and explicit landing authorization.
 
-1. Mark operator-named items and honor state-then-wait. A request to state the
-   protocol is not permission to execute it. Start only after an explicit go.
-   Record the queue, owner, branch, head SHA, base SHA, and current state.
+1. Mark operator-named items and honor state-then-wait. A plan or status
+   request is NOT RUN. Start the local owner loop when the user asks to execute
+   Autopilot; that authorizes scoped push and review PR creation after local
+   checks, but not other remote mutations or external worker services. Record
+   the queue, owner, branch, head SHA, base SHA, and state.
 2. Assign one owner to each independent item when Codex delegation is
-   available. Give each owner a disjoint worktree or branch and an exact
-   scope. If delegation is unavailable, keep the work in this session or
-   report BLOCKED. Each owner keeps a local decisions trail and returns its
-   evidence.
+   available. Use the Luna-at-max worker lane in Poteto mode for code,
+   tooling, and evidence. Check the active catalog and dispatch controls.
+   Give each owner a disjoint worktree or branch and an exact scope. If no
+   allowed lane is available, use a bounded local fallback or report BLOCKED.
+   Each owner keeps a local decisions trail and returns evidence.
 3. Resolve one forge adapter for read operations and record the choice. Use a
    fake forge for tests. Check the exact head SHA before every verdict. A
    changed head voids the old verdict unless a stable patch-id check proves
@@ -23,7 +26,7 @@ fresh verified verdict and explicit landing authorization.
 5. Keep operator-named items at merge-ready. For an autonomous landing
    request, the user must name the landing authorization. A fake forge may
    record an attempted merge only after that authorization. Otherwise no
-   merge, push, PR edit, external comment, or deployment is run.
+   merge, PR edit, external comment, or deployment is run.
 6. Audit the queue at a bounded cadence. Read the playbook and the current
    state record at each tick. Use a 30-minute audit tick when the user asks
    for a standing run, with a bounded local timer and a recorded wake event.
@@ -35,17 +38,17 @@ fresh verified verdict and explicit landing authorization.
    uncommitted work during the hold.
 
 8. For an accepted code change, route the merge-ready local handoff through
-   [Opening a PR](./opening-a-pr.md). Keep PR creation, push, ready, comment,
-   merge, auto-merge, and deployment externally NOT RUN until each exact
-   action is authorized.
+   [Opening a PR](./opening-a-pr.md). Push scoped commits and create a review
+   PR after local checks pass. Ready, comment, merge, auto-merge, and
+   deployment keep their separate gates.
 
 The queue record uses one row per item. The verification ledger keys verdicts
 by item and head SHA. The frontier is computed from the ledger, not inferred
 from a reply.
 
-UNSUPPORTED-SEAM: remote forge, worker, watcher, and merge adapters are not
-implicit. Use a fake adapter in tests, or stop at the named capability with
-BLOCKED or NOT RUN.
+UNSUPPORTED-SEAM: remote forge, external worker, watcher, and merge adapters
+are not implicit. Check Codex-native worker controls separately. Use a fake
+adapter in tests, or stop at the named capability with BLOCKED or NOT RUN.
 
 Reply with the queue, owners, states, exact heads, independent verdicts,
 operator gates, local evidence paths, and the next authorized operation.

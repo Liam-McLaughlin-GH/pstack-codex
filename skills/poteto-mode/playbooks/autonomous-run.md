@@ -28,10 +28,10 @@ predicate.
    the exact action.
 8. A code-changing run is not complete at a local predicate. Return the diff,
    exact head SHA, checks, proposed body, reviewer result, and PR handoff
-   state. Prepare that local package without forge authorization. Create or
-   update a PR only after the operator gives exact authorization for that
-   operation; otherwise keep external status `NOT RUN` and record
-   `local_handoff_ready` separately.
+   state. After local checks pass, push scoped commits and create a review PR
+   under the change-producing request. Updating an existing PR remains a
+   separate operation. If the forge is unavailable, keep external status
+   `NOT RUN` and record `local_handoff_ready` separately.
 9. For a retained code change, route the handoff through [Opening a PR](./opening-a-pr.md).
    Push, PR, review, merge, and deployment operations remain independently
    gated.
