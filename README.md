@@ -56,7 +56,7 @@ The merged port has 49 active skills:
 - The `poteto-mode` playbooks under `skills/poteto-mode/playbooks`.
 - Two project agent definitions under `.codex/agents/`.
 
-The 23 playbooks keep the upstream workflow contracts while using the local capability and side-effect rules in `skills/poteto-mode/references/capability-boundaries.md`. Forge, watcher, deployment, message, delegation, and deletion steps stay fixture-only or require explicit authorization.
+The 23 upstream playbooks keep their source workflow contracts while using the local capability and side-effect rules in `skills/poteto-mode/references/capability-boundaries.md`. Four Showpass playbooks add Liam's support hotfix, backend fix, frontend fix, and paired backend/frontend loop. Forge, watcher, deployment, message, delegation, and deletion steps stay fixture-only or require explicit authorization.
 
 ## Active skill guide
 

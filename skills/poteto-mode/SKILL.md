@@ -46,7 +46,13 @@ process proportional to the risk and keep every claim tied to evidence.
 ## Trigger routing
 
 - Read-only questions use [Investigation](playbooks/investigation.md).
-- A reported defect uses [Bug fix](playbooks/bug-fix.md).
+- A Showpass support issue that may need a narrow customer hotfix uses
+  [Hotfix](playbooks/hotfix.md).
+- A backend-only change uses [Backend fix](playbooks/backend-fix.md).
+- A frontend-only change uses [Frontend fix](playbooks/frontend-fix.md).
+- A change spanning both products uses
+  [Backend/frontend loop](playbooks/backend-frontend-loop.md).
+- Other reported defects use [Bug fix](playbooks/bug-fix.md).
 - A measured slowdown uses [Perf issue](playbooks/perf-issue.md).
 - Repeated metric improvement uses [Hillclimb](playbooks/hillclimb.md).
 - A live diagnosis uses [Runtime forensics](playbooks/runtime-forensics.md).
