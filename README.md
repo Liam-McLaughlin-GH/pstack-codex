@@ -47,6 +47,24 @@ Use $poteto-mode to plan this change. Use $how to trace the current path and $wh
 
 The project configuration in `.codex/config.toml` registers `poteto-agent` and `Comment Sicko`. The matching definitions live under `.codex/agents/`. Run Codex from the repository so the project configuration is in scope.
 
+## Companion skills
+
+The Showpass backend and frontend playbooks also refer to `$ponytail`, which
+is maintained outside this repository in
+[`CodexMaxxing/skills/ponytail`](https://github.com/Liam-McLaughlin-GH/CodexMaxxing/tree/main/skills/ponytail).
+Download that repository separately and link the skill into the Codex skills
+directory if you want those playbooks to invoke it:
+
+```sh
+CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
+mkdir -p "$CODEX_HOME/skills"
+ln -s /path/to/CodexMaxxing/skills/ponytail "$CODEX_HOME/skills/ponytail"
+```
+
+Pstack does not fetch companion repositories or install their skills
+automatically. The playbook remains readable without `$ponytail`, but its
+Ponytail-specific tracing workflow requires that skill to be installed.
+
 ## Active port
 
 The merged port has 49 active skills:
