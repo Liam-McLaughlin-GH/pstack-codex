@@ -47,23 +47,26 @@ Use $poteto-mode to plan this change. Use $how to trace the current path and $wh
 
 The project configuration in `.codex/config.toml` registers `poteto-agent` and `Comment Sicko`. The matching definitions live under `.codex/agents/`. Run Codex from the repository so the project configuration is in scope.
 
-## Companion skills
+## External skill dependencies
 
-The Showpass backend and frontend playbooks also refer to `$ponytail`, which
-is maintained outside this repository in
-[`CodexMaxxing/skills/ponytail`](https://github.com/Liam-McLaughlin-GH/CodexMaxxing/tree/main/skills/ponytail).
-Download that repository separately and link the skill into the Codex skills
-directory if you want those playbooks to invoke it:
+These skills are referenced by bundled instructions but are not included in
+this repository. Pstack does not fetch or install them automatically.
+
+| Skill | Used by | Source repository | Required when |
+| --- | --- | --- | --- |
+| `$ponytail` | `poteto-mode` coding and code review | [DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail), skill at [`skills/ponytail`](https://github.com/DietrichGebert/ponytail/tree/16f29800fd2681bdf24f3eb4ccffe38be3baec6b/skills/ponytail) | Coding and code review. Install it in the active Codex skills directory; Poteto mode applies full mode automatically. |
+| `$skill-creator` | `automate-me` and `reflect` | [openai/codex](https://github.com/openai/codex), skill source at [`codex-rs/skills/src/assets/samples/skill-creator`](https://github.com/openai/codex/tree/main/codex-rs/skills/src/assets/samples/skill-creator) | Substantive skill authoring. Codex may already provide it as a system skill. |
+
+To install Ponytail from a local clone of its repository:
 
 ```sh
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 mkdir -p "$CODEX_HOME/skills"
-ln -s /path/to/CodexMaxxing/skills/ponytail "$CODEX_HOME/skills/ponytail"
+ln -s /path/to/ponytail/skills/ponytail "$CODEX_HOME/skills/ponytail"
 ```
 
-Pstack does not fetch companion repositories or install their skills
-automatically. The playbook remains readable without `$ponytail`, but its
-Ponytail-specific tracing workflow requires that skill to be installed.
+The `$script` reference in a test is a shell variable, not a skill. The
+`$skill` text in fixtures is a placeholder, not a dependency.
 
 ## Active port
 
