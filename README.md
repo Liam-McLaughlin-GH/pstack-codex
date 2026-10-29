@@ -15,7 +15,7 @@ The upstream project is MIT licensed. The original copyright and license text ar
 Run these commands from the repository root:
 
 ```sh
-cd /Users/liammclaughlin/PycharmProjects/pstack-codex
+cd /path/to/pstack-codex
 python3 scripts/verify_port.py
 ```
 
@@ -56,7 +56,7 @@ The merged port has 49 active skills:
 - The `poteto-mode` playbooks under `skills/poteto-mode/playbooks`.
 - Two project agent definitions under `.codex/agents/`.
 
-The 23 upstream playbooks keep their source workflow contracts while using the local capability and side-effect rules in `skills/poteto-mode/references/capability-boundaries.md`. Four Showpass playbooks add Liam's support hotfix, backend fix, frontend fix, and paired backend/frontend loop. Forge, watcher, deployment, message, delegation, and deletion steps stay fixture-only or require explicit authorization.
+The 23 upstream playbooks keep their source workflow contracts while using the local capability and side-effect rules in `skills/poteto-mode/references/capability-boundaries.md`. Four Showpass-specific playbooks cover support hotfixes, backend fixes, frontend fixes, and paired backend/frontend work. Forge, watcher, deployment, message, delegation, and deletion steps stay fixture-only or require explicit authorization.
 
 ## Active skill guide
 
@@ -233,20 +233,18 @@ Add the narrowest skill-specific test command when the change has one. Keep test
 
 The completed planning and issue-tracking material was removed from `plans/completion/`. The active skills remain the source of truth for their commands and boundaries.
 
-## Liam's current context
+## Using workspace context
 
-This repository carries the pstack skills used in Codex. Liam's broader,
-changing skill set and work context live in the CodexMaxxing vault:
+These skills are designed to work with the context supplied by the consuming
+workspace. Before acting on a project:
 
-- `CodexMaxxing/skills/` is the canonical source for custom workspace skills;
-  `~/.codex/skills/` is the local runtime view.
-- `CodexMaxxing/vault/agent/workspace.md` defines workspace and provider
-  routing rules.
-- `CodexMaxxing/vault/agent/repos/<repo>.md` holds repo-specific setup and
-  conventions.
-- `CodexMaxxing/vault/projects/` holds active project and ticket context.
+- Read workspace-level agent instructions and the target repository's
+  `AGENTS.md` or equivalent.
+- Load the repo-specific and project context relevant to the task.
+- Check which skills are installed in the current runtime and use their
+  canonical source when available.
 
-Refresh those sources when starting work. Keep credentials, runtime databases,
+Refresh project state when starting work. Keep credentials, runtime databases,
 logs, raw sessions, and machine-local state out of this repository.
 
 ## Runtime boundaries

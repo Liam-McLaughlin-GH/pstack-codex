@@ -1,6 +1,6 @@
 ### Showpass hotfix
 
-Use this for a support-reported customer problem when Liam asks to apply a
+Use this for a support-reported customer problem when the operator asks to apply a
 code hotfix. A Slack/Jira report alone requests investigation, not a code
 change. Start from the support evidence and keep the repair tied to the exact
 customer-visible failure.
