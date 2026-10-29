@@ -231,7 +231,23 @@ git diff --check
 
 Add the narrowest skill-specific test command when the change has one. Keep tests behavior-focused. Use fixture adapters for external systems. Record unavailable live checks as `NOT RUN` or `UNSUPPORTED` instead of treating static checks as live proof.
 
-The root `plans/completion/` directory contains the issue briefs, completion ledger, parity classification, and review loop used for the completed port. The active skills remain the source of truth for their own commands and boundaries.
+The completed planning and issue-tracking material was removed from `plans/completion/`. The active skills remain the source of truth for their commands and boundaries.
+
+## Liam's current context
+
+This repository carries the pstack skills used in Codex. Liam's broader,
+changing skill set and work context live in the CodexMaxxing vault:
+
+- `CodexMaxxing/skills/` is the canonical source for custom workspace skills;
+  `~/.codex/skills/` is the local runtime view.
+- `CodexMaxxing/vault/agent/workspace.md` defines workspace and provider
+  routing rules.
+- `CodexMaxxing/vault/agent/repos/<repo>.md` holds repo-specific setup and
+  conventions.
+- `CodexMaxxing/vault/projects/` holds active project and ticket context.
+
+Refresh those sources when starting work. Keep credentials, runtime databases,
+logs, raw sessions, and machine-local state out of this repository.
 
 ## Runtime boundaries
 
