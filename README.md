@@ -280,3 +280,85 @@ It does not provide:
 G1 playbooks, G2 agent definitions, and G3 helper tooling are implemented within offline boundaries. G4 Benny and controls remains unsupported because the required live adapter, target configuration, credentials, and role router are absent.
 
 The repository does not install itself into a real user runtime automatically. Review the preview and use an isolated destination before applying a skill installation.
+
+## Usage examples
+
+Start a substantial task with `$poteto-mode`. Describe the result you need and
+the evidence or limits that matter; it routes to the relevant playbook. Add
+other skills when the task benefits from them. These prompts are examples, not
+required syntax.
+
+### Support and product work
+
+- **Investigate a support report:** “Use `$poteto-mode` to investigate this
+  report. Read the full supplied context, trace the backend and frontend paths,
+  and separate observed facts from assumptions. Don’t edit yet.”
+- **Apply a customer hotfix:** “Use `$poteto-mode` for this support hotfix.
+  Confirm the affected behavior and repo, find the root cause, make the
+  smallest safe fix, and report checks and remaining QA. Do not deploy.”
+- **Fix backend behavior:** “Use `$poteto-mode` and `$ponytail` to trace and fix
+  this Django bug in `web-app`. Read the repo guidance, preserve dirty work,
+  keep the change scoped, and report the exact verification.”
+- **Fix frontend behavior:** “Use `$poteto-mode` and `$ponytail` to fix this
+  visible bug in `showpass-frontend`. Trace the user flow and data source, use
+  the existing component patterns, and list browser QA gaps.”
+- **Coordinate both repos:** “Use the backend/frontend loop in `$poteto-mode`
+  for this feature. Establish the API contract first, update the backend and
+  frontend in separate checkouts, then verify each side and the integrated
+  flow.”
+- **Build a feature:** “Use `$poteto-mode`, `$how`, and `$architect` to design
+  and implement this feature. Name the data shape and boundaries before
+  editing; verify the user-visible behavior.”
+- **Refactor safely:** “Use `$poteto-mode` for a behavior-preserving refactor.
+  Characterize current behavior, map callers with `$blast-radius`, then make
+  the smallest structural change and compare behavior.”
+
+### Investigation and review
+
+- **Walk through a code path:** “Use `$how` to trace this request from entry
+  point to response. Show the main files, data passed between layers, and
+  failure cases.”
+- **Explain a design choice:** “Use `$why` to explain why this service has its
+  current shape. Separate evidence in the code or history from inference.”
+- **Review a risky diff:** “Use `$poteto-mode`, `$blast-radius`, and
+  `$interrogate` to review this diff. Check callers, edge cases, and tests;
+  report only issues supported by the current code.”
+- **Review comments:** “Use `$no-comments` on this diff. Find comments and
+  suppressions that are stale, misleading, or hiding a real constraint.”
+- **Compare approaches:** “Use `$arena` to compare two designs against these
+  requirements. Keep candidates separate, score the tradeoffs, and recommend
+  one.”
+- **Learn a subsystem:** “Use `$teach` to explain this subsystem. Start with
+  the user problem, then cover the key concepts, code flow, and gotchas.”
+
+### Verification and delivery
+
+- **Add a focused regression check:** “Use `$tdd` for this defect. Show the
+  failing behavior first, make the fix, then run the focused check and report
+  the result.”
+- **Improve UI parity:** “Use `$poteto-mode` and the Visual parity playbook to
+  compare this screen with the supplied reference. Identify measurable
+  differences and verify each change in the browser.”
+- **Investigate a slowdown:** “Use the Perf issue playbook to test the leading
+  performance hypotheses. Measure the same operation before and after and
+  report what the available evidence can prove.”
+- **Check a PR:** “Use the Babysit playbook to refresh this PR’s current head,
+  CI, and review state. Summarize blockers and the next action; don’t change
+  PR state.”
+- **Prepare a review handoff:** “Use `$technical-writing` to prepare a concise
+  PR description from this diff and the actual checks. Keep the repository’s
+  template and don’t claim checks that weren’t run.”
+- **Resume supplied work:** “Use the Session pickup playbook with these notes
+  and branches. Recheck current state, identify what changed, and route the
+  remaining work to the right playbook.”
+- **Pause a long run:** “Use the Pause safely playbook. Stop new writes,
+  preserve branches and evidence, and report a concrete resume point.”
+- **Handle a broad task:** “Use `$figure-it-out` to break this request into
+  bounded phases with a clear done condition, checkpoints, and a resume note.”
+- **Write clean docs:** “Use `$technical-writing` to draft this guide, then
+  apply `$unslop`. Keep commands, names, and links exact.”
+
+`$ponytail` is a companion skill maintained outside this repository. The
+[Companion skills](#companion-skills) section explains where to get it. If it
+is unavailable, use the local playbook and state that the companion workflow
+could not run.
