@@ -30,6 +30,10 @@ process proportional to the risk and keep every claim tied to evidence.
 
 - A source claim, observed result, inference, and unknown stay separate.
 - Code starts from a named data shape and an organizing structure.
+- For coding and code review, automatically apply `$ponytail` in full mode.
+  The user does not need to invoke it separately. If Ponytail is not installed,
+  use the minimum-solution rules in this skill and state that the companion
+  skill was unavailable.
 - A behavioral claim needs a matching-surface check. Compilation alone is not
   proof.
 - Independent writers use separate paths, worktrees, or branches.

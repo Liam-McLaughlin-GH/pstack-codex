@@ -296,10 +296,10 @@ required syntax.
 - **Apply a customer hotfix:** “Use `$poteto-mode` for this support hotfix.
   Confirm the affected behavior and repo, find the root cause, make the
   smallest safe fix, and report checks and remaining QA. Do not deploy.”
-- **Fix backend behavior:** “Use `$poteto-mode` and `$ponytail` to trace and fix
+- **Fix backend behavior:** “Use `$poteto-mode` to trace and fix
   this Django bug in `web-app`. Read the repo guidance, preserve dirty work,
   keep the change scoped, and report the exact verification.”
-- **Fix frontend behavior:** “Use `$poteto-mode` and `$ponytail` to fix this
+- **Fix frontend behavior:** “Use `$poteto-mode` to fix this
   visible bug in `showpass-frontend`. Trace the user flow and data source, use
   the existing component patterns, and list browser QA gaps.”
 - **Coordinate both repos:** “Use the backend/frontend loop in `$poteto-mode`
@@ -358,7 +358,9 @@ required syntax.
 - **Write clean docs:** “Use `$technical-writing` to draft this guide, then
   apply `$unslop`. Keep commands, names, and links exact.”
 
-`$ponytail` is a companion skill maintained outside this repository. The
+For coding and code review, `$poteto-mode` automatically applies `$ponytail`
+in full mode when that companion skill is installed; prompts do not need to
+name it separately. `$ponytail` is maintained outside this repository. The
 [Companion skills](#companion-skills) section explains where to get it. If it
-is unavailable, use the local playbook and state that the companion workflow
-could not run.
+is unavailable, use the minimum-solution rules and state that the companion
+skill could not load.

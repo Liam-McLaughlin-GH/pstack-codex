@@ -12,9 +12,8 @@ calculations, reports, tasks, data repair scripts, and backend CI failures.
 3. Trace the real request/task/data flow through callers, models, services,
    serializers, and side effects. For financial, permission, or data repair
    paths, identify the trust boundary and exact record scope before editing.
-4. Apply the active `$ponytail` full-mode workflow for root-cause tracing and
-   minimal reuse. Keep the change within the reported behavior and preserve
-   existing API contracts, money/data safeguards, and error handling.
+4. Keep the change within the reported behavior and preserve existing API
+   contracts, money/data safeguards, and error handling.
 5. Verify with the narrowest relevant backend check that the user authorized.
    Check the original failing path and nearby callers when the blast radius
    requires it. State database, provider, and Production limitations plainly.

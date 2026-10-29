@@ -13,8 +13,8 @@ desktop, component, hook, API integration, and frontend CI work.
 3. Trace the user action to the rendered state and its data source. Identify
    the API contract, loading/error/empty states, accessibility impact, and the
    visible behavior that proves the defect is fixed.
-4. Apply the active `$ponytail` full-mode workflow. Make the smallest
-   root-cause change and keep unrelated layout or package refactors out.
+4. Make the smallest root-cause change and keep unrelated layout or package
+   refactors out.
 5. Run only the narrowest useful lint, type, unit, or build checks authorized
    for the task. For a visible behavior change, prepare or perform browser QA
    only when requested and available; automated checks do not prove browser
