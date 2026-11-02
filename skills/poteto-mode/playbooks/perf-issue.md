@@ -4,12 +4,19 @@ You own the measurement story. Tie each fix to a captured baseline and a
 matching post-change artifact.
 
 1. Confirm that the matching profiler, browser, trace, or process-control
-   surface is available. If the required surface is missing, stop before
-   editing and return BLOCKED. If a supplied artifact is wrong-surface or
+   surface is available. If representative measurement is unavailable, mark
+   performance verification BLOCKED. Local candidate implementation and review
+   may proceed with that limit stated; do not claim a verified performance
+   improvement or performance readiness. If a supplied artifact is wrong-surface or
    unmappable, return INCONCLUSIVE. If capture is unapproved or its
    precondition is unmet, return NOT RUN. Otherwise
    capture a baseline on the matching surface. Name metric, unit,
-   workload, sample count, noise rule, and artifact path.
+   workload, sample count, noise rule, and artifact path. Explain why the
+   workload represents affected callers, data volume, relationship fan-out,
+   and composed queries. Include empty scopes and repeated background work
+   when they could change the decision. Measure the complete operation; query
+   count is supporting evidence. Use an authorized representative environment;
+   Production is not automatically required.
 2. Run $how over the affected path. Use the following strategy families as
    hypothesis prompts, not a checklist: elimination, divide and conquer,
    caching, indirection, batching, redundancy, lazy evaluation, and
@@ -27,10 +34,13 @@ matching post-change artifact.
    gated.
 
 UNSUPPORTED-SEAM: no live profiler, browser, trace parser, or process-control
-surface is assumed. A local fixture or supplied artifact can support Trace
-forensics, but it cannot prove a live performance change. Missing matching
-surface status is BLOCKED before any code change; a wrong-surface artifact is
-INCONCLUSIVE and an unapproved capture is NOT RUN.
+surface is assumed. A local fixture or supplied artifact supports conclusions
+only for its tested workload and candidate revision; it cannot prove a live
+performance change. Missing representative measurement leaves performance
+verification BLOCKED, while bounded local candidate work may proceed. A
+wrong-surface artifact is INCONCLUSIVE and an unapproved capture is NOT RUN.
 
 Reply with baseline, post-fix number, delta, workload, artifacts, source
-mapping, and any INCONCLUSIVE boundary.
+mapping, and any INCONCLUSIVE boundary. State whether the evidence supports
+code review, a bounded experiment, or performance readiness, and name the
+missing check when representative performance remains unverified.
