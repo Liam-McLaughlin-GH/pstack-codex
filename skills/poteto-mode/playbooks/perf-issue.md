@@ -33,6 +33,22 @@ matching post-change artifact.
    package preparation. Forge and deployment actions remain independently
    gated.
 
+### Showpass SQL verification layer
+
+For a significant query rewrite, compare the baseline and candidate SQL on
+representative Production data before recommending performance readiness. Load
+`$showpass-db-broker` and follow its query-plan verification route: broker first,
+then Showpass Explorer when actual execution plans are needed and the broker
+rejects `ANALYZE`. Keep local correctness and concurrency checks as well.
+
+Use the application-generated SQL and bound parameters, including downstream
+query composition. Compare equivalent inputs and results across relevant empty,
+typical, and high-fanout scopes. Record candidate revision, connection,
+constraints, plans, samples, and whole-operation timings. Estimated plans alone
+do not verify runtime; replica execution does not prove primary concurrency or
+fleet performance. If the required comparison cannot be completed within the
+allowed scope, leave performance readiness unverified and name the missing check.
+
 UNSUPPORTED-SEAM: no live profiler, browser, trace parser, or process-control
 surface is assumed. A local fixture or supplied artifact supports conclusions
 only for its tested workload and candidate revision; it cannot prove a live
