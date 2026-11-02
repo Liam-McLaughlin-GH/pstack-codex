@@ -58,6 +58,10 @@ process proportional to the risk and keep every claim tied to evidence.
   [Backend/frontend loop](playbooks/backend-frontend-loop.md).
 - Other reported defects use [Bug fix](playbooks/bug-fix.md).
 - A measured slowdown uses [Perf issue](playbooks/perf-issue.md).
+- When a bug fix or refactor changes query shape, batching, caching, or repeated
+  work to improve performance, also follow [Perf issue](playbooks/perf-issue.md).
+  Passing correctness tests and reducing query count do not establish a runtime
+  improvement.
 - Repeated metric improvement uses [Hillclimb](playbooks/hillclimb.md).
 - A live diagnosis uses [Runtime forensics](playbooks/runtime-forensics.md).
 - A supplied capture uses [Trace forensics](playbooks/trace-forensics.md).
