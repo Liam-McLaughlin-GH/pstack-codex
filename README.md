@@ -54,7 +54,7 @@ this repository. Pstack does not fetch or install them automatically.
 
 | Skill | Used by | Source repository | Required when |
 | --- | --- | --- | --- |
-| `$ponytail` | `poteto-mode` coding and code review | [DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail), skill at [`skills/ponytail`](https://github.com/DietrichGebert/ponytail/tree/16f29800fd2681bdf24f3eb4ccffe38be3baec6b/skills/ponytail) | Coding and code review. Install it in the active Codex skills directory; Poteto mode applies full mode automatically. |
+| `$ponytail` | `poteto-mode` coding and code review | [DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail), skill at [`skills/ponytail`](https://github.com/DietrichGebert/ponytail/tree/96608e078b2d5ea607c5c3b8b5a54d1c1fba6846/skills/ponytail) | Coding and code review. Install it in the active Codex skills directory; Poteto mode applies full mode automatically. |
 | `$skill-creator` | `automate-me` and `reflect` | [openai/codex](https://github.com/openai/codex), skill source at [`codex-rs/skills/src/assets/samples/skill-creator`](https://github.com/openai/codex/tree/main/codex-rs/skills/src/assets/samples/skill-creator) | Substantive skill authoring. Codex may already provide it as a system skill. |
 
 To install Ponytail from a local clone of its repository:
