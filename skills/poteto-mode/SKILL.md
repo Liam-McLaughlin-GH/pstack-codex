@@ -34,6 +34,10 @@ When drafting or executing Liam's implementation `/goal`, load `$codex-prompt-in
 
 - A source claim, observed result, inference, and unknown stay separate.
 - Code starts from a named data shape and an organizing structure.
+- For coding and code review, automatically apply `$ponytail` in full mode.
+  The user does not need to invoke it separately. If Ponytail is not installed,
+  use the minimum-solution rules in this skill and state that the companion
+  skill was unavailable.
 - A behavioral claim needs a matching-surface check. Compilation alone is not
   proof.
 - Independent writers use separate paths, worktrees, or branches.
@@ -62,7 +66,13 @@ specific case as evidence before the task ends.
 ## Trigger routing
 
 - Read-only questions use [Investigation](playbooks/investigation.md).
-- A reported defect uses [Bug fix](playbooks/bug-fix.md).
+- A Showpass support issue that may need a narrow customer hotfix uses
+  [Hotfix](playbooks/hotfix.md).
+- A backend-only change uses [Backend fix](playbooks/backend-fix.md).
+- A frontend-only change uses [Frontend fix](playbooks/frontend-fix.md).
+- A change spanning both products uses
+  [Backend/frontend loop](playbooks/backend-frontend-loop.md).
+- Other reported defects use [Bug fix](playbooks/bug-fix.md).
 - A measured slowdown uses [Perf issue](playbooks/perf-issue.md).
 - When a bug fix or refactor changes query shape, batching, caching, or repeated
   work to improve performance, also follow [Perf issue](playbooks/perf-issue.md).

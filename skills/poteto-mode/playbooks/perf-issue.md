@@ -33,21 +33,46 @@ matching post-change artifact.
    package preparation. Forge and deployment actions remain independently
    gated.
 
-### Showpass SQL verification layer
+### SQL verification layer
 
-For a significant query rewrite, compare the baseline and candidate SQL on
-representative Production data before recommending performance readiness. Load
-`$showpass-db-broker` and follow its query-plan verification route: broker first,
-then Showpass Explorer when actual execution plans are needed and the broker
-rejects `ANALYZE`. Keep local correctness and concurrency checks as well.
+For a significant query rewrite, compare baseline and candidate SQL on
+representative production data before recommending performance readiness.
+Start with the environment's approved read-only broker and plain
+`EXPLAIN (FORMAT JSON)`. When actual execution plans are needed and the broker
+rejects `ANALYZE`, use an explicitly approved SQL Explorer or isolated
+production-data environment. Do not disguise SQL or weaken the broker filter.
 
-Use the application-generated SQL and bound parameters, including downstream
-query composition. Compare equivalent inputs and results across relevant empty,
-typical, and high-fanout scopes. Record candidate revision, connection,
-constraints, plans, samples, and whole-operation timings. Estimated plans alone
-do not verify runtime; replica execution does not prove primary concurrency or
-fleet performance. If the required comparison cannot be completed within the
-allowed scope, leave performance readiness unverified and name the missing check.
+Confirm the selected connection, read-only protection, statement timeout,
+target records, overall time budget, and stop conditions before executing
+`EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)` on read-only SELECTs. Syntax support
+does not establish resource isolation or safe limits. Do not analyze writes,
+locking SELECTs, or side-effecting functions through this route. Keep existing
+stricter limits and obtain separate authorization when the scope must expand.
+
+Use application-generated SQL and bound parameters, including downstream query
+composition. Compare equivalent inputs and results across relevant empty,
+typical, and high-fanout scopes. Record tested revisions, connection, limits,
+sample/cache conditions, plans, actual rows and loops, buffer activity, and
+temporary work. Retain sensitive SQL and plans in private evidence and share
+sanitized summaries. Keep correctness and concurrency checks as well.
+
+Measure whole-operation timing separately where authorized. Estimated plans
+alone do not verify runtime; replica execution does not prove primary
+concurrency or fleet performance. If the required comparison cannot be
+completed within the allowed scope, leave performance readiness unverified and
+name the missing check.
+
+### Showpass query route
+
+For Showpass query changes, start with `$showpass-db-broker` for bounded
+read-only plan checks. When actual execution plans are needed and the broker
+rejects `ANALYZE`, use Showpass Explorer or an isolated production-data
+environment only after its read-only protections, connection, statement timeout,
+target records, time budget, and stop conditions are explicitly confirmed and
+authorized. Use application-generated SQL and bound parameters, compare
+equivalent empty, typical, and high-fanout scopes, and include downstream
+composition. Replica execution does not establish primary concurrency or fleet
+performance.
 
 UNSUPPORTED-SEAM: no live profiler, browser, trace parser, or process-control
 surface is assumed. A local fixture or supplied artifact supports conclusions
