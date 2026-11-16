@@ -5,6 +5,8 @@ description: Prepare Slack messages in the user's voice, show the exact wording 
 
 # Draft
 
+<!-- writing-pass: avoid-ai-writing -->
+
 Use this skill when the user invokes $draft or asks for this Slack drafting workflow.
 
 ## Prepare the message
