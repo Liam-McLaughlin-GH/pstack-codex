@@ -42,6 +42,21 @@ Any safety fact you can't get to step 4, say so. Don't write it up as settled. S
    and performance conclusions separately; leave unmeasured performance unproven.
 6. For a big or wide change, run it as an `arena`. Ask several models the same question and merge the answers. Different models catch different real bugs.
 
+### Shared telemetry changes
+
+Start at the changed send or capture trigger. List each affected caller and
+trace the request fields, rendered text and attributes it can introduce before
+that trigger fires. Include successful requests or renders retained until a
+later failure. Record each caller's trigger, destination, evidence and
+disposition. A caller list by itself does not establish coverage.
+
+For a broad change, give one independent reviewer the changed trigger and caller
+list before showing the earlier findings. Ask them to select a high-risk flow
+and trace what can leave the app. For each newly enabled high-risk path, run the
+actual caller with synthetic data and inspect each affected outbound event or
+recording. Use a positive control to distinguish a safe capture from a recorder
+that never ran. Name unresolved caller paths in the handoff.
+
 ## What to hand back
 
 - **What it does.** What changed, including the part that isn't obvious.
