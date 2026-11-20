@@ -23,6 +23,8 @@ bot approval does not supply it. Deployment mutations and Production writes
 require separate authorization. Read-only build and deployment verification
 may proceed within the task. Do not inspect `web-k8s` without its own permission.
 
+For every PR update, apply the installed `web-app-pr-writing` skill’s Live PR Mutation Safety rules before the first provider write. Put progress, before/after QA and evidence in the existing description. “Tag the reviewer” means assign the reviewer through the provider’s reviewer field. An existing assignment completes that step. Verify both fields after editing. Only post a comment or thread reply when Liam explicitly requests one, including a comment-based bot trigger. Use the configured review label where available.
+
 ## Prepare the PR and Jira
 
 1. Confirm the checkout, remote, source and target branches, current head,
@@ -45,7 +47,7 @@ Use `$review-unblock` and its `references/galileo-review-loop.md`. Resolve the
 live Galileo account, make the PR ready unless explicitly held draft, assign
 that reviewer, and read back the assignment.
 
-After a fix is pushed, the entire re-review comment must be the provider's
+When Liam explicitly authorizes the comment-based trigger after a fix is pushed, the entire re-review comment must be the provider's
 resolved Galileo mention followed by ` re-review`, with no additional text.
 Bitbucket raw syntax is `@{<verified-account-id>} re-review`. Resolve and verify
 the account at execution time. Plain text `@galileo-agent re-review` is not a
