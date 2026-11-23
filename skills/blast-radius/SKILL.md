@@ -32,6 +32,8 @@ Any safety fact you can't get to step 4, say so. Don't write it up as settled. S
 1. Read the change. The diff, the symbols it adds, changes, and deletes, and what it now does differently, including the part the diff doesn't spell out. Use `why` step 2 to pull the PR and commits.
 2. Find the one fact it's safe because of. Most changes that look risky are safe because of a single fact, like "this call only drops already-dead cache entries and does nothing else". Find that fact. If it holds, most risky cases are cleared at once. Spend your time here, not on a long list of maybes.
 3. Look where grep stops. Read the source of the library you call, and check its pinned version and any local patch. Work out when things run: microtasks, unmount and teardown, Solid versus React. Follow what a symbol search misses: the JSON an API returns, a DB column, a wire format, another language reading the same bytes, a feature flag, code three hops downstream.
+   For a feature behind a switch or per-tenant setting, trace each gate from the entry point through callback scheduling and execution to the final query or write. A gate on discovery or display does not prove the write path is gated. Check the disabled switch, a tenant with no eligible feature records, an ordinary record using a shared model, and removal of the last eligible record. The last case may need one refresh to clear stale state; the others should not silently do full work.
+   For hooks, signals, and post-commit callbacks, calculate how many times they run for one realistic bulk operation. Include work after transaction commit, repeated row locks, cache queries, saves, and audit writes; a fast insert phase does not clear callback cost.
 4. Be honest about each risk. Give it a real chance of happening and a real cost if it does. Keep the risks you confirmed. List the ones you checked and cleared separately. Same rules as `why`. Cite a real `file:line`, a search that finds nothing is still an answer, and never make up a caller or an API.
 5. Prove the one fact. Write a script or test that runs the real code, run it, and paste what happened. If you can't prove it cheaply, mark it unproven. Don't overstate.
    For a performance claim, running real code proves only the measured properties.
@@ -40,6 +42,7 @@ Any safety fact you can't get to step 4, say so. Don't write it up as settled. S
    playbook for representative whole-operation measurements, including composed
    queries, empty inputs, and recurring fanout when relevant. Report correctness
    and performance conclusions separately; leave unmeasured performance unproven.
+   When gate placement or fanout is the safety fact, count scheduled callbacks and executed queries or writes for an ordinary bulk fixture with the feature on and off. Also prove that removing the last eligible record clears stale cached state. If a realistic volume cannot run locally, prove the per-row count and state the unmeasured runtime separately.
 6. For a big or wide change, run it as an `arena`. Ask several models the same question and merge the answers. Different models catch different real bugs.
 
 ### Shared telemetry changes
@@ -64,7 +67,13 @@ that never ran. Name unresolved caller paths in the handoff.
 - **Risks.** Only the real ones. Each names how it breaks, the `file:line`, how likely and how bad, and how to check. Paste the proof for the ones that matter.
 - **Cleared.** What you checked and why it's fine.
 - **Before you merge.** The cheapest test or repro that catches the real bug, including the script you wrote.
+- **Gate and fanout result.** For changed hooks, cache writers, or shared models, state which disabled and ordinary paths were run, the callback/query/write count, and which volume or Production timing remains unproven. Do not mark the change safe from a feature-gated reader test alone.
 
 Write it through `unslop`, cite real code, and strip anything private before it goes anywhere public.
 
 **Reply:** the writeup above, with the one safety fact either proven or marked unproven.
+
+<!-- writing-pass: avoid-ai-writing -->
+## User-facing writing pass
+
+Use `avoid-ai-writing` in composition mode for the final report. Preserve code references, proof levels, uncertainty, and risk.
