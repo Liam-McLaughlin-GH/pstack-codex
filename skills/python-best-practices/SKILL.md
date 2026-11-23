@@ -46,6 +46,15 @@ def parse_page(raw: str) -> int:
 
 These rules are repository facts, not general Python defaults. Re-check the cited source before changing a convention.
 
+The pinned citations below are historical evidence. Read the selected checkout's
+current instructions before applying them. Backend guidance now separates
+`docs/standards/code_style.md`, `docs/standards/constants.md`, and
+`docs/standards/package_layout.md`. Use the constants guide for stored values
+and lookup contracts, and the package guide before moving imports, historical
+migration dependencies, or registered task names. The current checkout owns
+any policy change; retain the pinned evidence rather than relabeling it as a
+fresh verification.
+
 ### Django and ORM
 
 - **[SP-WEB-ENV]** Use the `web-app` environment's selected Python executable. Its agent guide requires Python 3.12 and Django 5.2.15; the setup guide pins the bootstrap interpreter to Python 3.12.10. Sources: `web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/AGENTS.md#L38-L44`; `web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/README.md#L49-L58`; `web-app@508b22a3fa7a25ef5cdac465a29195117f3f97cc:web-app/requirements.txt#L75-L75`.
