@@ -21,6 +21,18 @@ calculations, reports, tasks, data repair scripts, and backend CI failures.
    using the current web-app template and title format. Keep local checks,
    Bitbucket CI, review, and deployment as separate states.
 
+## Service design for Liam's PRs
+
+Prefer a named service class with one clear public method for a business operation.
+Keep related behavior together so a reviewer can follow the workflow from the call site.
+When cases share a workflow but have different rules, pass a case-specific handler
+to the service. A single service class is enough when the operation has one set of rules.
+
+For example, in `VenueJournalService().record(PurchaseCompleted(basket))`, the writer
+owns locking, venue ordering, and duplicate handling. The purchase handler decides
+eligibility and builds the entry. A future refund handler should be able to reuse
+the writer without adding a refund branch to `record()`.
+
 Do not stage, commit, push, merge, run Production scripts, or claim manual QA
 unless the user authorized that exact action. For a support hotfix, follow
 [Showpass hotfix](./hotfix.md) as the outer workflow.
