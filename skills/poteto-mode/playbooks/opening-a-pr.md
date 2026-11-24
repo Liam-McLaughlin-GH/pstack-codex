@@ -47,5 +47,13 @@ Forge gate:
 UNSUPPORTED-SEAM: no implicit forge, PR, video, or deployment adapter exists.
 The local handoff is the safe fallback.
 
+At final handoff, release the task branch for checkout in the user's IDE. In a linked
+worktree you created for the task, confirm the expected branch is checked out,
+all task changes are committed, and `git status --porcelain` is empty. Once
+all work using that checkout has finished, run `git switch --detach` there.
+Verify with `git worktree list --porcelain` that the branch is free. Leave the
+user's checkout alone. If edits or ongoing work keep the branch occupied,
+report the branch, worktree path, and reason.
+
 Reply with worktree state, ordered commits, title and body path, checks,
 authorization state, and the next operation.
