@@ -45,6 +45,14 @@ Any safety fact you can't get to step 4, say so. Don't write it up as settled. S
    When gate placement or fanout is the safety fact, count scheduled callbacks and executed queries or writes for an ordinary bulk fixture with the feature on and off. Also prove that removing the last eligible record clears stale cached state. If a realistic volume cannot run locally, prove the per-row count and state the unmeasured runtime separately.
 6. For a big or wide change, run it as an `arena`. Ask several models the same question and merge the answers. Different models catch different real bugs.
 
+### Shared resources and unrelated users
+
+When a change acquires a shared resource earlier, holds it longer, or sends more work through it, start at the resource and trace outward. Identify its actual scope (for example one event row, a parent shared by recurring events, or a worker pool). Find an unchanged request or job that competes for that same resource, even if it never calls the changed helper. Trace who holds it, who waits, when it is released, and what the waiting user experiences.
+
+For feature-specific work, compare the eligible population with everyone routed through the shared path. Use a sourced denominator when available. For a hot key, examine simultaneous operations on the same key. A low average across many keys can hide one busy event timing out. Check ordinary traffic and background work together where they overlap. State which downstream effects were observed and which still need measurement.
+
+Pick the smallest check that can distinguish the old behavior from the new one. For an early event lock, use two database connections and an ordinary metadata-only update on a capped event without the feature. Observe where it waits relative to the base revision. Repeat with the switch off and verify the intended protection for participating traffic. Report the affected user, operation, and consequence alongside the technical finding.
+
 ### Shared telemetry changes
 
 Start at the changed send or capture trigger. List each affected caller and
